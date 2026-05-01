@@ -1,0 +1,707 @@
+use crate::{
+    access_log::{AccessLogEntry, AccessLogger},
+    backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
+    config::{Config, ForwardedMode, LbAlgorithm},
+    control::ControlServer,
+    health,
+    metrics::MetricsService,
+    tls::CertStore,
+    vhost::RoutingTable,
+};
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::Utc;
+use ipnet::IpNet;
+use pingora::{
+    lb::selection::{BackendIter, BackendSelection},
+    proxy::{http_proxy_service, ProxyHttp, Session},
+    server::Server,
+    services::background::background_service,
+    upstreams::peer::HttpPeer,
+    Error, ErrorType,
+};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{error, info};
+
+// PER-REQUEST CONTEXT
+
+pub struct ProxyCtx {
+    pool: String,
+    vhost: String,
+    backend: Option<SocketAddr>,
+    started_at: Instant,
+    backend_started_at: Option<Instant>,
+    request_bytes: usize,
+    response_bytes: usize,
+    client_ip: Option<IpAddr>,
+    client_addr_str: Option<String>,
+    is_tls: bool,
+    method: String,
+    uri: String,
+    protocol: String,
+    user_agent: Option<String>,
+}
+
+// PROXY IMPLEMENTATION
+
+pub struct KProxy {
+    routing: Arc<ArcSwap<RoutingTable>>,
+    pools: Arc<PoolRegistry>,
+    access_logger: Arc<AccessLogger>,
+}
+
+#[async_trait]
+impl ProxyHttp for KProxy {
+    type CTX = ProxyCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        ProxyCtx {
+            pool: String::new(),
+            vhost: String::new(),
+            backend: None,
+            started_at: Instant::now(),
+            backend_started_at: None,
+            request_bytes: 0,
+            response_bytes: 0,
+            client_ip: None,
+            client_addr_str: None,
+            is_tls: false,
+            method: String::new(),
+            uri: String::new(),
+            protocol: String::new(),
+            user_agent: None,
+        }
+    }
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let ds = session.as_downstream();
+
+        // Capture all request metadata before any early return so logging() always has it.
+        let method = ds.req_header().method.to_string();
+        let uri = ds
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_owned())
+            .unwrap_or_else(|| ds.req_header().uri.path().to_owned());
+        let protocol = format!("{:?}", ds.req_header().version);
+        let user_agent = ds
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        let host = ds
+            .get_header("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("*")
+            .to_owned();
+        let path = ds.req_header().uri.path().to_owned();
+        let client_ip: Option<IpAddr> = ds
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip());
+        let client_addr_str: Option<String> = ds
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.to_string());
+        let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
+
+        ctx.method = method;
+        ctx.uri = uri;
+        ctx.protocol = protocol;
+        ctx.user_agent = user_agent;
+        ctx.vhost = host.clone();
+        ctx.client_ip = client_ip;
+        ctx.client_addr_str = client_addr_str;
+        ctx.is_tls = is_tls;
+
+        // Client IP as consistent-hash key; fall back to empty bytes.
+        let key: Vec<u8> = client_ip
+            .map(|ip| ip.to_string().into_bytes())
+            .unwrap_or_default();
+
+        let routing = self.routing.load();
+        let pool_name = routing
+            .resolve(&host, &path)
+            .ok_or_else(|| {
+                crate::metrics::record_lb_error("", &host, "no_route");
+                Error::explain(
+                    ErrorType::HTTPStatus(502),
+                    format!("no vhost match for host='{host}' path='{path}'"),
+                )
+            })?
+            .to_owned();
+
+        // Set pool before select() so logging() can distinguish no_route from no_backend.
+        ctx.pool = pool_name.clone();
+
+        let addr = self
+            .pools
+            .select(&pool_name, &key)
+            .ok_or_else(|| {
+                crate::metrics::record_lb_error(&pool_name, &host, "no_backend");
+                Error::explain(
+                    ErrorType::HTTPStatus(502),
+                    format!("pool '{pool_name}' has no available backends"),
+                )
+            })?;
+
+        ctx.backend = Some(addr);
+        ctx.backend_started_at = Some(Instant::now());
+
+        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let Some(client_ip) = ctx.client_ip else {
+            return Ok(());
+        };
+
+        let routing = self.routing.load();
+        let fwd_cfg = routing.forwarded_config(&ctx.vhost);
+        let mode = fwd_cfg.map(|c| &c.mode).unwrap_or(&ForwardedMode::Replace);
+
+        if matches!(mode, ForwardedMode::Off) {
+            upstream_request.headers.remove("x-forwarded-for");
+            upstream_request.headers.remove("x-real-ip");
+            upstream_request.headers.remove("x-forwarded-proto");
+            upstream_request.headers.remove("x-forwarded-host");
+            upstream_request.headers.remove("forwarded");
+            return Ok(());
+        }
+
+        let (real_ip, xff) = if matches!(mode, ForwardedMode::Append) {
+            let trusted = fwd_cfg.map(|c| c.trusted_proxies.as_slice()).unwrap_or(&[]);
+            if is_trusted_proxy(&client_ip, trusted) {
+                let existing = session
+                    .as_downstream()
+                    .get_header("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let real = existing
+                    .split(',')
+                    .next()
+                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                    .unwrap_or(client_ip);
+                let chain = if existing.is_empty() {
+                    client_ip.to_string()
+                } else {
+                    format!("{existing}, {client_ip}")
+                };
+                (real, chain)
+            } else {
+                (client_ip, client_ip.to_string())
+            }
+        } else {
+            (client_ip, client_ip.to_string())
+        };
+
+        let proto = if ctx.is_tls { "https" } else { "http" };
+        let host = &ctx.vhost;
+
+        upstream_request.insert_header("x-forwarded-for", xff.as_str())?;
+        upstream_request.insert_header("x-real-ip", real_ip.to_string().as_str())?;
+        upstream_request.insert_header("x-forwarded-proto", proto)?;
+        upstream_request.insert_header("x-forwarded-host", host.as_str())?;
+        upstream_request.insert_header(
+            "forwarded",
+            format!("for={real_ip};proto={proto};host={host}").as_str(),
+        )?;
+
+        Ok(())
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        if let Some(b) = body {
+            ctx.request_bytes += b.len();
+        }
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(b) = body {
+            ctx.response_bytes += b.len();
+        }
+        Ok(None)
+    }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        e: Option<&Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        let backend = ctx.backend.take();
+        if let Some(addr) = backend {
+            self.pools.release(&ctx.pool, addr);
+        }
+
+        // Backend was selected but proxying failed — count as a connection error.
+        if e.is_some() {
+            if let Some(addr) = backend {
+                crate::metrics::record_backend_connection_error(&ctx.pool, &addr.to_string());
+            }
+        }
+
+        let status = session
+            .as_downstream()
+            .response_written()
+            .map(|r| r.status.as_u16())
+            .unwrap_or(0);
+
+        let elapsed = ctx.started_at.elapsed().as_secs_f64();
+
+        if !ctx.pool.is_empty() {
+            crate::metrics::record_request(&ctx.pool, &ctx.vhost, status, elapsed);
+
+            if let Some(addr) = backend {
+                let backend_elapsed = ctx
+                    .backend_started_at
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(elapsed);
+                crate::metrics::record_backend_request(
+                    &ctx.pool,
+                    &addr.to_string(),
+                    status,
+                    backend_elapsed,
+                );
+            }
+
+            crate::metrics::add_request_bytes_in(&ctx.pool, &ctx.vhost, ctx.request_bytes);
+            crate::metrics::add_request_bytes_out(&ctx.pool, &ctx.vhost, ctx.response_bytes);
+        }
+
+        let error_str: Option<String> = if ctx.pool.is_empty() {
+            Some("no_route".into())
+        } else if backend.is_none() {
+            Some("no_backend".into())
+        } else if e.is_some() {
+            Some("upstream_connect".into())
+        } else {
+            None
+        };
+
+        let backend_duration_ms = ctx
+            .backend_started_at
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+        let entry = AccessLogEntry {
+            timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            method: std::mem::take(&mut ctx.method),
+            uri: std::mem::take(&mut ctx.uri),
+            protocol: std::mem::take(&mut ctx.protocol),
+            status,
+            client_addr: ctx.client_addr_str.take(),
+            vhost: std::mem::take(&mut ctx.vhost),
+            pool: std::mem::take(&mut ctx.pool),
+            backend_addr: backend.map(|a| a.to_string()),
+            bytes_in: ctx.request_bytes,
+            bytes_out: ctx.response_bytes,
+            duration_ms: elapsed * 1000.0,
+            backend_duration_ms,
+            user_agent: ctx.user_agent.take(),
+            tls: ctx.is_tls,
+            error: error_str,
+        };
+
+        self.access_logger.log(&entry);
+    }
+}
+
+// HELPERS
+
+fn is_trusted_proxy(ip: &IpAddr, cidrs: &[String]) -> bool {
+    cidrs.iter().any(|cidr| {
+        cidr.parse::<IpNet>()
+            .map(|net| net.contains(ip))
+            .unwrap_or(false)
+    })
+}
+
+// HOT RELOAD SERVICE
+
+struct ReloadService {
+    routing: Arc<ArcSwap<RoutingTable>>,
+    pools: Arc<PoolRegistry>,
+    cert_store: Arc<CertStore>,
+    config_path: String,
+    conf_dir: Option<String>,
+}
+
+#[async_trait]
+impl pingora::services::background::BackgroundService for ReloadService {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "reload: failed to register SIGHUP handler");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = sighup.recv() => {
+                    match crate::config::load(&self.config_path, self.conf_dir.as_deref()) {
+                        Ok(new_cfg) => {
+                            self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
+                            self.pools.sync_from_config(&new_cfg);
+                            if let Err(e) = self.cert_store.reload(&new_cfg) {
+                                error!(error = %e, "TLS cert reload failed, keeping previous certs");
+                            }
+                            info!(path = self.config_path, "config reloaded");
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                path = self.config_path,
+                                "config reload failed, keeping previous config"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// SERVER STARTUP
+
+/// Build all pools from config, registering health-check background services on
+/// the server. Returns the completed `PoolRegistry`.
+/// Resolve a backend address to IP:port. Pass-through if already an IP, DNS-resolve if hostname.
+fn resolve_addr(addr: &str) -> anyhow::Result<String> {
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(addr.to_owned());
+    }
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("cannot resolve '{addr}': {e}"))?
+        .next()
+        .map(|sa| sa.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no address resolved for '{addr}'"))
+}
+
+fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry> {
+    let mut pools: HashMap<String, Pool> = HashMap::new();
+    let mut drain: HashMap<String, crate::backend::BackendEntry> = HashMap::new();
+
+    for (name, pool_cfg) in &cfg.pools {
+        // Resolve hostnames to IPs once at startup so Pingora gets SocketAddrs
+        // and the drain map keys stay consistent with what the load balancer uses.
+        let resolved: Vec<String> = pool_cfg.backends.iter()
+            .map(|b| resolve_addr(&b.address))
+            .collect::<anyhow::Result<_>>()?;
+        let addrs: Vec<&str> = resolved.iter().map(String::as_str).collect();
+        let weights: Vec<usize> = pool_cfg.backends.iter().map(|b| b.weight as usize).collect();
+
+        build_drain_entries(name, &addrs, &mut drain);
+
+        // Initialise drain state metric for each backend
+        for addr in &addrs {
+            crate::metrics::set_drain_state(name, addr, crate::backend::DRAIN_ACTIVE);
+        }
+
+        let pool = match pool_cfg.algorithm {
+            LbAlgorithm::RoundRobin => {
+                Pool::RoundRobin(build_with_hc::<pingora::lb::selection::RoundRobin>(
+                    name, &addrs, &weights, pool_cfg, server,
+                )?)
+            }
+            LbAlgorithm::Random => {
+                Pool::Random(build_with_hc::<pingora::lb::selection::Random>(
+                    name, &addrs, &weights, pool_cfg, server,
+                )?)
+            }
+            LbAlgorithm::ConsistentHash => {
+                Pool::ConsistentHash(build_with_hc::<pingora::lb::selection::Consistent>(
+                    name, &addrs, &weights, pool_cfg, server,
+                )?)
+            }
+            LbAlgorithm::LeastConnections => {
+                Pool::LeastConn(Arc::new(
+                    LeastConnPool::build(&addrs)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ))
+            }
+        };
+
+        pools.insert(name.clone(), pool);
+    }
+
+    Ok(PoolRegistry::new(pools, drain))
+}
+
+/// Build a typed `LoadBalancer`, optionally attach a health check and register
+/// a background service, then return an `Arc` to the lb.
+fn build_with_hc<S>(
+    name: &str,
+    addrs: &[&str],
+    weights: &[usize],
+    pool_cfg: &crate::config::Pool,
+    server: &mut Server,
+) -> anyhow::Result<Arc<pingora::lb::LoadBalancer<S>>>
+where
+    S: BackendSelection + Send + Sync + 'static,
+    S::Iter: BackendIter,
+{
+    let mut lb = build_lb::<S>(addrs, weights)
+        .map_err(|e| anyhow::anyhow!("pool '{name}': {e}"))?;
+
+    if let Some(hc_cfg) = &pool_cfg.health_check {
+        let hc = health::build(hc_cfg, addrs.first().copied().unwrap_or(""));
+        lb.set_health_check(hc);
+        lb.health_check_frequency = Some(health::parse_duration(&hc_cfg.interval));
+        lb.parallel_health_check = true;
+
+        let bg = background_service(&format!("hc:{name}"), lb);
+        let arc = bg.task();
+        server.add_service(bg);
+        info!(pool = name, "health check enabled");
+        Ok(arc)
+    } else {
+        Ok(Arc::new(lb))
+    }
+}
+
+/// Start the Pingora proxy server. Never returns.
+pub fn run(cfg: &Config) -> ! {
+    let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
+
+    let mut server = Server::new(None).unwrap_or_else(|e| {
+        error!(error = %e, "failed to create Pingora server");
+        std::process::exit(1);
+    });
+    server.bootstrap();
+
+    let pools = match build_pools(cfg, &mut server) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            error!(error = %e, "failed to build pool registry");
+            std::process::exit(1);
+        }
+    };
+
+    let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
+        error!(error = %e, "failed to load TLS certificates");
+        std::process::exit(1);
+    }));
+
+    let access_logger = Arc::new(AccessLogger::new(&cfg.access_log));
+
+    // Register the hot-reload background service.
+    server.add_service(background_service(
+        "reload",
+        ReloadService {
+            routing: Arc::clone(&routing),
+            pools: Arc::clone(&pools),
+            cert_store: Arc::clone(&cert_store),
+            config_path: cfg.path.clone(),
+            conf_dir: cfg.conf_dir.clone(),
+        },
+    ));
+
+    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger };
+    let mut svc = http_proxy_service(&server.configuration, proxy);
+
+    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
+    let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
+
+    if plain.is_empty() && tls.is_empty() {
+        info!("no listeners configured, defaulting to 0.0.0.0:8080");
+        svc.add_tcp("0.0.0.0:8080");
+    } else {
+        for l in plain {
+            info!(address = l.address, "adding listener");
+            svc.add_tcp(&l.address);
+        }
+        for l in tls {
+            let settings = pingora::listeners::tls::TlsSettings::with_callbacks(
+                cert_store.make_callbacks(),
+            )
+            .unwrap_or_else(|e| {
+                error!(address = l.address, error = %e, "failed to create TLS settings");
+                std::process::exit(1);
+            });
+            info!(address = l.address, "adding TLS listener");
+            svc.add_tls_with_settings(&l.address, None, settings);
+        }
+    }
+
+    server.add_service(svc);
+    server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
+    server.add_service(background_service(
+        "control",
+        ControlServer {
+            socket_path: cfg.keel.control_socket.clone(),
+            pools: Arc::clone(&pools),
+            started_at: std::time::Instant::now(),
+            cluster: None,
+        },
+    ));
+
+    server.run_forever()
+}
+
+// ── CLUSTER RELOAD WATCHER ────────────────────────────────────────────────────
+
+struct ClusterReloadWatcher {
+    routing: Arc<ArcSwap<RoutingTable>>,
+    pools: Arc<PoolRegistry>,
+    cert_store: Arc<CertStore>,
+    config_rx: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+#[async_trait]
+impl pingora::services::background::BackgroundService for ClusterReloadWatcher {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        let mut rx = self.config_rx.clone();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                result = rx.changed() => {
+                    if result.is_err() { return; }
+                    if let Some(yaml) = rx.borrow().clone() {
+                        match serde_yaml::from_str::<crate::config::Config>(&yaml) {
+                            Ok(new_cfg) => {
+                                self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
+                                self.pools.sync_from_config(&new_cfg);
+                                if let Err(e) = self.cert_store.reload(&new_cfg) {
+                                    error!(error = %e, "cluster: TLS cert reload failed");
+                                }
+                                info!("cluster: config applied from Raft log");
+                            }
+                            Err(e) => error!(error = %e, "cluster: invalid config YAML"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Start the proxy in cluster mode: registers ClusterService as a background service
+/// and watches Raft-committed config changes. Never returns.
+pub fn run_cluster(
+    cfg: &Config,
+    cluster: crate::cluster::ClusterHandle,
+    cluster_svc: crate::cluster::ClusterService,
+) -> ! {
+    let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
+
+    let mut server = Server::new(None).unwrap_or_else(|e| {
+        error!(error = %e, "failed to create Pingora server");
+        std::process::exit(1);
+    });
+    server.bootstrap();
+
+    let pools = match build_pools(cfg, &mut server) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            error!(error = %e, "failed to build pool registry");
+            std::process::exit(1);
+        }
+    };
+
+    let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
+        error!(error = %e, "failed to load TLS certificates");
+        std::process::exit(1);
+    }));
+
+    let access_logger = Arc::new(AccessLogger::new(&cfg.access_log));
+
+    server.add_service(background_service("cluster", cluster_svc));
+    server.add_service(background_service(
+        "cluster-reload",
+        ClusterReloadWatcher {
+            routing: Arc::clone(&routing),
+            pools: Arc::clone(&pools),
+            cert_store: Arc::clone(&cert_store),
+            config_rx: cluster.config_rx.clone(),
+        },
+    ));
+    server.add_service(background_service(
+        "reload",
+        ReloadService {
+            routing: Arc::clone(&routing),
+            pools: Arc::clone(&pools),
+            cert_store: Arc::clone(&cert_store),
+            config_path: cfg.path.clone(),
+            conf_dir: cfg.conf_dir.clone(),
+        },
+    ));
+
+    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger };
+    let mut svc = http_proxy_service(&server.configuration, proxy);
+
+    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
+    let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
+
+    if plain.is_empty() && tls_listeners.is_empty() {
+        info!("no listeners configured, defaulting to 0.0.0.0:8080");
+        svc.add_tcp("0.0.0.0:8080");
+    } else {
+        for l in plain {
+            info!(address = l.address, "adding listener");
+            svc.add_tcp(&l.address);
+        }
+        for l in tls_listeners {
+            let settings = pingora::listeners::tls::TlsSettings::with_callbacks(
+                cert_store.make_callbacks(),
+            )
+            .unwrap_or_else(|e| {
+                error!(address = l.address, error = %e, "failed to create TLS settings");
+                std::process::exit(1);
+            });
+            info!(address = l.address, "adding TLS listener");
+            svc.add_tls_with_settings(&l.address, None, settings);
+        }
+    }
+
+    server.add_service(svc);
+    server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
+    server.add_service(background_service(
+        "control",
+        ControlServer {
+            socket_path: cfg.keel.control_socket.clone(),
+            pools: Arc::clone(&pools),
+            started_at: std::time::Instant::now(),
+            cluster: Some(cluster),
+        },
+    ));
+
+    server.run_forever()
+}

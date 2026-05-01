@@ -1,0 +1,36 @@
+keel:
+  workers: 2
+  user: root
+  group: root
+
+listeners:
+  - address: 0.0.0.0:80
+
+metrics:
+  address: 0.0.0.0:9090
+
+access_log:
+  enabled: true
+  dir: /var/log/keel
+
+pools:
+  web:
+    algorithm: round_robin
+    health_check:
+      type: http
+      path: /
+      interval: 5s
+      timeout: 2s
+      healthy_threshold: 1
+      unhealthy_threshold: 2
+    backends:
+      - address: backend1:80
+        weight: 1
+      - address: backend2:80
+        weight: 1
+      - address: backend3:80
+        weight: 1
+
+vhosts:
+  - host: "*"
+    pool: web

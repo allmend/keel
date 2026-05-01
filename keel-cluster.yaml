@@ -1,0 +1,44 @@
+keel:
+  workers: 4
+  user: keel
+  group: keel
+
+listeners:
+  - address: 0.0.0.0:80
+  - address: 0.0.0.0:443
+    tls: true
+
+metrics:
+  address: 0.0.0.0:9090
+
+cluster:
+  secret: change-me-in-production
+  peers:
+    - 10.0.0.1:7000
+    - 10.0.0.2:7000
+    - 10.0.0.3:7000
+
+pools:
+  web:
+    algorithm: round_robin
+    health_check:
+      type: http
+      path: /health
+      interval: 10s
+      timeout: 2s
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+    backends:
+      - address: 10.0.0.10:8080
+        weight: 1
+      - address: 10.0.0.11:8080
+        weight: 1
+      - address: 10.0.0.12:8080
+        weight: 2
+
+vhosts:
+  - host: example.com
+    pool: web
+    tls:
+      cert: /etc/keel/certs/example.crt
+      key: /etc/keel/certs/example.key

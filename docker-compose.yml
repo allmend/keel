@@ -1,0 +1,23 @@
+services:
+  keel:
+    build: .
+    init: true   # tini — proper PID 1 / signal handling for forked workers
+    volumes:
+      - ./keel-dev.yaml:/etc/keel/keel.yaml:ro
+    ports:
+      - "8080:80"     # proxy — curl http://localhost:8080
+      - "9090:9090"   # metrics — curl http://localhost:9090/metrics
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+
+  # traefik/whoami returns hostname + request info — easy to see which backend responded
+  backend1:
+    image: traefik/whoami
+
+  backend2:
+    image: traefik/whoami
+
+  backend3:
+    image: traefik/whoami
