@@ -1,7 +1,8 @@
 use crate::{
     access_log::{AccessLogEntry, AccessLogger},
     backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
-    config::{Config, ForwardedMode, LbAlgorithm},
+    cache::CacheHandle,
+    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm},
     control::ControlServer,
     health,
     metrics::MetricsService,
@@ -14,6 +15,11 @@ use bytes::Bytes;
 use chrono::Utc;
 use ipnet::IpNet;
 use pingora::{
+    cache::{
+        cache_control::CacheControl,
+        filters::{request_cacheable, resp_cacheable},
+        CacheKey, CacheMetaDefaults,
+    },
     lb::selection::{BackendIter, BackendSelection},
     proxy::{http_proxy_service, ProxyHttp, Session},
     server::Server,
@@ -53,6 +59,7 @@ pub struct KProxy {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
     access_logger: Arc<AccessLogger>,
+    cache: Option<CacheHandle>,
 }
 
 #[async_trait]
@@ -76,6 +83,46 @@ impl ProxyHttp for KProxy {
             protocol: String::new(),
             user_agent: None,
         }
+    }
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<bool> {
+        // Only redirect plain HTTP — TLS connections pass through.
+        let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
+        if is_tls {
+            return Ok(false);
+        }
+
+        let host = session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("*")
+            .to_owned();
+
+        let routing = self.routing.load();
+        if !routing.should_redirect_https(&host) {
+            return Ok(false);
+        }
+
+        let path = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let host_bare = host.split(':').next().unwrap_or(&host);
+        let location = format!("https://{host_bare}{path}");
+
+        let mut resp = pingora::http::ResponseHeader::build(301, Some(2))?;
+        resp.insert_header("location", location.as_str())?;
+        resp.insert_header("content-length", "0")?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(true)
     }
 
     async fn upstream_peer(
@@ -253,6 +300,129 @@ impl ProxyHttp for KProxy {
         Ok(None)
     }
 
+    fn request_cache_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let Some(ref cache) = self.cache else { return Ok(()); };
+
+        if !request_cacheable(session.req_header()) {
+            return Ok(());
+        }
+
+        let path = session.req_header().uri.path();
+        let routing = self.routing.load();
+        if routing.cache_config(&ctx.vhost, path).is_none() {
+            return Ok(());
+        }
+
+        session.cache.enable(cache.storage, Some(cache.eviction), None, None, None);
+        Ok(())
+    }
+
+    fn cache_key_callback(
+        &self,
+        session: &Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<CacheKey> {
+        let req = session.req_header();
+        let host = req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("_");
+        let path = req
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        Ok(CacheKey::new(host.as_bytes().to_vec(), path.as_bytes().to_vec(), ""))
+    }
+
+    fn response_cache_filter(
+        &self,
+        session: &Session,
+        resp: &pingora::http::ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<pingora::cache::RespCacheable> {
+        use pingora::cache::{
+            CacheMeta, NoCacheReason, RespCacheable::{Cacheable, Uncacheable},
+        };
+        use std::time::{Duration, SystemTime};
+
+        let host = ctx.vhost.split(':').next().unwrap_or(&ctx.vhost);
+        let path = session.req_header().uri.path();
+        let routing = self.routing.load();
+
+        let Some(rule) = routing.cache_config(host, path) else {
+            return Ok(Uncacheable(NoCacheReason::Custom("not configured")));
+        };
+
+        // --- Status filter (default: 200 only) ---
+        let status = resp.status.as_u16();
+        let allowed = if rule.statuses.is_empty() { &[200u16] as &[u16] } else { &rule.statuses };
+        if !allowed.contains(&status) {
+            return Ok(Uncacheable(NoCacheReason::Custom("status filtered")));
+        }
+
+        // --- Content-type filter (empty = no restriction) ---
+        if !rule.content_types.is_empty() {
+            let ct = resp.headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            // Strip parameters ("text/html; charset=utf-8" → "text/html")
+            let ct_base = ct.split(';').next().unwrap_or(ct).trim();
+            let matched = rule.content_types.iter().any(|pattern| {
+                if let Some(prefix) = pattern.strip_suffix('*') {
+                    ct_base.starts_with(prefix)
+                } else {
+                    ct_base.eq_ignore_ascii_case(pattern)
+                }
+            });
+            if !matched {
+                return Ok(Uncacheable(NoCacheReason::Custom("content-type filtered")));
+            }
+        }
+
+        // --- Cache-Control from origin ---
+        static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
+        let cc = CacheControl::from_headers_named("cache-control", &resp.headers);
+        let result = resp_cacheable(cc.as_ref(), resp.clone(), false, &DEFAULTS);
+
+        // --- TTL override: force-cache when origin sends no Cache-Control ---
+        if matches!(result, Uncacheable(_)) {
+            if let Some(ttl) = rule.ttl {
+                let now = SystemTime::now();
+                let meta = CacheMeta::new(
+                    now + Duration::from_secs(ttl as u64),
+                    now, 0, 0,
+                    resp.clone(),
+                );
+                return Ok(Cacheable(meta));
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut pingora::http::ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        use pingora::cache::CachePhase;
+        let value = match session.cache.phase() {
+            CachePhase::Hit | CachePhase::Stale | CachePhase::Revalidated => "HIT",
+            CachePhase::Disabled(_) | CachePhase::Bypass => return Ok(()),
+            _ => "MISS",
+        };
+        let _ = upstream_response.insert_header("x-cache", value);
+        Ok(())
+    }
+
     async fn logging(
         &self,
         session: &mut Session,
@@ -398,9 +568,9 @@ impl pingora::services::background::BackgroundService for ReloadService {
 
 // SERVER STARTUP
 
-/// Build all pools from config, registering health-check background services on
-/// the server. Returns the completed `PoolRegistry`.
-/// Resolve a backend address to IP:port. Pass-through if already an IP, DNS-resolve if hostname.
+// Build all pools from config, registering health-check background services on
+// the server. Returns the completed `PoolRegistry`.
+// Resolve a backend address to IP:port. Pass-through if already an IP, DNS-resolve if hostname.
 fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr.to_owned());
@@ -463,8 +633,8 @@ fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry
     Ok(PoolRegistry::new(pools, drain))
 }
 
-/// Build a typed `LoadBalancer`, optionally attach a health check and register
-/// a background service, then return an `Arc` to the lb.
+// Build a typed `LoadBalancer`, optionally attach a health check and register
+// a background service, then return an `Arc` to the lb.
 fn build_with_hc<S>(
     name: &str,
     addrs: &[&str],
@@ -495,7 +665,22 @@ where
     }
 }
 
-/// Start the Pingora proxy server. Never returns.
+fn log_cache_mode(cfg: &CacheConfig) {
+    match (&cfg.memory, &cfg.disk) {
+        (Some(mem), Some(disk)) => {
+            info!(memory = mem, disk_path = disk.path, disk_size = disk.size, "cache: tiered (memory + disk) enabled");
+        }
+        (Some(mem), None) => {
+            info!(memory = mem, "cache: memory store enabled");
+        }
+        (None, Some(disk)) => {
+            info!(disk_path = disk.path, disk_size = disk.size, "cache: disk store enabled");
+        }
+        (None, None) => {}
+    }
+}
+
+// Start the Pingora proxy server. Never returns.
 pub fn run(cfg: &Config) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
 
@@ -520,6 +705,18 @@ pub fn run(cfg: &Config) -> ! {
 
     let access_logger = Arc::new(AccessLogger::new(&cfg.access_log));
 
+    let cache = match crate::cache::init(&cfg.cache) {
+        Ok(Some(h)) => {
+            log_cache_mode(&cfg.cache);
+            Some(h)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "cache: init failed, caching disabled");
+            None
+        }
+    };
+
     // Register the hot-reload background service.
     server.add_service(background_service(
         "reload",
@@ -532,7 +729,7 @@ pub fn run(cfg: &Config) -> ! {
         },
     ));
 
-    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger };
+    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger, cache };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
@@ -574,7 +771,7 @@ pub fn run(cfg: &Config) -> ! {
     server.run_forever()
 }
 
-// ── CLUSTER RELOAD WATCHER ────────────────────────────────────────────────────
+// CLUSTER RELOAD WATCHER
 
 struct ClusterReloadWatcher {
     routing: Arc<ArcSwap<RoutingTable>>,
@@ -595,7 +792,7 @@ impl pingora::services::background::BackgroundService for ClusterReloadWatcher {
                 result = rx.changed() => {
                     if result.is_err() { return; }
                     if let Some(yaml) = rx.borrow().clone() {
-                        match serde_yaml::from_str::<crate::config::Config>(&yaml) {
+                        match serde_yml::from_str::<crate::config::Config>(&yaml) {
                             Ok(new_cfg) => {
                                 self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
                                 self.pools.sync_from_config(&new_cfg);
@@ -613,8 +810,8 @@ impl pingora::services::background::BackgroundService for ClusterReloadWatcher {
     }
 }
 
-/// Start the proxy in cluster mode: registers ClusterService as a background service
-/// and watches Raft-committed config changes. Never returns.
+// Start the proxy in cluster mode: registers ClusterService as a background service
+// and watches Raft-committed config changes. Never returns.
 pub fn run_cluster(
     cfg: &Config,
     cluster: crate::cluster::ClusterHandle,
@@ -643,6 +840,18 @@ pub fn run_cluster(
 
     let access_logger = Arc::new(AccessLogger::new(&cfg.access_log));
 
+    let cache = match crate::cache::init(&cfg.cache) {
+        Ok(Some(h)) => {
+            log_cache_mode(&cfg.cache);
+            Some(h)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "cache: init failed, caching disabled");
+            None
+        }
+    };
+
     server.add_service(background_service("cluster", cluster_svc));
     server.add_service(background_service(
         "cluster-reload",
@@ -664,7 +873,7 @@ pub fn run_cluster(
         },
     ));
 
-    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger };
+    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger, cache };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();

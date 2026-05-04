@@ -3,13 +3,34 @@ keel:
   user: keel
   group: keel
 
+# Load additional vhost/pool configs from a directory (conf.d style).
+# Files are merged in alphabetical order.
+# include:
+#   - conf.d/**/*.yaml
+
 listeners:
   - address: 0.0.0.0:80
   - address: 0.0.0.0:443
     tls: true
+  # Enable PROXY Protocol on a listener when Keel sits behind a cloud LB
+  # that injects the real client IP via PROXY Protocol (AWS NLB, HAProxy, etc.)
+  # - address: 0.0.0.0:80
+  #   proxy_protocol: true
 
 metrics:
   address: 0.0.0.0:9090
+
+access_log:
+  enabled: true
+  dir: /var/log/keel
+
+# Two-tier HTTP cache: hot objects in memory, full working set on disk.
+# Omit either tier to use only the other. Omit the whole section to disable.
+cache:
+  memory: 256M
+  disk:
+    path: /var/cache/keel
+    size: 10G
 
 pools:
   web:
@@ -35,3 +56,21 @@ vhosts:
     tls:
       cert: /etc/keel/certs/example.crt
       key: /etc/keel/certs/example.key
+    # Forward real client IP to backends. 'replace' always overwrites incoming
+    # headers (prevents spoofing). Use 'append' if Keel itself is behind a
+    # trusted upstream proxy — list its CIDR under trusted_proxies.
+    forwarded_headers:
+      mode: replace
+    # Cache rules for this vhost. 'ttl' is the fallback when the origin sends
+    # no Cache-Control. 'statuses' defaults to [200] when omitted.
+    # 'content_types' empty means no content-type restriction.
+    cache:
+      enabled: true
+      ttl: 300
+      statuses: [200, 301]
+      content_types:
+        - text/html
+        - text/css
+        - application/javascript
+        - image/*
+        - font/*

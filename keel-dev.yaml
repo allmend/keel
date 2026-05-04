@@ -13,6 +13,10 @@ access_log:
   enabled: true
   dir: /var/log/keel
 
+# Memory-only cache for local dev — no disk path needed in containers.
+cache:
+  memory: 64M
+
 pools:
   web:
     algorithm: round_robin
@@ -34,3 +38,6 @@ pools:
 vhosts:
   - host: "*"
     pool: web
+    cache:
+      enabled: true
+      ttl: 30

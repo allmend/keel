@@ -1,27 +1,35 @@
-use crate::config::{Config, ForwardedHeadersConfig};
-use std::collections::HashMap;
+use crate::config::{Config, ForwardedHeadersConfig, VhostCacheConfig};
+use std::collections::{HashMap, HashSet};
 
 /// Maps an incoming (host, path) pair to a pool name.
 ///
 /// Resolution order:
-///   1. Exact host match, longest path-prefix match
-///   2. Wildcard host ("*"), longest path-prefix match
+///  1. Exact host match, longest path-prefix match
+///  2. Wildcard host ("*"), longest path-prefix match
 pub struct RoutingTable {
     /// host → routes sorted by path prefix length descending
     vhosts: HashMap<String, Vec<Route>>,
     /// host → forwarded headers config (cloned from config on build)
     forwarded: HashMap<String, ForwardedHeadersConfig>,
+    /// host → vhost-level cache config (fallback when route has none)
+    cache: HashMap<String, VhostCacheConfig>,
+    /// hosts that should redirect HTTP → HTTPS
+    redirect_http: HashSet<String>,
 }
 
 struct Route {
     path_prefix: String,
     pool: String,
+    /// Route-level cache config — overrides the vhost-level config when present.
+    cache: Option<VhostCacheConfig>,
 }
 
 impl RoutingTable {
     pub fn build(cfg: &Config) -> Self {
         let mut vhosts: HashMap<String, Vec<Route>> = HashMap::new();
         let mut forwarded: HashMap<String, ForwardedHeadersConfig> = HashMap::new();
+        let mut cache: HashMap<String, VhostCacheConfig> = HashMap::new();
+        let mut redirect_http: HashSet<String> = HashSet::new();
 
         for vhost in &cfg.vhosts {
             let routes = vhosts.entry(vhost.host.clone()).or_default();
@@ -32,6 +40,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: "/".into(),
                         pool: pool.clone(),
+                        cache: None,
                     });
                 }
             } else {
@@ -39,6 +48,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: r.path.clone(),
                         pool: r.pool.clone(),
+                        cache: r.cache.clone(),
                     });
                 }
             }
@@ -49,25 +59,53 @@ impl RoutingTable {
             if let Some(fwd) = &vhost.forwarded_headers {
                 forwarded.insert(vhost.host.clone(), fwd.clone());
             }
+
+            if let Some(cc) = &vhost.cache {
+                cache.insert(vhost.host.clone(), cc.clone());
+            }
+
+            if vhost.redirect_http {
+                redirect_http.insert(vhost.host.clone());
+            }
         }
 
-        RoutingTable { vhosts, forwarded }
+        RoutingTable { vhosts, forwarded, cache, redirect_http }
     }
 
     /// Returns the pool name for the given host and path, or `None` if no match.
     pub fn resolve<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
-        // Strip port from Host header if present ("example.com:443" → "example.com")
         let host = host.split(':').next().unwrap_or(host);
-
         self.match_host(host, path)
             .or_else(|| self.match_host("*", path))
     }
 
+    /// Returns the cache config for the given host and path, or `None` if caching is
+    /// not enabled. Resolution order: route-level → vhost-level → wildcard vhost-level.
+    pub fn cache_config(&self, host: &str, path: &str) -> Option<&VhostCacheConfig> {
+        let host = host.split(':').next().unwrap_or(host);
+
+        let route_cache = self.route_cache(host, path)
+            .or_else(|| self.route_cache("*", path));
+
+        if let Some(cc) = route_cache {
+            return if cc.enabled { Some(cc) } else { None };
+        }
+
+        // Fall back to vhost-level config.
+        let vhost_cache = self.cache.get(host).or_else(|| self.cache.get("*"))?;
+        if vhost_cache.enabled { Some(vhost_cache) } else { None }
+    }
+
     /// Returns the forwarded headers config for the given host, or `None` if not set.
-    /// Falls back to the wildcard vhost config if no exact match.
     pub fn forwarded_config(&self, host: &str) -> Option<&ForwardedHeadersConfig> {
         let host = host.split(':').next().unwrap_or(host);
         self.forwarded.get(host).or_else(|| self.forwarded.get("*"))
+    }
+
+    /// Returns true if plain HTTP requests to this host should be redirected to HTTPS.
+    pub fn should_redirect_https(&self, host: &str) -> bool {
+        let host = host.split(':').next().unwrap_or(host);
+        self.redirect_http.contains(host) || self.redirect_http.contains("*")
     }
 
     fn match_host<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
@@ -77,12 +115,24 @@ impl RoutingTable {
             .find(|r| path.starts_with(r.path_prefix.as_str()))
             .map(|r| r.pool.as_str())
     }
+
+    /// Returns the route-level cache config for the matching route, if any.
+    fn route_cache<'a>(&'a self, host: &str, path: &str) -> Option<&'a VhostCacheConfig> {
+        let routes = self.vhosts.get(host)?;
+        routes
+            .iter()
+            .find(|r| path.starts_with(r.path_prefix.as_str()))
+            .and_then(|r| r.cache.as_ref())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AccessLogConfig, Config, KeelConfig, MetricsConfig, Pool, LbAlgorithm, Backend, Vhost, Route as CfgRoute};
+    use crate::config::{
+        AccessLogConfig, Backend, Config, KeelConfig, LbAlgorithm, MetricsConfig, Pool,
+        Route as CfgRoute, Vhost, VhostCacheConfig,
+    };
     use std::collections::HashMap;
 
     fn make_config(vhosts: Vec<Vhost>, pools: HashMap<String, Pool>) -> Config {
@@ -95,6 +145,7 @@ mod tests {
             pools,
             vhosts,
             access_log: AccessLogConfig::default(),
+            cache: crate::config::CacheConfig::default(),
             include: vec![],
             cluster: None,
         }
@@ -115,6 +166,8 @@ mod tests {
             routes: vec![],
             tls: None,
             forwarded_headers: None,
+            cache: None,
+            redirect_http: false,
         }
     }
 
@@ -133,11 +186,13 @@ mod tests {
                 host: "example.com".into(),
                 pool: None,
                 routes: vec![
-                    CfgRoute { path: "/".into(), pool: "default".into() },
-                    CfgRoute { path: "/api/".into(), pool: "api".into() },
+                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None },
+                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
+                cache: None,
+                redirect_http: false,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -158,5 +213,79 @@ mod tests {
         let cfg = make_config(vec![vhost("example.com", "web")], [pool("web")].into());
         let t = RoutingTable::build(&cfg);
         assert_eq!(t.resolve("example.com:8080", "/"), Some("web"));
+    }
+
+    #[test]
+    fn cache_config_route_overrides_vhost() {
+        let cfg = make_config(
+            vec![Vhost {
+                host: "example.com".into(),
+                pool: None,
+                routes: vec![
+                    CfgRoute {
+                        path: "/static/".into(),
+                        pool: "assets".into(),
+                        cache: Some(VhostCacheConfig {
+                            enabled: true,
+                            ttl: Some(3600),
+                            statuses: vec![200],
+                            content_types: vec!["image/*".into()],
+                        }),
+                    },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                ],
+                tls: None,
+                forwarded_headers: None,
+                cache: Some(VhostCacheConfig {
+                    enabled: true,
+                    ttl: Some(60),
+                    statuses: vec![],
+                    content_types: vec![],
+                }),
+                redirect_http: false,
+            }],
+            [pool("assets"), pool("web")].into(),
+        );
+        let t = RoutingTable::build(&cfg);
+
+        // /static/ uses route-level config (ttl 3600, image/*)
+        let cc = t.cache_config("example.com", "/static/logo.png").unwrap();
+        assert_eq!(cc.ttl, Some(3600));
+        assert_eq!(cc.content_types, vec!["image/*"]);
+
+        // / falls back to vhost-level config (ttl 60, no content_types filter)
+        let cc = t.cache_config("example.com", "/").unwrap();
+        assert_eq!(cc.ttl, Some(60));
+        assert!(cc.content_types.is_empty());
+    }
+
+    #[test]
+    fn cache_config_disabled_route_hides_vhost_default() {
+        let cfg = make_config(
+            vec![Vhost {
+                host: "example.com".into(),
+                pool: None,
+                routes: vec![
+                    CfgRoute {
+                        path: "/api/".into(),
+                        pool: "api".into(),
+                        cache: Some(VhostCacheConfig { enabled: false, ..Default::default() }),
+                    },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                ],
+                tls: None,
+                forwarded_headers: None,
+                cache: Some(VhostCacheConfig { enabled: true, ttl: Some(60), ..Default::default() }),
+                redirect_http: false,
+            }],
+            [pool("api"), pool("web")].into(),
+        );
+        let t = RoutingTable::build(&cfg);
+
+        // /api/ explicitly disabled — must not fall through to vhost default
+        assert!(t.cache_config("example.com", "/api/users").is_none());
+
+        // / still uses vhost default
+        assert!(t.cache_config("example.com", "/").is_some());
     }
 }

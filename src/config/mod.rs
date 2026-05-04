@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("cannot read {path}"))?;
-    let mut cfg: Config = serde_yaml::from_str(&raw)
+    let mut cfg: Config = serde_yml::from_str(&raw)
         .with_context(|| format!("cannot parse {path}"))?;
     cfg.path = path.to_owned();
     cfg.conf_dir = conf_dir.map(|s| s.to_owned());
@@ -51,7 +51,7 @@ pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
 
             check_no_root_sections(&frag_str, &raw)?;
 
-            let fragment: IncludeFragment = serde_yaml::from_str(&raw)
+            let fragment: IncludeFragment = serde_yml::from_str(&raw)
                 .with_context(|| format!("cannot parse {frag_str}"))?;
 
             // Pools merge as a map — duplicate name is an error.
@@ -76,7 +76,7 @@ pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
 
 /// Reject conf.d files that contain root-only sections.
 fn check_no_root_sections(path: &str, raw: &str) -> Result<()> {
-    let value: serde_yaml::Value = serde_yaml::from_str(raw)
+    let value: serde_yml::Value = serde_yml::from_str(raw)
         .with_context(|| format!("cannot parse {path}"))?;
 
     let forbidden = ["keel", "metrics", "access_log", "include", "cluster"];
@@ -132,6 +132,9 @@ pub struct Config {
 
     #[serde(default)]
     pub access_log: AccessLogConfig,
+
+    #[serde(default)]
+    pub cache: CacheConfig,
 
     /// Glob patterns for conf.d include files. Processed at load time.
     #[serde(default)]
@@ -313,6 +316,37 @@ pub struct ForwardedHeadersConfig {
     pub trusted_proxies: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CacheConfig {
+    /// Memory budget, e.g. "256M", "1G". Memory cache disabled if absent.
+    pub memory: Option<String>,
+    /// Disk cache config. Disk cache disabled if absent.
+    pub disk: Option<DiskCacheConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiskCacheConfig {
+    /// Directory for cache files.
+    pub path: String,
+    /// Disk budget, e.g. "500M", "10G".
+    pub size: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct VhostCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fallback TTL in seconds when origin sends no Cache-Control.
+    pub ttl: Option<u32>,
+    /// HTTP status codes to cache. Defaults to [200] when empty.
+    #[serde(default)]
+    pub statuses: Vec<u16>,
+    /// Content-type prefixes to cache. Empty means no restriction.
+    /// Supports trailing wildcard: "image/*" matches "image/png", "image/jpeg", etc.
+    #[serde(default)]
+    pub content_types: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Vhost {
     pub host: String,
@@ -325,12 +359,21 @@ pub struct Vhost {
     pub tls: Option<TlsConfig>,
 
     pub forwarded_headers: Option<ForwardedHeadersConfig>,
+
+    pub cache: Option<VhostCacheConfig>,
+
+    /// Redirect plain HTTP requests to HTTPS with a 301.
+    /// Defaults to true when `tls.acme: true`; must be set explicitly for BYO certs.
+    #[serde(default)]
+    pub redirect_http: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Route {
     pub path: String,
     pub pool: String,
+    /// Per-route cache config. Overrides the vhost-level cache config when set.
+    pub cache: Option<VhostCacheConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

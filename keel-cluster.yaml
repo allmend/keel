@@ -11,12 +11,26 @@ listeners:
 metrics:
   address: 0.0.0.0:9090
 
+access_log:
+  enabled: true
+  dir: /var/log/keel
+
+# Two-tier cache. Each node caches independently — no cross-node coordination.
+cache:
+  memory: 256M
+  disk:
+    path: /var/cache/keel
+    size: 10G
+
+# Cluster config. Peers are added at startup via --join, not here.
+# Bootstrap first node:  keel --config keel-cluster.yaml --cluster --bootstrap --secret <secret>
+# Join an existing node: keel --config keel-cluster.yaml --cluster --join 10.0.0.1:7654 --secret <secret>
 cluster:
+  addr: 0.0.0.0:7654        # RPC listen address for peer connections
   secret: change-me-in-production
-  peers:
-    - 10.0.0.1:7000
-    - 10.0.0.2:7000
-    - 10.0.0.3:7000
+  # Bring your own CA instead of the auto-generated one:
+  # ca_cert: /etc/keel/cluster-ca.crt
+  # ca_key:  /etc/keel/cluster-ca.key
 
 pools:
   web:
@@ -42,3 +56,15 @@ vhosts:
     tls:
       cert: /etc/keel/certs/example.crt
       key: /etc/keel/certs/example.key
+    forwarded_headers:
+      mode: replace
+    cache:
+      enabled: true
+      ttl: 300
+      statuses: [200, 301]
+      content_types:
+        - text/html
+        - text/css
+        - application/javascript
+        - image/*
+        - font/*

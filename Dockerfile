@@ -1,4 +1,4 @@
-# ── Build stage ───────────────────────────────────────────────────────────────
+#  Build stage
 FROM rust:1-bookworm AS builder
 
 WORKDIR /build
@@ -12,7 +12,7 @@ COPY src ./src
 
 RUN cargo build --release
 
-# ── Runtime stage ─────────────────────────────────────────────────────────────
+#  Runtime stage
 FROM debian:bookworm-slim
 
 RUN apt-get update \

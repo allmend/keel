@@ -1,5 +1,6 @@
 mod access_log;
 mod backend;
+mod cache;
 mod cluster;
 mod config;
 mod control;

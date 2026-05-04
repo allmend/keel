@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as RaftConfig, Raft};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::cluster::types::{ClientRequest, NodeId, TypeConfig};
 
 pub type ClusterRaft = Raft<TypeConfig>;
 
-// ── OPTIONS ───────────────────────────────────────────────────────────────────
+// OPTIONS 
 
 pub struct ClusterOpts {
     pub node_id: NodeId,
@@ -35,7 +35,7 @@ pub struct ClusterOpts {
     pub join: Option<String>,
 }
 
-// ── CLUSTER HANDLE ────────────────────────────────────────────────────────────
+// CLUSTER HANDLE 
 
 #[derive(Clone)]
 pub struct ClusterHandle {
@@ -51,11 +51,10 @@ impl ClusterHandle {
     }
 }
 
-// ── CERTIFICATE HELPERS ───────────────────────────────────────────────────────
+// CERTIFICATE HELPERS 
 
 struct Ca {
-    cert: rcgen::Certificate,
-    key: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
 }
 
@@ -67,7 +66,8 @@ impl Ca {
         params.distinguished_name.push(rcgen::DnType::CommonName, "Keel Cluster CA");
         let cert = params.self_signed(&key)?;
         let cert_pem = cert.pem();
-        Ok(Self { cert, key, cert_pem })
+        let issuer = Issuer::new(params, key);
+        Ok(Self { issuer, cert_pem })
     }
 
     fn issue_node_cert(&self, node_id: NodeId) -> Result<(String, String)> {
@@ -80,7 +80,7 @@ impl Ca {
         params.subject_alt_names = vec![rcgen::SanType::DnsName(
             "keel-cluster".try_into().map_err(|e| anyhow::anyhow!("SAN: {e:?}"))?,
         )];
-        let node_cert = params.signed_by(&node_key, &self.cert, &self.key)?;
+        let node_cert = params.signed_by(&node_key, &self.issuer)?;
         Ok((node_cert.pem(), node_key.serialize_pem()))
     }
 }
@@ -141,7 +141,7 @@ fn build_server_tls(
     Ok(Arc::new(cfg))
 }
 
-// ── JOIN PROTOCOL ─────────────────────────────────────────────────────────────
+// JOIN PROTOCOL 
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JoinRequest {
@@ -194,7 +194,7 @@ async fn do_join(
     }
 }
 
-// ── PEER RPC LISTENER ─────────────────────────────────────────────────────────
+// PEER RPC LISTENER 
 
 /// Dispatches one mTLS peer connection to the Raft node.
 async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: Arc<ClusterRaft>) {
@@ -287,7 +287,7 @@ async fn handle_join(
     }
 }
 
-// ── CLUSTER SERVICE ───────────────────────────────────────────────────────────
+// CLUSTER SERVICE 
 
 pub struct ClusterService {
     opts: ClusterOpts,
@@ -308,7 +308,7 @@ impl ClusterService {
     async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
         let opts = &self.opts;
 
-        // ── CERTIFICATES ──────────────────────────────────────────────────────
+        // CERTIFICATES 
         if !opts.bootstrap && opts.join.is_none() {
             anyhow::bail!("cluster mode requires --bootstrap or --join");
         }
@@ -328,7 +328,7 @@ impl ClusterService {
             (ca_pem, cert, key, None)
         };
 
-        // ── RAFT INITIALIZATION ───────────────────────────────────────────────
+        // RAFT INITIALIZATION 
         let sm = StateMachine::default();
         sm.set_config_tx(Arc::clone(&self.config_tx));
 
@@ -344,7 +344,7 @@ impl ClusterService {
                 .map_err(|e| anyhow::anyhow!("Raft init: {e:?}"))?,
         );
 
-        // ── BOOTSTRAP (initial leader) ────────────────────────────────────────
+        // BOOTSTRAP (initial leader) 
         if opts.bootstrap {
             let mut members = BTreeMap::new();
             members.insert(opts.node_id, BasicNode { addr: opts.cluster_addr.clone() });
@@ -358,7 +358,7 @@ impl ClusterService {
         // Publish the raft handle so ControlServer can use it.
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
 
-        // ── PEER LISTENER ─────────────────────────────────────────────────────
+        // PEER LISTENER 
         let server_tls = build_server_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
         let acceptor = TlsAcceptor::from(server_tls);
         let listener = TcpListener::bind(&opts.cluster_addr)
@@ -416,7 +416,7 @@ impl ClusterService {
     }
 }
 
-// ── PUBLIC FACTORY ────────────────────────────────────────────────────────────
+// PUBLIC FACTORY 
 
 pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let raft_slot = Arc::new(Mutex::new(None));
@@ -429,7 +429,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     (handle, service)
 }
 
-// ── KEELCTL HELPERS ───────────────────────────────────────────────────────────
+// KEELCTL HELPERS 
 
 /// Submit a config YAML to the cluster via Raft. Returns when committed.
 pub async fn push_config(raft: &ClusterRaft, yaml: String) -> Result<()> {
