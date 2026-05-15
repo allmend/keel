@@ -10,12 +10,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-// METRIC HANDLES
+// Metric handles
 
 const LATENCY_BUCKETS: &[f64] =
     &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-// Request-level
+// Request metrics
 
 pub static REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
@@ -63,7 +63,7 @@ pub static LB_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register keel_lb_errors_total")
 });
 
-// Backend-level
+// Backend metrics
 
 pub static BACKEND_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
@@ -120,7 +120,7 @@ pub static BACKEND_DRAIN_STATE: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("register keel_backend_drain_state")
 });
 
-// HELPER FUNCTIONS
+// Helper functions
 
 pub fn record_request(pool: &str, vhost: &str, status: u16, duration_secs: f64) {
     let s = status.to_string();
@@ -165,7 +165,7 @@ pub fn set_drain_state(pool: &str, backend: &str, state: u8) {
     BACKEND_DRAIN_STATE.with_label_values(&[pool, backend]).set(state as f64);
 }
 
-// METRICS HTTP SERVICE
+// Metrics service
 
 /// Lightweight HTTP service that serves Prometheus metrics at GET /metrics.
 pub struct MetricsService {

@@ -25,7 +25,7 @@ use crate::cluster::types::{ClientRequest, NodeId, TypeConfig};
 
 pub type ClusterRaft = Raft<TypeConfig>;
 
-// OPTIONS 
+// Options
 
 pub struct ClusterOpts {
     pub node_id: NodeId,
@@ -35,7 +35,7 @@ pub struct ClusterOpts {
     pub join: Option<String>,
 }
 
-// CLUSTER HANDLE 
+// Cluster handle
 
 #[derive(Clone)]
 pub struct ClusterHandle {
@@ -51,7 +51,7 @@ impl ClusterHandle {
     }
 }
 
-// CERTIFICATE HELPERS 
+// Certificate helpers
 
 struct Ca {
     issuer: Issuer<'static, KeyPair>,
@@ -141,7 +141,7 @@ fn build_server_tls(
     Ok(Arc::new(cfg))
 }
 
-// JOIN PROTOCOL 
+// Join protocol
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JoinRequest {
@@ -194,7 +194,7 @@ async fn do_join(
     }
 }
 
-// PEER RPC LISTENER 
+// Peer RPC listener
 
 /// Dispatches one mTLS peer connection to the Raft node.
 async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: Arc<ClusterRaft>) {
@@ -287,7 +287,7 @@ async fn handle_join(
     }
 }
 
-// CLUSTER SERVICE 
+// Cluster service
 
 pub struct ClusterService {
     opts: ClusterOpts,
@@ -308,7 +308,6 @@ impl ClusterService {
     async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
         let opts = &self.opts;
 
-        // CERTIFICATES 
         if !opts.bootstrap && opts.join.is_none() {
             anyhow::bail!("cluster mode requires --bootstrap or --join");
         }
@@ -328,7 +327,6 @@ impl ClusterService {
             (ca_pem, cert, key, None)
         };
 
-        // RAFT INITIALIZATION 
         let sm = StateMachine::default();
         sm.set_config_tx(Arc::clone(&self.config_tx));
 
@@ -344,7 +342,6 @@ impl ClusterService {
                 .map_err(|e| anyhow::anyhow!("Raft init: {e:?}"))?,
         );
 
-        // BOOTSTRAP (initial leader) 
         if opts.bootstrap {
             let mut members = BTreeMap::new();
             members.insert(opts.node_id, BasicNode { addr: opts.cluster_addr.clone() });
@@ -358,7 +355,6 @@ impl ClusterService {
         // Publish the raft handle so ControlServer can use it.
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
 
-        // PEER LISTENER 
         let server_tls = build_server_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
         let acceptor = TlsAcceptor::from(server_tls);
         let listener = TcpListener::bind(&opts.cluster_addr)
@@ -416,7 +412,7 @@ impl ClusterService {
     }
 }
 
-// PUBLIC FACTORY 
+// Public factory
 
 pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let raft_slot = Arc::new(Mutex::new(None));
@@ -429,7 +425,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     (handle, service)
 }
 
-// KEELCTL HELPERS 
+// Cluster operations
 
 /// Submit a config YAML to the cluster via Raft. Returns when committed.
 pub async fn push_config(raft: &ClusterRaft, yaml: String) -> Result<()> {

@@ -15,7 +15,7 @@ use pingora::{Error, ErrorType::InternalError};
 use tokio::fs;
 use tracing::warn;
 
-// FILE FORMAT
+// File format
 // [4 LE bytes: internal_len][internal_meta bytes]
 // [4 LE bytes: header_len][header_meta bytes]
 // [body bytes]
@@ -68,7 +68,7 @@ fn decode_entry(data: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     Some((internal, header, body))
 }
 
-// HIT HANDLER
+// Hit handler
 
 struct DiskHit {
     body: Arc<Vec<u8>>,
@@ -117,7 +117,7 @@ impl HandleHit for DiskHit {
     fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) { self }
 }
 
-// MISS HANDLER
+// Miss handler
 
 pub struct DiskMiss {
     meta_internal: Vec<u8>,
@@ -182,7 +182,7 @@ impl HandleMiss for DiskMiss {
     }
 }
 
-// STORAGE IMPL
+// Storage impl
 
 #[async_trait]
 impl Storage for DiskStore {

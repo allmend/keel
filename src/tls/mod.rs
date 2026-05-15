@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-// CERT STORE
+// Cert store
 
 struct CertPair {
     cert: X509,
@@ -72,7 +72,7 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
     Ok(map)
 }
 
-// SNI CERT RESOLVER
+// SNI cert resolver
 
 /// Selects a certificate per TLS handshake based on the SNI hostname.
 /// Falls back to the `"*"` entry if no exact match is found.

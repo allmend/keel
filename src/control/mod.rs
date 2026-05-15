@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
-// PROTOCOL TYPES
+// Protocol types
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -18,6 +18,7 @@ pub enum ControlRequest {
     BackendDrain { address: String, #[serde(default)] wait: bool },
     ConfigReload,
     ClusterStatus,
+    ClusterDemote,
     ConfigPush { yaml: String },
 }
 
@@ -43,7 +44,7 @@ impl ControlResponse {
     }
 }
 
-// SERVER
+// Server
 
 pub struct ControlServer {
     pub socket_path: String,
@@ -103,7 +104,7 @@ impl pingora::services::background::BackgroundService for ControlServer {
     }
 }
 
-// CONNECTION HANDLER
+// Connection handler
 
 async fn handle_connection(
     stream: tokio::net::UnixStream,
@@ -191,6 +192,11 @@ async fn handle_connection(
             write_line(&mut writer, &resp).await?;
         }
 
+        ControlRequest::ClusterDemote => {
+            let resp = cmd_cluster_demote(&cluster).await;
+            write_line(&mut writer, &resp).await?;
+        }
+
         ControlRequest::ConfigPush { yaml } => {
             let resp = cmd_config_push(&cluster, yaml).await;
             write_line(&mut writer, &resp).await?;
@@ -209,7 +215,7 @@ async fn write_line(
     Ok(())
 }
 
-// COMMAND IMPLEMENTATIONS
+// Command implementations
 
 fn cmd_status(pools: &PoolRegistry, started_at: Instant) -> String {
     let uptime_secs = started_at.elapsed().as_secs();
@@ -284,6 +290,25 @@ async fn cmd_cluster_status(cluster: &Option<crate::cluster::ClusterHandle>) -> 
         "last_committed": m.last_applied.map(|l| l.index),
         "membership": members,
     }))
+}
+
+async fn cmd_cluster_demote(cluster: &Option<crate::cluster::ClusterHandle>) -> String {
+    let Some(ch) = cluster else {
+        return ControlResponse::err("not in cluster mode");
+    };
+    let Some(raft) = ch.raft().await else {
+        return ControlResponse::err("cluster not yet initialized");
+    };
+    let m = raft.metrics().borrow().clone();
+    if m.current_leader != Some(m.id) {
+        return ControlResponse::err("this node is not the leader");
+    }
+    match raft.trigger().elect().await {
+        Ok(()) => ControlResponse::ok(serde_json::json!({
+            "message": "leadership transfer requested; a new election will begin"
+        })),
+        Err(e) => ControlResponse::err(e.to_string()),
+    }
 }
 
 async fn cmd_config_push(cluster: &Option<crate::cluster::ClusterHandle>, yaml: String) -> String {

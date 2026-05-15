@@ -34,7 +34,7 @@ use std::time::Instant;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 
-// PER-REQUEST CONTEXT
+// Per-request context
 
 pub struct ProxyCtx {
     pool: String,
@@ -53,7 +53,7 @@ pub struct ProxyCtx {
     user_agent: Option<String>,
 }
 
-// PROXY IMPLEMENTATION
+// Proxy implementation
 
 pub struct KProxy {
     routing: Arc<ArcSwap<RoutingTable>>,
@@ -359,14 +359,14 @@ impl ProxyHttp for KProxy {
             return Ok(Uncacheable(NoCacheReason::Custom("not configured")));
         };
 
-        // --- Status filter (default: 200 only) ---
+        // Status filter (default: 200 only)
         let status = resp.status.as_u16();
         let allowed = if rule.statuses.is_empty() { &[200u16] as &[u16] } else { &rule.statuses };
         if !allowed.contains(&status) {
             return Ok(Uncacheable(NoCacheReason::Custom("status filtered")));
         }
 
-        // --- Content-type filter (empty = no restriction) ---
+        // Content-type filter (empty = no restriction)
         if !rule.content_types.is_empty() {
             let ct = resp.headers
                 .get("content-type")
@@ -386,12 +386,12 @@ impl ProxyHttp for KProxy {
             }
         }
 
-        // --- Cache-Control from origin ---
+        // Cache-Control from origin
         static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
         let cc = CacheControl::from_headers_named("cache-control", &resp.headers);
         let result = resp_cacheable(cc.as_ref(), resp.clone(), false, &DEFAULTS);
 
-        // --- TTL override: force-cache when origin sends no Cache-Control ---
+        // TTL override: apply fallback when origin sends no Cache-Control
         if matches!(result, Uncacheable(_)) {
             if let Some(ttl) = rule.ttl {
                 let now = SystemTime::now();
@@ -506,7 +506,7 @@ impl ProxyHttp for KProxy {
     }
 }
 
-// HELPERS
+// Helpers
 
 fn is_trusted_proxy(ip: &IpAddr, cidrs: &[String]) -> bool {
     cidrs.iter().any(|cidr| {
@@ -516,7 +516,7 @@ fn is_trusted_proxy(ip: &IpAddr, cidrs: &[String]) -> bool {
     })
 }
 
-// HOT RELOAD SERVICE
+// Hot reload service
 
 struct ReloadService {
     routing: Arc<ArcSwap<RoutingTable>>,
@@ -566,11 +566,9 @@ impl pingora::services::background::BackgroundService for ReloadService {
     }
 }
 
-// SERVER STARTUP
+// Server startup
 
-// Build all pools from config, registering health-check background services on
-// the server. Returns the completed `PoolRegistry`.
-// Resolve a backend address to IP:port. Pass-through if already an IP, DNS-resolve if hostname.
+// Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
 fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr.to_owned());
@@ -583,6 +581,7 @@ fn resolve_addr(addr: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no address resolved for '{addr}'"))
 }
 
+// Builds all pools from config, registering health-check background services on the server.
 fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry> {
     let mut pools: HashMap<String, Pool> = HashMap::new();
     let mut drain: HashMap<String, crate::backend::BackendEntry> = HashMap::new();
@@ -771,7 +770,7 @@ pub fn run(cfg: &Config) -> ! {
     server.run_forever()
 }
 
-// CLUSTER RELOAD WATCHER
+// Cluster reload watcher
 
 struct ClusterReloadWatcher {
     routing: Arc<ArcSwap<RoutingTable>>,

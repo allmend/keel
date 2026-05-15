@@ -12,7 +12,7 @@ use openraft::{
 
 use crate::cluster::types::{ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig};
 
-// LOG STORE 
+// Log store
 
 #[derive(Debug, Default)]
 struct LogStoreData {
@@ -125,7 +125,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 }
 
-// STATE MACHINE 
+// State machine
 
 #[derive(Debug, Default)]
 struct StateMachineData {

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-// DRAIN STATE
+// Drain state
 
 pub const DRAIN_ACTIVE: u8 = 0;
 pub const DRAIN_DRAINING: u8 = 1;
@@ -37,7 +37,7 @@ pub struct BackendStatus {
     pub connections: i64,
 }
 
-// POOL VARIANTS
+// Pool variants
 
 pub enum Pool {
     RoundRobin(Arc<LoadBalancer<RoundRobin>>),
@@ -46,7 +46,7 @@ pub enum Pool {
     LeastConn(Arc<LeastConnPool>),
 }
 
-// POOL REGISTRY
+// Pool registry
 
 /// Manages all configured backend pools, their selection algorithms, and per-backend
 /// drain state / connection counters.
@@ -272,7 +272,7 @@ impl PoolRegistry {
     }
 }
 
-// HELPERS
+// Helpers
 
 pub fn drain_key(pool: &str, addr: &str) -> String {
     format!("{pool}/{addr}")
@@ -300,7 +300,7 @@ fn track_and_return(
     Some(addr)
 }
 
-// LEAST CONNECTIONS
+// Least connections
 
 pub struct LeastConnEntry {
     pub addr: SocketAddr,
@@ -350,7 +350,7 @@ impl LeastConnPool {
     }
 }
 
-// LOAD BALANCER BUILDER
+// Load balancer builder
 
 /// Build a Pingora LoadBalancer from backend addresses (unweighted; weights are
 /// handled by Pingora internally when using `Backend::new_with_weight`).

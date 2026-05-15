@@ -56,10 +56,6 @@ struct Cli {
     #[arg(long)]
     ca_key: Option<String>,
 
-    /// Trigger zero-downtime binary upgrade
-    #[arg(long)]
-    upgrade: bool,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -92,6 +88,8 @@ enum Command {
 enum ClusterCommand {
     /// Show cluster status
     Status,
+    /// Step down as leader and trigger a new election
+    Demote,
 }
 
 #[derive(Subcommand)]
@@ -138,7 +136,6 @@ fn main() -> Result<()> {
 
     match detect_mode(&cli) {
         Mode::Cli(cmd) => run_cli(cmd, &cli.socket),
-        Mode::Upgrade => run_upgrade(),
         Mode::ClusterBootstrap => run_server(cli),
         Mode::ClusterJoin => run_server(cli),
         Mode::Standalone => run_server(cli),
@@ -147,7 +144,6 @@ fn main() -> Result<()> {
 
 enum Mode<'a> {
     Cli(&'a Command),
-    Upgrade,
     ClusterBootstrap,
     ClusterJoin,
     Standalone,
@@ -156,9 +152,6 @@ enum Mode<'a> {
 fn detect_mode(cli: &Cli) -> Mode<'_> {
     if let Some(cmd) = &cli.command {
         return Mode::Cli(cmd);
-    }
-    if cli.upgrade {
-        return Mode::Upgrade;
     }
     if cli.cluster && cli.bootstrap {
         return Mode::ClusterBootstrap;
@@ -215,11 +208,7 @@ fn derive_node_id(addr: &str) -> u64 {
     h.finish()
 }
 
-fn run_upgrade() -> Result<()> {
-    todo!("binary upgrade via USR2 + fd passing — Phase 4")
-}
-
-// CLI CLIENT
+// Cli commands
 
 fn run_cli(cmd: &Command, socket: &str) -> Result<()> {
     match cmd {
@@ -234,6 +223,7 @@ fn run_cli(cmd: &Command, socket: &str) -> Result<()> {
             ConfigCommand::Push { file } => cli_config_push(socket, file),
         },
         Command::Cluster { command: ClusterCommand::Status } => cli_cluster_status(socket),
+        Command::Cluster { command: ClusterCommand::Demote } => cli_cluster_demote(socket),
     }
 }
 
@@ -360,6 +350,15 @@ fn cli_cluster_status(socket: &str) -> Result<()> {
     Ok(())
 }
 
+fn cli_cluster_demote(socket: &str) -> Result<()> {
+    use control::ControlRequest;
+
+    let resp = send_request(socket, &ControlRequest::ClusterDemote)?;
+    let data = require_ok(&resp)?;
+    println!("{}", data["message"].as_str().unwrap_or("done"));
+    Ok(())
+}
+
 fn cli_config_push(socket: &str, file: &str) -> Result<()> {
     use control::ControlRequest;
 
@@ -388,7 +387,7 @@ fn cli_config_reload(socket: &str) -> Result<()> {
     Ok(())
 }
 
-// HELPERS
+// Helpers
 
 fn send_request(socket: &str, request: &control::ControlRequest) -> Result<serde_json::Value> {
     use std::io::{BufRead, BufReader, Write};
