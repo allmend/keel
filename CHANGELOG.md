@@ -8,6 +8,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [0.2.0-alpha] — 2026-07-03
+
 ### Added
 
 - **ACME certificates replicate through Raft in cluster mode.** Only the
