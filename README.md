@@ -1,6 +1,6 @@
 # Keel
 
-> **Pre-alpha.** Keel is still finding its sea legs. Expect rough edges, breaking config changes between versions, and the occasional existential crisis about whether Raft really needs that many log entries. Core proxy, TLS, clustering, and caching work — but we wouldn't stake a production fleet on it just yet. Early feedback very welcome.
+> **Alpha.** Keel is still finding its sea legs. Expect rough edges, breaking config changes between versions, and the occasional existential crisis about whether Raft really needs that many log entries. Core proxy, TLS + ACME, clustering, and caching work — but we wouldn't stake a production fleet on it just yet. Early feedback very welcome.
 
 ---
 
@@ -10,9 +10,10 @@ A fast, modern, self-hosted load balancer, reverse proxy, and API gateway built 
 
 - **Live backend drain** — gracefully remove a backend without dropping connections
 - **Runtime pool management** — no reload required to change backend state
+- **Automatic TLS** — ACME (Let's Encrypt or any ACME v2 CA), issuance to renewal, no restarts
 - **Balanced workers** — async multithreaded (Tokio), not per-process like Nginx
 - **True config hot-swap** — SIGHUP reloads config and TLS certs without restart
-- **Clustering built in** — Raft consensus, mTLS peer mesh, distributed drain
+- **Clustering built in** — Raft consensus, mTLS peer mesh, distributed drain, replicated certificates
 - **Written in Rust** — memory safe, single static binary, minimal attack surface
 
 Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allmend/keel)
@@ -26,25 +27,39 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
 - TLS termination with per-vhost certificates
-- HTTP → HTTPS redirect
+- **ACME / automatic TLS** — named issuers (Let's Encrypt default, internal CAs supported), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
+- HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Health checks — TCP and HTTP
 - Backend drain with live connection tracking
 - Config hot reload (SIGHUP or `keel config reload`)
 - TLS certificate hot-swap
 - Two-tier HTTP cache (memory L1 + disk L2)
-- PROXY Protocol inbound (cloud LB → Keel)
 - Prometheus metrics (`/metrics`)
 - NDJSON access logs, per-vhost
-- conf.d config splitting
-- Raft-based clustering with mTLS
+- conf.d config splitting — vhosts, pools, and certificates per team file
+- Raft-based clustering with mTLS, encrypted join, automatic voter promotion
 - Distributed config push via `keel config push`
-- ACME / automatic TLS - In roadmap
-- API gateway (rate limiting, auth, transforms) - In roadmap
-- UDP load balancing - In roadmap
+- Cluster-replicated ACME certificates — leader issues, every node serves
+- Graceful node removal — `keel cluster stepdown` with quorum-loss protection
+
+In the roadmap: API gateway features (rate limiting, auth, transforms), TCP/UDP (L4) load balancing, PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
 ## Quick Start
+
+### Container / prebuilt binaries
+
+Releases ship a multi-arch container (`FROM scratch`, static binary) and
+static Linux binaries (x86_64 + arm64, MUSL):
+
+```bash
+docker pull ghcr.io/allmend/keel:0.2.0-alpha
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.2.0-alpha
+```
+
+Or grab a tarball from the [releases page](https://github.com/allmend/keel/releases)
+— binary, example config, and `SHA256SUMS` included.
 
 ### Docker Compose (recommended for trying it out)
 
@@ -101,6 +116,26 @@ vhosts:
     pool: web
 ```
 
+### Automatic TLS
+
+Add three lines and Keel obtains and renews the certificate itself:
+
+```yaml
+acme:
+  issuers:
+    default:
+      email: ops@example.com
+
+vhosts:
+  - host: example.com
+    pool: web
+    tls:
+      acme: true      # HTTP-01 via Let's Encrypt; renews automatically
+```
+
+See [docs/acme.md](docs/acme.md) for named issuers (multiple CAs side by
+side), renewal tuning, and certificates for TCP/passthrough backends.
+
 ---
 
 ## CLI
@@ -111,7 +146,8 @@ keel backend list --pool web             # list backends and connection counts
 keel backend drain 10.0.0.1:8080 --wait # drain a backend, stream live status
 keel config reload                       # reload config from disk (same as SIGHUP)
 keel config push keel.yaml               # push config to entire cluster via Raft
-keel cluster status                      # cluster membership and Raft state
+keel cluster status                      # cluster membership and Raft roles
+keel cluster stepdown                    # gracefully leave the cluster (--force to override quorum guard)
 ```
 
 ---
@@ -128,7 +164,7 @@ keel --config keel.yaml --cluster --bootstrap --secret mytoken
 keel --config keel.yaml --cluster --join 10.0.0.1 --secret mytoken
 ```
 
-All inter-node traffic is mTLS. The cluster CA is generated automatically from the shared secret, or you can bring your own CA. Config changes are committed via Raft and applied atomically across all nodes.
+All inter-node traffic is mTLS and the join exchange itself is encrypted with a key derived from the shared secret. The cluster CA is generated automatically, or bring your own. Joining nodes retry with backoff (safe to start all nodes at once) and are promoted to Raft voters once caught up. Config changes — and ACME certificates — are committed via Raft and applied on every node; `keel cluster stepdown` removes a node gracefully, refusing (without `--force`) when the remaining nodes would lose quorum.
 
 ---
 
@@ -149,7 +185,7 @@ All inter-node traffic is mTLS. The cluster CA is generated automatically from t
 
 ## Status
 
-Keel is pre-release (v0.1.0-alpha). Core proxy, TLS, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is pre-release (v0.2.0-alpha). Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 
