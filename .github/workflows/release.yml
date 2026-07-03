@@ -1,0 +1,179 @@
+# Release pipeline — runs on version tags (v0.1.0-alpha, v0.2.0, …).
+#
+# Produces:
+#   - Static binaries: linux x86_64 + arm64 (MUSL, fully static),
+#     FreeBSD x86_64 (mostly static). aarch64-unknown-freebsd is a Rust
+#     tier-3 target (no prebuilt std) and is not built.
+#   - Multi-arch container (linux/amd64 + linux/arm64) on ghcr.io, FROM scratch.
+#     Tagged {version}; also {major}.{minor} and latest for stable (non-pre) tags.
+#   - A GitHub Release with the tarballs, SHA256SUMS, and pull instructions.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/keel
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux_x86_64
+            target: x86_64-unknown-linux-musl
+          - name: linux_arm64
+            target: aarch64-unknown-linux-musl
+          - name: freebsd_x86_64
+            target: x86_64-unknown-freebsd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }} --features vendored-openssl
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="keel-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/${PKG}"
+          cp "target/${{ matrix.target }}/release/keel" "dist/${PKG}/"
+          cp README.md LICENSE CHANGELOG.md keel.yaml "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: dist/*.tar.gz
+          retention-days: 7
+
+      # Raw binaries for the container job (linux targets only)
+      - name: Upload binary
+        if: startsWith(matrix.name, 'linux')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/keel
+          retention-days: 7
+
+  container:
+    name: Container (ghcr.io)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-linux_*
+          path: bins
+
+      - name: Arrange binaries for buildx
+        run: |
+          mkdir -p dist/linux-amd64 dist/linux-arm64
+          install -m 0755 bins/bin-linux_x86_64/keel dist/linux-amd64/keel
+          install -m 0755 bins/bin-linux_arm64/keel  dist/linux-arm64/keel
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # semver tags: 0.1.0-alpha for prereleases; stable tags additionally get
+      # {major}.{minor} and latest (metadata-action skips those for prereleases).
+      - name: Container metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    name: GitHub Release
+    needs: [build, container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: pkgs
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd pkgs
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > notes.md <<EOF
+          ## Container
+
+          \`\`\`bash
+          docker pull ${IMAGE}:${VERSION}
+          \`\`\`
+
+          Multi-arch (linux/amd64, linux/arm64), \`FROM scratch\`, static MUSL binary.
+
+          ## Binaries
+
+          | File | Platform |
+          |---|---|
+          | \`keel-${VERSION}-linux_x86_64.tar.gz\` | Linux x86_64 (MUSL, fully static) |
+          | \`keel-${VERSION}-linux_arm64.tar.gz\` | Linux aarch64 (MUSL, fully static) |
+          | \`keel-${VERSION}-freebsd_x86_64.tar.gz\` | FreeBSD x86_64 |
+
+          Verify with \`sha256sum -c SHA256SUMS\`.
+
+          FreeBSD arm64 is not provided: aarch64-unknown-freebsd is a Rust tier-3
+          target without prebuilt standard library support.
+
+          See CHANGELOG.md for what changed in this release.
+          EOF
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            pkgs/*.tar.gz
+            pkgs/SHA256SUMS
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

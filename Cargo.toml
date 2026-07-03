@@ -60,3 +60,17 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 # AEAD + digest for encrypting the cluster join exchange (already in tree via rustls)
 ring = "0.17"
+
+# Already in tree via pingora's openssl feature; declared here so release builds
+# can force the vendored (compiled-from-source, statically linked) OpenSSL.
+openssl = "0.10"
+
+[features]
+default = []
+# Static release builds (MUSL, FreeBSD cross): build OpenSSL from source instead
+# of linking the system library. Local dev builds keep using system OpenSSL.
+vendored-openssl = ["openssl/vendored"]
+
+[profile.release]
+strip = true
+lto = "thin"

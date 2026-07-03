@@ -1,0 +1,18 @@
+# Release container — FROM scratch with a prebuilt static MUSL binary.
+# Built by .github/workflows/release.yml, which places the binaries at
+# dist/linux-amd64/keel and dist/linux-arm64/keel before invoking buildx.
+#
+# For local development builds use ./Dockerfile instead.
+
+FROM alpine:3 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+ARG TARGETARCH
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY dist/linux-${TARGETARCH}/keel /keel
+
+EXPOSE 80 443 9090
+
+ENTRYPOINT ["/keel"]
+CMD ["--config", "/etc/keel/keel.yaml"]

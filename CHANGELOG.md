@@ -18,6 +18,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   to voters by the leader once their log catches up, making the documented quorum
   model (3 nodes = 2 of 3, etc.) actually hold. `keel cluster status` now shows
   each member's Raft role (`voter` / `learner`).
+- **Release pipeline.** Version tags build static binaries (Linux x86_64/arm64
+  MUSL, FreeBSD x86_64), publish a multi-arch `FROM scratch` container to
+  `ghcr.io/allmend/keel`, and create a GitHub Release with checksums. New
+  `vendored-openssl` cargo feature for static builds.
+- **LICENSE file** (Apache-2.0, matching the Cargo.toml declaration).
 
 ### Fixed
 
