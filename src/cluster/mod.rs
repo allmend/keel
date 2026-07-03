@@ -128,11 +128,18 @@ pub struct ClusterHandle {
     pub raft: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
     /// Fires when a new config YAML is committed to the Raft log.
     pub config_rx: watch::Receiver<Option<String>>,
+    /// mTLS client config for peer RPCs (set together with `raft`). Used by the
+    /// control plane to forward commands (e.g. stepdown) to the leader.
+    pub client_tls: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
 }
 
 impl ClusterHandle {
     pub async fn raft(&self) -> Option<Arc<ClusterRaft>> {
         self.raft.lock().await.clone()
+    }
+
+    pub async fn client_tls(&self) -> Option<Arc<rustls::ClientConfig>> {
+        self.client_tls.lock().await.clone()
     }
 }
 
@@ -302,6 +309,14 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             Ok(r) => serde_json::to_vec(&RpcResponse::<_> { ok: Some(r), err: None }).unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e.to_string()) }).unwrap(),
         },
+        Ok(RpcRequest::StepDown { node_id }) => match apply_stepdown(&raft, node_id).await {
+            Ok(message) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::StepDownReply { message }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
         Err(e) => {
             serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e.to_string()) }).unwrap()
         }
@@ -348,10 +363,18 @@ async fn handle_join(
             Err(e) => JoinEnvelope::Err { message: e.to_string() },
         };
 
+        let joined = matches!(envelope, JoinEnvelope::Ok(_));
         let resp = join_seal(&key, &serde_json::to_vec(&envelope)?)?;
         stream.write_all(&(resp.len() as u32).to_be_bytes()).await?;
         stream.write_all(&resp).await?;
         stream.flush().await?;
+
+        // Promote the joiner to voter once it has its certs and its log has
+        // caught up. Without promotion the bootstrap node stays the only voter
+        // forever and the documented quorum model (3 nodes = 2 of 3) never holds.
+        if joined {
+            promote_to_voter(raft, req.node_id, req.addr).await;
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -361,11 +384,52 @@ async fn handle_join(
     }
 }
 
+/// How long the leader waits for a new learner's log to catch up before giving
+/// up on promoting it (it stays a learner and holds no quorum weight).
+const PROMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for a newly joined learner to catch up, then promote it to voter so it
+/// counts toward quorum. Failures are logged, never fatal — the node keeps
+/// working as a learner.
+async fn promote_to_voter(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String) {
+    let m = raft.metrics().borrow().clone();
+    if m.membership_config.membership().voter_ids().any(|v| v == node_id) {
+        return;
+    }
+
+    let node = BasicNode { addr };
+    // Blocking add_learner returns once the leader sees the learner's log caught
+    // up — replication retries internally while the joiner finishes starting.
+    match tokio::time::timeout(PROMOTE_TIMEOUT, raft.add_learner(node_id, node, true)).await {
+        Err(_) => {
+            warn!(
+                node_id,
+                "cluster: learner did not catch up within {}s; leaving as learner",
+                PROMOTE_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            warn!(node_id, error = %e, "cluster: add_learner failed; leaving as learner");
+            return;
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    ids.insert(node_id);
+    match raft.change_membership(openraft::ChangeMembers::AddVoterIds(ids), false).await {
+        Ok(_) => info!(node_id, "cluster: node promoted to voter"),
+        Err(e) => warn!(node_id, error = %e, "cluster: voter promotion failed; node remains a learner"),
+    }
+}
+
 // Cluster service
 
 pub struct ClusterService {
     opts: ClusterOpts,
     raft_slot: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
+    tls_slot: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
     config_tx: Arc<watch::Sender<Option<String>>>,
 }
 
@@ -418,6 +482,7 @@ impl ClusterService {
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
 
         let client_tls = build_client_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
+        *self.tls_slot.lock().await = Some(Arc::clone(&client_tls));
         let net_factory = ClusterNetworkFactory { tls: client_tls };
 
         let raft = Arc::new(
@@ -537,11 +602,16 @@ mod tests {
 
 pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let raft_slot = Arc::new(Mutex::new(None));
+    let tls_slot = Arc::new(Mutex::new(None));
     let (config_tx, config_rx) = watch::channel(None);
     let config_tx = Arc::new(config_tx);
 
-    let handle = ClusterHandle { raft: Arc::clone(&raft_slot), config_rx };
-    let service = ClusterService { opts, raft_slot, config_tx };
+    let handle = ClusterHandle {
+        raft: Arc::clone(&raft_slot),
+        config_rx,
+        client_tls: Arc::clone(&tls_slot),
+    };
+    let service = ClusterService { opts, raft_slot, tls_slot, config_tx };
 
     (handle, service)
 }
@@ -554,4 +624,155 @@ pub async fn push_config(raft: &ClusterRaft, yaml: String) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("config push failed: {e:?}"))?;
     Ok(())
+}
+
+// Stepdown
+//
+// A stepdown gracefully removes the local node from the cluster: the removal is
+// committed to the Raft log (so every remaining node accepts it), and if the
+// leaving node is the leader, openraft steps it down once the change commits and
+// the remaining voters elect a new leader.
+
+/// How long to wait for the membership change to commit before declaring that
+/// the cluster (probably) has no quorum for it.
+const STEPDOWN_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-peer TCP reachability probe timeout for the pre-stepdown quorum check.
+const STEPDOWN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Gracefully remove the local node from the cluster. Runs on the leaving node.
+///
+/// Before committing anything, the remaining voters are probed over TCP: if fewer
+/// than a majority of the post-stepdown cluster are reachable, the cluster would
+/// lose quorum and the stepdown is refused unless `force` is set.
+pub async fn stepdown(
+    raft: &ClusterRaft,
+    client_tls: &Arc<rustls::ClientConfig>,
+    force: bool,
+) -> Result<String> {
+    let m = raft.metrics().borrow().clone();
+    let my_id = m.id;
+    let membership = m.membership_config.membership().clone();
+    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    let addrs: BTreeMap<NodeId, String> =
+        membership.nodes().map(|(id, n)| (*id, n.addr.clone())).collect();
+
+    let Some(leader_id) = m.current_leader else {
+        anyhow::bail!(
+            "cluster has no leader — a membership change cannot be committed right now; \
+             retry once a leader is elected"
+        );
+    };
+
+    if voters.contains(&my_id) {
+        let remaining: Vec<(NodeId, String)> = voters
+            .iter()
+            .filter(|id| **id != my_id)
+            .filter_map(|id| addrs.get(id).map(|a| (*id, a.clone())))
+            .collect();
+
+        if remaining.is_empty() {
+            anyhow::bail!(
+                "this node is the only voter in the cluster; stepping down would destroy it. \
+                 Shut the node down instead (the membership change could never commit)"
+            );
+        }
+
+        // Quorum-loss check: after stepdown the remaining voters must be able to
+        // form a majority among themselves. Probe their cluster listeners.
+        let reachable = probe_reachable(&remaining).await;
+        let needed = remaining.len() / 2 + 1;
+        if reachable < needed {
+            let msg = format!(
+                "Performing this action would cause the cluster to lose quorum: \
+                 after stepdown {needed} of {} remaining voter(s) must be reachable \
+                 to commit changes, but only {reachable} responded.",
+                remaining.len(),
+            );
+            if !force {
+                anyhow::bail!("{msg} Refusing to step down — re-run with --force to attempt anyway.");
+            }
+            warn!("cluster: {msg} Proceeding due to --force");
+        }
+    }
+
+    if leader_id == my_id {
+        let msg = apply_stepdown(raft, my_id).await?;
+        Ok(format!("{msg}. Leadership handed over to the remaining voters; it is safe to stop this node"))
+    } else {
+        let leader_addr = addrs
+            .get(&leader_id)
+            .with_context(|| format!("address of leader {leader_id} unknown"))?;
+        let msg = network::send_stepdown(leader_addr, Arc::clone(client_tls), my_id).await?;
+        Ok(format!("{msg}. It is safe to stop this node"))
+    }
+}
+
+/// Commit the membership change that removes `node_id`. Must run on the leader —
+/// either locally (leader stepping itself down; openraft demotes it after commit)
+/// or on behalf of a follower that forwarded a StepDown RPC.
+///
+/// `change_membership` returns only after the change is committed by quorum, so a
+/// successful return means every remaining node has accepted the stepdown.
+pub async fn apply_stepdown(raft: &ClusterRaft, node_id: NodeId) -> Result<String> {
+    let m = raft.metrics().borrow().clone();
+    if m.current_leader != Some(m.id) {
+        anyhow::bail!(
+            "this node is not the leader (current leader: {}); cannot apply stepdown",
+            m.current_leader.map(|l| l.to_string()).unwrap_or_else(|| "none".to_owned())
+        );
+    }
+
+    let membership = m.membership_config.membership().clone();
+    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    if !membership.nodes().any(|(id, _)| *id == node_id) {
+        anyhow::bail!("node {node_id} is not a cluster member");
+    }
+
+    let mut remove = std::collections::BTreeSet::new();
+    remove.insert(node_id);
+    let change = if voters.contains(&node_id) {
+        if voters.len() == 1 {
+            anyhow::bail!("node {node_id} is the only voter; the cluster cannot remove it");
+        }
+        openraft::ChangeMembers::RemoveVoters(remove)
+    } else {
+        // Learners hold no quorum weight; just drop the node entry.
+        openraft::ChangeMembers::RemoveNodes(remove)
+    };
+
+    // retain=false removes the node from the membership entirely (not learner).
+    match tokio::time::timeout(STEPDOWN_COMMIT_TIMEOUT, raft.change_membership(change, false)).await
+    {
+        Err(_) => anyhow::bail!(
+            "membership change did not commit within {}s — the cluster has likely lost quorum",
+            STEPDOWN_COMMIT_TIMEOUT.as_secs()
+        ),
+        Ok(Err(e)) => anyhow::bail!("membership change failed: {e}"),
+        Ok(Ok(_)) => {
+            info!(node_id, "cluster: node stepped down (membership change committed)");
+            Ok(format!("node {node_id} removed from cluster membership (committed by quorum)"))
+        }
+    }
+}
+
+/// Count how many peers accept a TCP connection on their cluster address within
+/// the probe timeout. A coarse liveness signal, measured from the leaving node.
+async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
+    let mut set = tokio::task::JoinSet::new();
+    for (_, addr) in peers {
+        let addr = addr.clone();
+        set.spawn(async move {
+            matches!(
+                tokio::time::timeout(STEPDOWN_PROBE_TIMEOUT, TcpStream::connect(&addr)).await,
+                Ok(Ok(_))
+            )
+        });
+    }
+    let mut up = 0;
+    while let Some(res) = set.join_next().await {
+        if matches!(res, Ok(true)) {
+            up += 1;
+        }
+    }
+    up
 }

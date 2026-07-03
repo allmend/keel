@@ -18,12 +18,23 @@ use crate::cluster::types::{NodeId, TypeConfig};
 
 // Wire protocol: 4-byte big-endian length prefix, then JSON body.
 
+// Externally tagged (serde default) on purpose: internally-tagged enums are
+// buffered through serde's private Content type, which cannot round-trip the
+// integer map keys inside Raft membership entries (BTreeMap<NodeId, BasicNode>).
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "rpc", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum RpcRequest {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<NodeId>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    /// Ask the receiving node (must be the leader) to remove `node_id` from
+    /// the cluster membership. Sent by a follower that is stepping down.
+    StepDown { node_id: NodeId },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct StepDownReply {
+    pub message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +99,21 @@ impl ClusterNetwork {
             NetworkError::new(&io::Error::new(io::ErrorKind::UnexpectedEof, "empty response"))
         })
     }
+}
+
+/// One-shot stepdown RPC to the leader over the mTLS peer channel. Returns the
+/// leader's confirmation message once the membership change has committed.
+pub(crate) async fn send_stepdown(
+    addr: &str,
+    tls: Arc<rustls::ClientConfig>,
+    node_id: NodeId,
+) -> anyhow::Result<String> {
+    let mut net = ClusterNetwork { target_addr: addr.to_owned(), tls };
+    let reply: StepDownReply = net
+        .call(&RpcRequest::StepDown { node_id })
+        .await
+        .map_err(|e| anyhow::anyhow!("stepdown request to leader at {addr} failed: {e}"))?;
+    Ok(reply.message)
 }
 
 impl RaftNetwork<TypeConfig> for ClusterNetwork {

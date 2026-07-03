@@ -19,6 +19,7 @@ pub enum ControlRequest {
     ConfigReload,
     ClusterStatus,
     ClusterDemote,
+    ClusterStepdown { #[serde(default)] force: bool },
     ConfigPush { yaml: String },
 }
 
@@ -216,6 +217,11 @@ async fn handle_connection(
             write_line(&mut writer, &resp).await?;
         }
 
+        ControlRequest::ClusterStepdown { force } => {
+            let resp = cmd_cluster_stepdown(&cluster, force).await;
+            write_line(&mut writer, &resp).await?;
+        }
+
         ControlRequest::ConfigPush { yaml } => {
             let resp = cmd_config_push(&cluster, yaml).await;
             write_line(&mut writer, &resp).await?;
@@ -295,11 +301,19 @@ async fn cmd_cluster_status(cluster: &Option<crate::cluster::ClusterHandle>) -> 
     };
     let m = raft.metrics().borrow().clone();
     let role = if m.current_leader == Some(m.id) { "leader" } else { "follower" };
+    let voters: std::collections::BTreeSet<_> =
+        m.membership_config.membership().voter_ids().collect();
     let members: Vec<serde_json::Value> = m
         .membership_config
         .membership()
         .nodes()
-        .map(|(id, node)| serde_json::json!({"id": id, "addr": node.addr}))
+        .map(|(id, node)| {
+            serde_json::json!({
+                "id": id,
+                "addr": node.addr,
+                "role": if voters.contains(id) { "voter" } else { "learner" },
+            })
+        })
         .collect();
     ControlResponse::ok(serde_json::json!({
         "role": role,
@@ -327,6 +341,25 @@ async fn cmd_cluster_demote(cluster: &Option<crate::cluster::ClusterHandle>) -> 
             "message": "leadership transfer requested; a new election will begin"
         })),
         Err(e) => ControlResponse::err(e.to_string()),
+    }
+}
+
+async fn cmd_cluster_stepdown(
+    cluster: &Option<crate::cluster::ClusterHandle>,
+    force: bool,
+) -> String {
+    let Some(ch) = cluster else {
+        return ControlResponse::err("not in cluster mode");
+    };
+    let Some(raft) = ch.raft().await else {
+        return ControlResponse::err("cluster not yet initialized");
+    };
+    let Some(tls) = ch.client_tls().await else {
+        return ControlResponse::err("cluster not yet initialized");
+    };
+    match crate::cluster::stepdown(&raft, &tls, force).await {
+        Ok(message) => ControlResponse::ok(serde_json::json!({ "message": message })),
+        Err(e) => ControlResponse::err(format!("{e:#}")),
     }
 }
 

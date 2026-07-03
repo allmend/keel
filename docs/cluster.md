@@ -70,6 +70,8 @@ keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mysecret
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
 
+A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
+
 The join exchange happens before mTLS is established, so it is encrypted with a key
 derived from the shared secret (ChaCha20-Poly1305). The secret itself is never sent
 on the wire — the join request and the response (which carries the new node's private
@@ -162,6 +164,54 @@ Drain requires quorum to commit the initial drain command. If a network partitio
 
 ---
 
+## Stepping down (removing a node)
+
+To take a node out of the cluster gracefully — for decommissioning, maintenance, or shrinking the cluster — run on that node:
+
+```bash
+keel cluster stepdown
+```
+
+What happens:
+
+1. **Quorum check.** The node computes the post-stepdown voter set and probes each remaining voter's cluster address. If fewer than a majority of the remaining voters are reachable, the cluster would lose quorum after the stepdown, and the command refuses:
+
+   ```
+   Error: Performing this action would cause the cluster to lose quorum: after stepdown
+   2 of 2 remaining voter(s) must be reachable to commit changes, but only 1 responded.
+   Refusing to step down — re-run with --force to attempt anyway.
+   ```
+
+2. **Membership change via Raft.** The removal is committed to the Raft log, so every remaining node accepts the stepdown before the command returns. If the node is a follower, the request is transparently forwarded to the leader over the mTLS peer channel.
+
+3. **Leadership handover.** If the node stepping down *is* the leader, it commits its own removal and steps down once the change is accepted; the remaining voters elect a new leader. Traffic is unaffected throughout.
+
+On success:
+
+```
+node 3 removed from cluster membership (committed by quorum). It is safe to stop this node
+```
+
+The node keeps serving traffic with its last known config until you stop the process.
+
+### `--force`
+
+`keel cluster stepdown --force` skips the refusal and attempts the membership change anyway. If the remaining nodes genuinely cannot form quorum, the change cannot commit — the command fails after a 30-second timeout:
+
+```
+Error: membership change did not commit within 30s — the cluster has likely lost quorum
+```
+
+Note that the proposed change stays in the Raft log: if enough nodes come back later, the stepdown completes at that point. Use `--force` only when you understand why quorum is unavailable.
+
+### Edge cases
+
+- **Last voter** — stepping down the only voter would destroy the cluster; the command always refuses (the membership change could never commit). Just stop the node instead.
+- **No leader** — a membership change cannot be committed without a leader; the command fails and asks you to retry after the election settles.
+- **Learner** — a node that is still a learner is removed without any quorum impact.
+
+---
+
 ## Split brain behavior
 
 During a network partition:
@@ -190,9 +240,11 @@ Cluster:
   Leader:    12345678
   Committed: 42
   Members:
-    [12345678] 10.0.0.1:7654
-    [98765432] 10.0.0.2:7654
-    [11223344] 10.0.0.3:7654
+    [12345678] 10.0.0.1:7654  (voter)
+    [98765432] 10.0.0.2:7654  (voter)
+    [11223344] 10.0.0.3:7654  (learner)
 ```
+
+Members are shown with their Raft role: `voter` counts toward quorum, `learner` receives the log but does not vote (nodes are learners briefly after joining, until promoted).
 
 See [CLI reference](cli.md) for all cluster commands.

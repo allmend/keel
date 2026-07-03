@@ -90,6 +90,13 @@ enum ClusterCommand {
     Status,
     /// Step down as leader and trigger a new election
     Demote,
+    /// Gracefully leave the cluster: hand over leadership if leader, then
+    /// commit this node's removal from the membership
+    Stepdown {
+        /// Proceed even if the remaining nodes would lose quorum
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -224,6 +231,9 @@ fn run_cli(cmd: &Command, socket: &str) -> Result<()> {
         },
         Command::Cluster { command: ClusterCommand::Status } => cli_cluster_status(socket),
         Command::Cluster { command: ClusterCommand::Demote } => cli_cluster_demote(socket),
+        Command::Cluster { command: ClusterCommand::Stepdown { force } } => {
+            cli_cluster_stepdown(socket, *force)
+        }
     }
 }
 
@@ -344,7 +354,12 @@ fn cli_cluster_status(socket: &str) -> Result<()> {
     if let Some(nodes) = data["membership"].as_array() {
         println!("  Members:");
         for n in nodes {
-            println!("    [{}] {}", n["id"].as_u64().unwrap_or(0), n["addr"].as_str().unwrap_or("?"));
+            println!(
+                "    [{}] {}  ({})",
+                n["id"].as_u64().unwrap_or(0),
+                n["addr"].as_str().unwrap_or("?"),
+                n["role"].as_str().unwrap_or("?"),
+            );
         }
     }
     Ok(())
@@ -354,6 +369,15 @@ fn cli_cluster_demote(socket: &str) -> Result<()> {
     use control::ControlRequest;
 
     let resp = send_request(socket, &ControlRequest::ClusterDemote)?;
+    let data = require_ok(&resp)?;
+    println!("{}", data["message"].as_str().unwrap_or("done"));
+    Ok(())
+}
+
+fn cli_cluster_stepdown(socket: &str, force: bool) -> Result<()> {
+    use control::ControlRequest;
+
+    let resp = send_request(socket, &ControlRequest::ClusterStepdown { force })?;
     let data = require_ok(&resp)?;
     println!("{}", data["message"].as_str().unwrap_or("done"));
     Ok(())

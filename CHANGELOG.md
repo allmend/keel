@@ -8,6 +8,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`keel cluster stepdown [--force]`** — gracefully remove the local node from the
+  cluster. Hands leadership over if the node is the leader, commits the removal to
+  the Raft log so all remaining nodes accept it, and refuses (without `--force`)
+  when the remaining voters would lose quorum.
+- **Automatic voter promotion.** Joining nodes start as learners and are promoted
+  to voters by the leader once their log catches up, making the documented quorum
+  model (3 nodes = 2 of 3, etc.) actually hold. `keel cluster status` now shows
+  each member's Raft role (`voter` / `learner`).
+
+### Fixed
+
+- **Cluster RPC deserialization of membership entries.** The peer RPC envelope used
+  an internally-tagged serde enum, which cannot round-trip the integer map keys
+  inside Raft membership entries — replicating any membership change failed with
+  `invalid type: string "1", expected u64`. The envelope is now externally tagged.
+
 ### Security
 
 - **Host header no longer used as a filesystem or metrics key.** A crafted `Host`

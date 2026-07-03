@@ -191,10 +191,44 @@ Cluster:
   Leader:    12345678
   Committed: 42
   Members:
-    [12345678] 10.0.0.1:7654
-    [98765432] 10.0.0.2:7654
-    [11223344] 10.0.0.3:7654
+    [12345678] 10.0.0.1:7654  (voter)
+    [98765432] 10.0.0.2:7654  (voter)
+    [11223344] 10.0.0.3:7654  (learner)
 ```
+
+Members are shown with their Raft role — `voter` (counts toward quorum) or `learner` (still catching up after join).
+
+Only available in cluster mode.
+
+---
+
+## keel cluster stepdown
+
+Gracefully remove the local node from the cluster. If the node is the leader, leadership is handed over to the remaining voters; the removal is committed to the Raft log so every remaining node accepts it before the command returns.
+
+```bash
+keel cluster stepdown [--force]
+```
+
+| Flag | Effect |
+|---|---|
+| `--force` | Attempt the stepdown even if the remaining nodes would lose quorum |
+
+Before committing anything, the command probes the remaining voters. If the cluster would lose quorum after the stepdown, it refuses:
+
+```
+Error: Performing this action would cause the cluster to lose quorum: after stepdown
+2 of 2 remaining voter(s) must be reachable to commit changes, but only 1 responded.
+Refusing to step down — re-run with --force to attempt anyway.
+```
+
+On success:
+
+```
+node 3 removed from cluster membership (committed by quorum). It is safe to stop this node
+```
+
+The node keeps serving traffic until you stop the process. See [Cluster — Stepping down](cluster.md#stepping-down-removing-a-node) for details and edge cases.
 
 Only available in cluster mode.
 
