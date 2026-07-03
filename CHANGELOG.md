@@ -25,6 +25,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   an internally-tagged serde enum, which cannot round-trip the integer map keys
   inside Raft membership entries — replicating any membership change failed with
   `invalid type: string "1", expected u64`. The envelope is now externally tagged.
+- **Cluster join retries with backoff.** A joiner racing the bootstrap node's
+  listener (the normal case under systemd / Compose / K8s) previously failed its
+  single join attempt and kept running outside the cluster while looking healthy.
+  Joins now retry with exponential backoff (1s → 30s) indefinitely; errors that
+  retrying cannot fix (wrong secret, protocol mismatch, explicit rejection) are
+  fatal and terminate the process so supervisors notice. The join responder now
+  sends a sealed rejection on decrypt failure so a wrong secret is detected
+  deterministically instead of surfacing as a connection error.
 
 ### Security
 

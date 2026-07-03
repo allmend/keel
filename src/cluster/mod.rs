@@ -255,32 +255,98 @@ enum JoinEnvelope {
     Err { message: String },
 }
 
+/// Why a join attempt failed — decides whether retrying can ever help.
+enum JoinError {
+    /// Transient network trouble (listener not up yet, connection reset, …).
+    Retryable(anyhow::Error),
+    /// Retrying cannot succeed: wrong secret, protocol mismatch, or an explicit
+    /// rejection from the cluster.
+    Fatal(anyhow::Error),
+}
+
 /// Connect to a bootstrap node and get cluster certs. Returns (ca, cert, key) PEMs.
 async fn do_join(
     join_addr: &str,
     secret: &str,
     node_id: NodeId,
     my_addr: &str,
-) -> Result<(String, String, String)> {
+) -> std::result::Result<(String, String, String), JoinError> {
     let mut stream = TcpStream::connect(join_addr)
         .await
-        .with_context(|| format!("cannot connect to {join_addr}"))?;
+        .map_err(|e| JoinError::Retryable(anyhow::anyhow!("cannot connect to {join_addr}: {e}")))?;
 
     let key = join_key(secret);
     let req = JoinRequest { node_id, addr: my_addr.to_owned() };
-    let body = join_seal(&key, &serde_json::to_vec(&req)?)?;
+    let body = serde_json::to_vec(&req)
+        .map_err(|e| JoinError::Fatal(e.into()))
+        .and_then(|b| join_seal(&key, &b).map_err(JoinError::Fatal))?;
 
-    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    stream.write_all(&body).await?;
-    stream.flush().await?;
+    let send = async {
+        stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+        stream.write_all(&body).await?;
+        stream.flush().await?;
+        read_frame(&mut stream, MAX_JOIN_FRAME).await
+    };
+    let buf = send.await.map_err(|e| JoinError::Retryable(e.into()))?;
 
-    let buf = read_frame(&mut stream, MAX_JOIN_FRAME).await?;
-    let plaintext = join_open(&key, &buf)
-        .context("join response decryption failed — wrong cluster secret?")?;
+    // A frame that fails to decrypt means the secrets differ — retrying with the
+    // same secret can never succeed.
+    let plaintext = join_open(&key, &buf).ok_or_else(|| {
+        JoinError::Fatal(anyhow::anyhow!(
+            "join response decryption failed — wrong cluster secret?"
+        ))
+    })?;
 
-    match serde_json::from_slice::<JoinEnvelope>(&plaintext)? {
+    match serde_json::from_slice::<JoinEnvelope>(&plaintext).map_err(|e| JoinError::Fatal(e.into()))? {
         JoinEnvelope::Ok(resp) => Ok((resp.ca_cert_pem, resp.node_cert_pem, resp.node_key_pem)),
-        JoinEnvelope::Err { message } => anyhow::bail!("join rejected: {message}"),
+        JoinEnvelope::Err { message } => {
+            Err(JoinError::Fatal(anyhow::anyhow!("join rejected: {message}")))
+        }
+    }
+}
+
+/// Initial delay between join attempts; doubles per failure up to the max.
+const JOIN_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+const JOIN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Retry `do_join` with exponential backoff until it succeeds, fails fatally, or
+/// shutdown is requested (returns `Ok(None)` in that case). Nodes are commonly
+/// started simultaneously by a supervisor, so "the bootstrap listener is not up
+/// yet" is the normal case, not an error worth dying over.
+async fn join_with_retry(
+    join_addr: &str,
+    secret: &str,
+    node_id: NodeId,
+    my_addr: &str,
+    shutdown: &mut pingora::server::ShutdownWatch,
+) -> Result<Option<(String, String, String)>> {
+    let mut delay = JOIN_RETRY_INITIAL;
+    let mut attempt = 1u32;
+    loop {
+        match do_join(join_addr, secret, node_id, my_addr).await {
+            Ok(certs) => return Ok(Some(certs)),
+            Err(JoinError::Fatal(e)) => {
+                return Err(e.context("cluster join failed (not retryable)"));
+            }
+            Err(JoinError::Retryable(e)) => {
+                warn!(
+                    attempt,
+                    retry_in_secs = delay.as_secs(),
+                    error = %format!("{e:#}"),
+                    "cluster: join attempt failed; retrying"
+                );
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            return Ok(None);
+                        }
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(JOIN_RETRY_MAX);
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -339,10 +405,18 @@ async fn handle_join(
         let key = join_key(expected_secret);
         let buf = read_frame(&mut stream, MAX_JOIN_FRAME).await?;
 
-        // Successful AEAD decryption proves the peer holds the shared secret; a
-        // wrong secret or any tampering fails here and the connection is dropped.
+        // Successful AEAD decryption proves the peer holds the shared secret. On
+        // failure, still send a sealed rejection: a genuine joiner with the wrong
+        // secret cannot decrypt it and fails fast ("wrong cluster secret?") instead
+        // of retrying an early-EOF forever. An attacker learns nothing beyond the
+        // rejection itself, which the dropped connection already revealed.
         let Some(plaintext) = join_open(&key, &buf) else {
             warn!("cluster: join rejected — could not decrypt request (invalid secret)");
+            let envelope = JoinEnvelope::Err { message: "invalid secret".to_owned() };
+            let resp = join_seal(&key, &serde_json::to_vec(&envelope)?)?;
+            stream.write_all(&(resp.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&resp).await?;
+            stream.flush().await?;
             return Ok(());
         };
 
@@ -437,7 +511,11 @@ pub struct ClusterService {
 impl pingora::services::background::BackgroundService for ClusterService {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
         if let Err(e) = self.run(&mut shutdown).await {
-            error!(error = %e, "cluster: fatal error");
+            // Exit rather than keep serving as a zombie: the operator asked for
+            // cluster mode, and a node whose control plane is dead looks healthy
+            // to a supervisor while silently never receiving config changes.
+            error!(error = %format!("{e:#}"), "cluster: fatal error — exiting");
+            std::process::exit(1);
         }
     }
 }
@@ -468,10 +546,13 @@ impl ClusterService {
             (ca_pem, cert, key, Some(ca))
         } else {
             let join_addr = opts.join.as_ref().unwrap();
-            let (ca_pem, cert, key) =
-                do_join(join_addr, &secret, opts.node_id, &opts.cluster_addr)
-                    .await
-                    .context("cluster join failed")?;
+            let Some((ca_pem, cert, key)) =
+                join_with_retry(join_addr, &secret, opts.node_id, &opts.cluster_addr, shutdown)
+                    .await?
+            else {
+                // Shutdown requested while still trying to join.
+                return Ok(());
+            };
             (ca_pem, cert, key, None)
         };
 
