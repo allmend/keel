@@ -61,7 +61,7 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
     for vhost in &cfg.vhosts {
         let Some(tls_cfg) = &vhost.tls else { continue };
 
-        let (cert_path, key_path) = if tls_cfg.acme {
+        let (cert_path, key_path) = if tls_cfg.acme.enabled() {
             let storage = &acme.as_ref().expect("validated: acme vhost implies acme config").storage;
             let (cert, key) = acme_cert_paths(storage, &vhost.host);
             // Before first issuance the files don't exist — start without a cert

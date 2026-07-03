@@ -793,9 +793,10 @@ pub fn run(cfg: &Config) -> ! {
     // responder when any host is ACME-managed.
     let acme_challenge_dir = cfg
         .acme_effective()
-        .filter(|_| !cfg.acme_hosts().is_empty())
         .map(|a| crate::acme::challenge_dir(&a.storage));
-    if let Some(acme_svc) = crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store)) {
+    if let Some(acme_svc) =
+        crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store), None)
+    {
         server.add_service(background_service("acme", acme_svc));
     }
 
@@ -940,9 +941,12 @@ pub fn run_cluster(
 
     let acme_challenge_dir = cfg
         .acme_effective()
-        .filter(|_| !cfg.acme_hosts().is_empty())
         .map(|a| crate::acme::challenge_dir(&a.storage));
-    if let Some(acme_svc) = crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store)) {
+    if let Some(acme_svc) = crate::acme::AcmeService::from_config(
+        cfg,
+        Arc::clone(&cert_store),
+        Some(cluster.clone()),
+    ) {
         server.add_service(background_service("acme", acme_svc));
     }
 

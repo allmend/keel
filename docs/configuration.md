@@ -193,7 +193,7 @@ vhosts:
 | `routes` | list | none | Path-prefix routing; see [Virtual hosts](virtual-hosts.md) |
 | `tls.cert` | string | none | Path to PEM certificate (BYO cert) |
 | `tls.key` | string | none | Path to PEM private key (BYO cert) |
-| `tls.acme` | bool | `false` | Obtain/renew the certificate automatically via ACME — see [ACME](acme.md) |
+| `tls.acme` | bool or string | `false` | `true` = ACME via issuer `default`; a string names an issuer from `acme.issuers` — see [ACME](acme.md) |
 | `redirect_http` | bool | `false` (`true` when `tls.acme`) | 301 plain HTTP to HTTPS |
 | `forwarded_headers.mode` | string | `replace` | `replace`, `append`, or `off` |
 | `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode |
@@ -206,23 +206,51 @@ See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and
 
 ## acme
 
-Automatic TLS via Let's Encrypt or any ACME v2 CA. See [ACME](acme.md).
+Automatic TLS via Let's Encrypt or any ACME v2 CA, organized as named
+issuers. Vhosts reference an issuer with `tls: { acme: true }` (the issuer
+named `default`) or `tls: { acme: <name> }`. See [ACME](acme.md).
 
 ```yaml
 acme:
-  email: ops@example.com
-  directory: https://acme-v02.api.letsencrypt.org/directory
   storage: /var/lib/keel/acme
-  domains: []               # standalone certs for TCP/passthrough backends
+  renew_before: 30%
+  issuers:
+    default:
+      email: ops@example.com
+    internal:
+      directory: https://ca.corp.internal/acme/directory
+      root_ca: /etc/keel/corp-root.pem
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `email` | string | none | ACME account contact |
-| `directory` | string | Let's Encrypt production | ACME v2 directory URL |
-| `storage` | string | `/var/lib/keel/acme` | Certs, keys, account, challenge tokens |
-| `domains` | list | `[]` | Hostnames without a TLS vhost to issue cert files for |
-| `root_ca` | string | none | Extra trust root for the ACME API (testing only) |
+| `storage` | string | `/var/lib/keel/acme` | Certs, keys, accounts, challenge tokens |
+| `renew_before` | string | `30%` | Renew when less than this remains: `%` of lifetime or absolute `Nd` |
+| `issuers.<name>.email` | string | none | ACME account contact for this issuer |
+| `issuers.<name>.directory` | string | Let's Encrypt production | ACME v2 directory URL |
+| `issuers.<name>.root_ca` | string | none | Extra trust root for the ACME API (internal CAs / Pebble) |
+| `issuers.<name>.renew_before` | string | global value | Per-issuer renewal override |
+
+---
+
+## certificates
+
+Standalone certificate requests: hostnames Keel obtains certificates for
+without terminating TLS itself (TCP / TLS-passthrough backends). Keel answers
+the HTTP-01 challenge and writes `{host}.crt` / `{host}.key` to
+`acme.storage`. Allowed in conf.d files (appended like vhosts). See
+[ACME](acme.md).
+
+```yaml
+certificates:
+  - host: db.example.com
+    issuer: default        # optional; "default" when omitted
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `host` | string | required | Hostname to issue for (no wildcards) |
+| `issuer` | string | `default` | Issuer name from `acme.issuers` |
 
 ---
 
@@ -273,7 +301,8 @@ Merge rules:
 - `pools`: merged as a map; duplicate pool name is an error
 - `vhosts`: appended in load order
 - `listeners`: appended in load order
-- `keel`, `metrics`, `access_log`, `include`, `cluster`: root file only; error if present in included files
+- `certificates`: appended in load order
+- `keel`, `metrics`, `access_log`, `include`, `cluster`, `acme`: root file only; error if present in included files
 
 Example layout:
 

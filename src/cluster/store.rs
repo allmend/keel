@@ -10,7 +10,7 @@ use openraft::{
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 
-use crate::cluster::types::{ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig};
+use crate::cluster::types::{CertMap, ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig};
 
 // Log store
 
@@ -133,6 +133,7 @@ struct StateMachineData {
     last_membership: StoredMembership<NodeId, BasicNode>,
     state: ClusterState,
     config_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<String>>>>,
+    certs_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<CertMap>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +142,10 @@ pub struct StateMachine(Arc<RwLock<StateMachineData>>);
 impl StateMachine {
     pub fn set_config_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<Option<String>>>) {
         self.0.write().unwrap().config_tx = Some(tx);
+    }
+
+    pub fn set_certs_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<CertMap>>) {
+        self.0.write().unwrap().certs_tx = Some(tx);
     }
 }
 
@@ -213,6 +218,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             d.state.draining.remove(&format!("{pool}/{address}"));
                             ClientResponse::ok()
                         }
+                        ClientRequest::SetCert { host, cert_pem, key_pem } => {
+                            d.state.certs.insert(host, (cert_pem, key_pem));
+                            if let Some(tx) = &d.certs_tx {
+                                let _ = tx.send(d.state.certs.clone());
+                            }
+                            ClientResponse::ok()
+                        }
                     };
                     responses.push(resp);
                 }
@@ -250,6 +262,14 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         d.state = data;
         d.last_applied = meta.last_log_id;
         d.last_membership = meta.last_membership.clone();
+        // A snapshot is how late joiners receive replicated state that has been
+        // compacted out of the log — notify watchers just like apply() does.
+        if let Some(tx) = &d.certs_tx {
+            let _ = tx.send(d.state.certs.clone());
+        }
+        if let (Some(tx), Some(yaml)) = (&d.config_tx, &d.state.config_yaml) {
+            let _ = tx.send(Some(yaml.clone()));
+        }
         Ok(())
     }
 

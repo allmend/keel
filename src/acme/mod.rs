@@ -1,18 +1,27 @@
 //! Automatic TLS via ACME (Let's Encrypt or any ACME v2 CA), HTTP-01 only.
 //!
+//! Certificates come from named **issuers** (`acme.issuers`). A vhost opts in
+//! with `tls: { acme: true }` (the issuer named "default", implicitly Let's
+//! Encrypt) or `tls: { acme: <issuer-name> }`. Each issuer keeps its own ACME
+//! account; hostnames map to exactly one issuer.
+//!
 //! Managed hostnames come from two places:
-//!   - vhosts with `tls.acme: true` — issued certs are hot-swapped into the
+//!   - vhosts with `tls.acme` — issued certs are hot-swapped into the
 //!     `CertStore` so Keel terminates TLS with them;
-//!   - `acme.domains` — hostnames Keel does not terminate TLS for (plain TCP /
-//!     TLS-passthrough backends). Keel answers the HTTP-01 challenge and writes
-//!     the cert/key files for the operator or backend to consume, the way
-//!     Lego's standalone HTTP-01 mode works.
+//!   - `acme.issuers.<name>.domains` — hostnames Keel does not terminate TLS
+//!     for (plain TCP / TLS-passthrough backends). Keel answers the HTTP-01
+//!     challenge and writes the cert/key files for the operator or backend to
+//!     consume, the way Lego's standalone HTTP-01 mode works.
+//!
+//! Renewal: when less than `renew_before` of the certificate's lifetime
+//! remains — a percentage ("30%", scales from 90-day to 6-day certs) or an
+//! absolute window ("20d").
 //!
 //! Multi-process coordination (standalone mode runs one worker per process):
 //! challenge tokens are files under `{storage}/challenges/`, so ANY worker can
 //! answer the CA's validation request; issuance itself is serialized with an
 //! exclusive flock on `{storage}/.issuer.lock` so exactly one worker talks to
-//! the CA. Every worker watches the cert files and hot-swaps renewed certs
+//! the CAs. Every worker watches the cert files and hot-swaps renewed certs
 //! into its own CertStore.
 
 use std::collections::HashMap;
@@ -29,13 +38,11 @@ use instant_acme::{
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::config::{AcmeConfig, Config};
+use crate::config::{AcmeConfig, AcmeIssuer, Config, RenewBefore};
 use crate::tls::{acme_cert_paths, CertStore};
 
 /// How often each worker wakes to check certs (renewal window, file changes).
 const CHECK_INTERVAL: Duration = Duration::from_secs(60);
-/// Renew when the certificate expires within this window.
-const RENEW_BEFORE_DAYS: u32 = 30;
 /// After a failed issuance, back off starting here, doubling per failure…
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
 /// …up to this cap, so a broken domain cannot hammer the CA (rate limits).
@@ -54,40 +61,56 @@ pub fn challenge_dir(storage: &str) -> PathBuf {
     Path::new(storage).join("challenges")
 }
 
-/// Account credentials wrapper persisted to `{storage}/account.json`. The
-/// directory URL is recorded so switching CAs creates a fresh account instead
-/// of replaying credentials against the wrong endpoint.
+/// Account credentials wrapper persisted to `{storage}/{issuer}/account.json`.
+/// The directory URL is recorded so pointing an issuer at a different CA
+/// creates a fresh account instead of replaying credentials against the wrong
+/// endpoint.
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
     directory: String,
     credentials: AccountCredentials,
 }
 
+/// One hostname Keel manages a certificate for.
+struct ManagedCert {
+    host: String,
+    issuer: String,
+    /// True when the cert is served by Keel's own TLS listeners (vhost);
+    /// false for standalone `domains` entries (cert files only).
+    vhost_managed: bool,
+}
+
 pub struct AcmeService {
     cfg: Config,
     acme: AcmeConfig,
     cert_store: Arc<CertStore>,
-    /// Hosts whose certs are terminated by Keel (present as vhosts).
-    vhost_hosts: Vec<String>,
-    /// All managed hosts (vhost hosts + standalone acme.domains).
-    all_hosts: Vec<String>,
+    managed: Vec<ManagedCert>,
+    /// Present in cluster mode: certs replicate via Raft, only the leader
+    /// talks to the CAs.
+    cluster: Option<crate::cluster::ClusterHandle>,
 }
 
 impl AcmeService {
     /// Returns None when the config uses no ACME at all.
-    pub fn from_config(cfg: &Config, cert_store: Arc<CertStore>) -> Option<Self> {
+    pub fn from_config(
+        cfg: &Config,
+        cert_store: Arc<CertStore>,
+        cluster: Option<crate::cluster::ClusterHandle>,
+    ) -> Option<Self> {
         let acme = cfg.acme_effective()?;
-        let all_hosts = cfg.acme_hosts();
-        if all_hosts.is_empty() {
+        let managed: Vec<ManagedCert> = cfg
+            .acme_assignments()
+            .into_iter()
+            .map(|(host, issuer, vhost_managed)| ManagedCert {
+                host: host.to_owned(),
+                issuer: issuer.to_owned(),
+                vhost_managed,
+            })
+            .collect();
+        if managed.is_empty() {
             return None;
         }
-        let vhost_hosts = cfg
-            .vhosts
-            .iter()
-            .filter(|v| v.tls.as_ref().map_or(false, |t| t.acme))
-            .map(|v| v.host.clone())
-            .collect();
-        Some(Self { cfg: cfg.clone(), acme, cert_store, vhost_hosts, all_hosts })
+        Some(Self { cfg: cfg.clone(), acme, cert_store, managed, cluster })
     }
 }
 
@@ -102,35 +125,45 @@ impl pingora::services::background::BackgroundService for AcmeService {
             error!(error = %format!("{e:#}"), "acme: cannot prepare storage directory; ACME disabled");
             return;
         }
-        info!(
-            hosts = ?self.all_hosts,
-            directory = self.acme.directory,
-            storage = self.acme.storage,
-            "acme: managing certificates"
-        );
+        for m in &self.managed {
+            info!(host = m.host, issuer = m.issuer, vhost = m.vhost_managed, "acme: managing certificate");
+        }
 
-        let mut issuer = Issuer::new(&self.acme);
+        let mut issuers = IssuerPool::new(&self.acme);
         let mut cert_mtimes: HashMap<String, SystemTime> = HashMap::new();
 
         loop {
-            // Every worker: hot-swap certs that changed on disk (issued or
-            // renewed by whichever worker holds the issuer lock).
-            self.reload_changed_certs(&mut cert_mtimes);
+            // Cluster: adopt any replicated cert that is better (longer valid)
+            // than what this node has on disk — BEFORE the issuance check, so
+            // a node never re-issues something the cluster already holds.
+            self.pull_cluster_certs().await;
 
-            // One worker at a time: issue/renew what needs it.
-            match try_issuer_lock(&self.acme.storage) {
-                Ok(Some(_lock)) => {
-                    for host in &self.all_hosts {
-                        if *shutdown.borrow() {
-                            break;
+            // Only the leader talks to the CAs in cluster mode; standalone
+            // always may. The flock additionally serializes across workers.
+            if self.may_issue().await {
+                match try_issuer_lock(&self.acme.storage) {
+                    Ok(Some(_lock)) => {
+                        for m in &self.managed {
+                            if *shutdown.borrow() {
+                                break;
+                            }
+                            issuers.maybe_issue(&m.host, &m.issuer).await;
                         }
-                        issuer.maybe_issue(host).await;
+                        // _lock drops here, releasing the flock.
                     }
-                    // _lock drops here, releasing the flock.
+                    Ok(None) => {} // another worker is the issuer this cycle
+                    Err(e) => warn!(error = %format!("{e:#}"), "acme: issuer lock failed"),
                 }
-                Ok(None) => {} // another worker is the issuer this cycle
-                Err(e) => warn!(error = %format!("{e:#}"), "acme: issuer lock failed"),
             }
+
+            // Cluster leader: replicate any disk cert that is better than (or
+            // missing from) the Raft state — covers fresh issuance and certs
+            // that survived a full-cluster restart on disk only.
+            self.push_cluster_certs().await;
+
+            // Every worker: hot-swap certs that changed on disk (issued here,
+            // by another worker, or adopted from the cluster).
+            self.reload_changed_certs(&mut cert_mtimes);
 
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -143,14 +176,81 @@ impl pingora::services::background::BackgroundService for AcmeService {
 }
 
 impl AcmeService {
+    /// In cluster mode: true only on the current Raft leader.
+    async fn may_issue(&self) -> bool {
+        let Some(cluster) = &self.cluster else { return true };
+        let Some(raft) = cluster.raft().await else { return false };
+        let m = raft.metrics().borrow().clone();
+        m.current_leader == Some(m.id)
+    }
+
+    /// Adopt replicated certs that are strictly better than the local disk
+    /// copy. "Better" = valid with more remaining lifetime; the loser is
+    /// overwritten so disk and Raft converge on one source of truth.
+    async fn pull_cluster_certs(&self) {
+        let Some(cluster) = &self.cluster else { return };
+        let replicated = cluster.certs_rx.borrow().clone();
+        for m in &self.managed {
+            let Some((cert_pem, key_pem)) = replicated.get(&m.host) else { continue };
+            let raft_remaining = match pem_remaining_secs(cert_pem) {
+                Some(r) if r > 0 => r,
+                _ => continue, // expired or unparsable — never adopt
+            };
+            let (cert_path, _) = acme_cert_paths(&self.acme.storage, &m.host);
+            let disk_remaining = std::fs::read(&cert_path)
+                .ok()
+                .and_then(|pem| pem_remaining_secs(std::str::from_utf8(&pem).unwrap_or("")))
+                .unwrap_or(0);
+            if raft_remaining > disk_remaining {
+                match write_cert_pair(&self.acme.storage, &m.host, cert_pem, key_pem) {
+                    Ok(()) => info!(host = m.host, "acme: adopted replicated certificate from cluster"),
+                    Err(e) => error!(host = m.host, error = %format!("{e:#}"), "acme: failed to write replicated certificate"),
+                }
+            }
+        }
+    }
+
+    /// Leader only: replicate disk certs that beat (or are missing from) the
+    /// Raft state, so followers and future joiners receive them.
+    async fn push_cluster_certs(&self) {
+        let Some(cluster) = &self.cluster else { return };
+        let Some(raft) = cluster.raft().await else { return };
+        {
+            let m = raft.metrics().borrow().clone();
+            if m.current_leader != Some(m.id) {
+                return;
+            }
+        }
+        let replicated = cluster.certs_rx.borrow().clone();
+        for m in &self.managed {
+            let (cert_path, key_path) = acme_cert_paths(&self.acme.storage, &m.host);
+            let Ok(cert_pem) = std::fs::read_to_string(&cert_path) else { continue };
+            let Ok(key_pem) = std::fs::read_to_string(&key_path) else { continue };
+            let disk_remaining = match pem_remaining_secs(&cert_pem) {
+                Some(r) if r > 0 => r,
+                _ => continue, // never replicate an expired/broken cert
+            };
+            let raft_remaining = replicated
+                .get(&m.host)
+                .and_then(|(c, _)| pem_remaining_secs(c))
+                .unwrap_or(0);
+            if disk_remaining > raft_remaining {
+                match crate::cluster::push_cert(&raft, m.host.clone(), cert_pem, key_pem).await {
+                    Ok(()) => info!(host = m.host, "acme: certificate replicated to cluster"),
+                    Err(e) => warn!(host = m.host, error = %format!("{e:#}"), "acme: certificate replication failed"),
+                }
+            }
+        }
+    }
+
     /// Reload the CertStore when any vhost-managed cert file changed on disk.
     fn reload_changed_certs(&self, seen: &mut HashMap<String, SystemTime>) {
         let mut changed = false;
-        for host in &self.vhost_hosts {
-            let (cert_path, _) = acme_cert_paths(&self.acme.storage, host);
+        for m in self.managed.iter().filter(|m| m.vhost_managed) {
+            let (cert_path, _) = acme_cert_paths(&self.acme.storage, &m.host);
             let Ok(meta) = std::fs::metadata(&cert_path) else { continue };
             let Ok(mtime) = meta.modified() else { continue };
-            if seen.insert(host.clone(), mtime) != Some(mtime) {
+            if seen.insert(m.host.clone(), mtime) != Some(mtime) {
                 changed = true;
             }
         }
@@ -194,23 +294,48 @@ fn try_issuer_lock(storage: &str) -> Result<Option<nix::fcntl::Flock<std::fs::Fi
     }
 }
 
-// Issuer — the part that talks to the CA
+// Issuer pool — the part that talks to the CAs
 
-struct Issuer {
-    acme: AcmeConfig,
-    account: Option<Account>,
+struct IssuerPool {
+    storage: String,
+    global_renew: RenewBefore,
+    issuers: HashMap<String, AcmeIssuer>,
+    /// Lazily created ACME accounts, one per issuer.
+    accounts: HashMap<String, Account>,
     /// Per-host failure backoff: (next attempt allowed at, current delay).
     backoff: HashMap<String, (Instant, Duration)>,
 }
 
-impl Issuer {
+impl IssuerPool {
     fn new(acme: &AcmeConfig) -> Self {
-        Self { acme: acme.clone(), account: None, backoff: HashMap::new() }
+        // Validated at config load; fall back to 30% defensively.
+        let global_renew =
+            RenewBefore::parse(&acme.renew_before).unwrap_or(RenewBefore::Percent(30));
+        Self {
+            storage: acme.storage.clone(),
+            global_renew,
+            issuers: acme.issuers.clone(),
+            accounts: HashMap::new(),
+            backoff: HashMap::new(),
+        }
     }
 
-    /// Issue or renew `host` if due, honoring the failure backoff.
-    async fn maybe_issue(&mut self, host: &str) {
-        if !needs_issuance(&self.acme.storage, host) {
+    fn issuer(&self, name: &str) -> AcmeIssuer {
+        self.issuers.get(name).cloned().unwrap_or_default()
+    }
+
+    fn renew_before(&self, issuer: &AcmeIssuer) -> RenewBefore {
+        issuer
+            .renew_before
+            .as_deref()
+            .and_then(|s| RenewBefore::parse(s).ok())
+            .unwrap_or(self.global_renew)
+    }
+
+    /// Issue or renew `host` via `issuer_name` if due, honoring the backoff.
+    async fn maybe_issue(&mut self, host: &str, issuer_name: &str) {
+        let issuer = self.issuer(issuer_name);
+        if !needs_issuance(&self.storage, host, self.renew_before(&issuer)) {
             return;
         }
         if let Some((next_at, _)) = self.backoff.get(host) {
@@ -219,10 +344,10 @@ impl Issuer {
             }
         }
 
-        match self.issue(host).await {
+        match self.issue(host, issuer_name, &issuer).await {
             Ok(()) => {
                 self.backoff.remove(host);
-                info!(host, "acme: certificate issued");
+                info!(host, issuer = issuer_name, "acme: certificate issued");
             }
             Err(e) => {
                 let delay = self
@@ -233,6 +358,7 @@ impl Issuer {
                 self.backoff.insert(host.to_owned(), (Instant::now() + delay, delay));
                 error!(
                     host,
+                    issuer = issuer_name,
                     retry_in_secs = delay.as_secs(),
                     error = %format!("{e:#}"),
                     "acme: issuance failed"
@@ -241,8 +367,8 @@ impl Issuer {
         }
     }
 
-    async fn issue(&mut self, host: &str) -> Result<()> {
-        let account = self.account().await?;
+    async fn issue(&mut self, host: &str, issuer_name: &str, issuer: &AcmeIssuer) -> Result<()> {
+        let account = self.account(issuer_name, issuer).await?;
 
         let identifier = Identifier::Dns(host.to_owned());
         let mut order = account
@@ -255,7 +381,7 @@ impl Issuer {
         let mut published: Vec<PathBuf> = Vec::new();
         let result = async {
             let mut authorizations = order.authorizations();
-            let mut ready: Vec<String> = Vec::new();
+            let mut ready = 0usize;
             while let Some(authz) = authorizations.next().await {
                 let mut authz = authz.context("authorization")?;
                 match authz.status {
@@ -271,15 +397,15 @@ impl Issuer {
                     anyhow::bail!("CA sent a token with unexpected characters");
                 }
                 let key_auth = challenge.key_authorization();
-                let token_path = challenge_dir(&self.acme.storage).join(&token);
+                let token_path = challenge_dir(&self.storage).join(&token);
                 std::fs::write(&token_path, key_auth.as_str())
                     .with_context(|| format!("write {}", token_path.display()))?;
                 published.push(token_path);
-                ready.push(token);
+                ready += 1;
                 challenge.set_ready().await.context("set challenge ready")?;
             }
             drop(authorizations);
-            info!(host, tokens = ready.len(), "acme: http-01 challenges published");
+            info!(host, tokens = ready, "acme: http-01 challenges published");
 
             let status = order.poll_ready(&RetryPolicy::default()).await.context("poll order")?;
             if status != OrderStatus::Ready {
@@ -291,7 +417,7 @@ impl Issuer {
                 .poll_certificate(&RetryPolicy::default())
                 .await
                 .context("download certificate")?;
-            write_cert_pair(&self.acme.storage, host, &cert_pem, &key_pem)
+            write_cert_pair(&self.storage, host, &cert_pem, &key_pem)
         }
         .await;
 
@@ -301,64 +427,65 @@ impl Issuer {
         result
     }
 
-    /// Load the persisted ACME account, or register one. Reused across all
-    /// renewals to stay within CA rate limits.
-    async fn account(&mut self) -> Result<&Account> {
-        if self.account.is_none() {
-            let path = Path::new(&self.acme.storage).join("account.json");
+    /// Load the persisted ACME account for `issuer_name`, or register one.
+    /// Reused across all renewals to stay within CA rate limits.
+    async fn account(&mut self, issuer_name: &str, issuer: &AcmeIssuer) -> Result<&Account> {
+        if !self.accounts.contains_key(issuer_name) {
+            let dir = Path::new(&self.storage).join(issuer_name);
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            let path = dir.join("account.json");
 
             let stored: Option<StoredAccount> = std::fs::read(&path)
                 .ok()
                 .and_then(|raw| serde_json::from_slice(&raw).ok())
-                .filter(|s: &StoredAccount| s.directory == self.acme.directory);
+                .filter(|s: &StoredAccount| s.directory == issuer.directory);
 
             let account = match stored {
-                Some(s) => self
-                    .builder()?
+                Some(s) => builder(issuer)?
                     .from_credentials(s.credentials)
                     .await
                     .context("restore ACME account")?,
                 None => {
                     let contact: Vec<String> =
-                        self.acme.email.iter().map(|e| format!("mailto:{e}")).collect();
+                        issuer.email.iter().map(|e| format!("mailto:{e}")).collect();
                     let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
-                    let (account, credentials) = self
-                        .builder()?
+                    let (account, credentials) = builder(issuer)?
                         .create(
                             &NewAccount {
                                 contact: &contact_refs,
                                 terms_of_service_agreed: true,
                                 only_return_existing: false,
                             },
-                            self.acme.directory.clone(),
+                            issuer.directory.clone(),
                             None,
                         )
                         .await
                         .context("create ACME account")?;
                     let stored =
-                        StoredAccount { directory: self.acme.directory.clone(), credentials };
+                        StoredAccount { directory: issuer.directory.clone(), credentials };
                     write_private(&path, serde_json::to_string(&stored)?.as_bytes())
                         .context("persist ACME account")?;
-                    info!(directory = self.acme.directory, "acme: account registered");
+                    info!(issuer = issuer_name, directory = issuer.directory, "acme: account registered");
                     account
                 }
             };
-            self.account = Some(account);
+            self.accounts.insert(issuer_name.to_owned(), account);
         }
-        Ok(self.account.as_ref().unwrap())
-    }
-
-    fn builder(&self) -> Result<instant_acme::AccountBuilder> {
-        Ok(match &self.acme.root_ca {
-            Some(pem) => Account::builder_with_root(pem)
-                .with_context(|| format!("load acme.root_ca '{pem}'"))?,
-            None => Account::builder().context("build ACME http client")?,
-        })
+        Ok(self.accounts.get(issuer_name).unwrap())
     }
 }
 
+fn builder(issuer: &AcmeIssuer) -> Result<instant_acme::AccountBuilder> {
+    Ok(match &issuer.root_ca {
+        Some(pem) => Account::builder_with_root(pem)
+            .with_context(|| format!("load root_ca '{pem}'"))?,
+        None => Account::builder().context("build ACME http client")?,
+    })
+}
+
 /// True when the cert is missing, unreadable, or inside the renewal window.
-fn needs_issuance(storage: &str, host: &str) -> bool {
+fn needs_issuance(storage: &str, host: &str, renew: RenewBefore) -> bool {
     let (cert_path, key_path) = acme_cert_paths(storage, host);
     if !Path::new(&cert_path).exists() || !Path::new(&key_path).exists() {
         return true;
@@ -368,10 +495,36 @@ fn needs_issuance(storage: &str, host: &str) -> bool {
         warn!(host, "acme: existing certificate unparsable; reissuing");
         return true;
     };
-    let Ok(renew_at) = openssl::asn1::Asn1Time::days_from_now(RENEW_BEFORE_DAYS) else {
-        return false;
-    };
-    cert.not_after() < renew_at.as_ref()
+    match remaining_and_lifetime_secs(&cert) {
+        Some((remaining, lifetime)) => {
+            let threshold = match renew {
+                RenewBefore::Percent(p) => lifetime * i64::from(p) / 100,
+                RenewBefore::Days(d) => i64::from(d) * 86_400,
+            };
+            remaining < threshold
+        }
+        None => {
+            warn!(host, "acme: cannot read certificate validity; reissuing");
+            true
+        }
+    }
+}
+
+/// Seconds until a PEM certificate's notAfter; negative when expired,
+/// None when unparsable.
+fn pem_remaining_secs(cert_pem: &str) -> Option<i64> {
+    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).ok()?;
+    remaining_and_lifetime_secs(&cert).map(|(r, _)| r)
+}
+
+/// (seconds until notAfter, total lifetime in seconds) — negative remaining
+/// means the certificate is already expired.
+fn remaining_and_lifetime_secs(cert: &openssl::x509::X509) -> Option<(i64, i64)> {
+    let now = openssl::asn1::Asn1Time::days_from_now(0).ok()?;
+    let remaining = now.diff(cert.not_after()).ok()?;
+    let lifetime = cert.not_before().diff(cert.not_after()).ok()?;
+    let to_secs = |d: openssl::asn1::TimeDiff| i64::from(d.days) * 86_400 + i64::from(d.secs);
+    Some((to_secs(remaining), to_secs(lifetime)))
 }
 
 /// Write key (0600) then cert (0644), each atomically via temp + rename, so a
@@ -407,6 +560,7 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::valid_token;
+    use crate::config::RenewBefore;
 
     #[test]
     fn token_charset() {
@@ -416,5 +570,17 @@ mod tests {
         assert!(!valid_token("a/b"));
         assert!(!valid_token("a.b"));
         assert!(!valid_token(&"x".repeat(300)));
+    }
+
+    #[test]
+    fn renew_before_parsing() {
+        assert_eq!(RenewBefore::parse("30%").unwrap(), RenewBefore::Percent(30));
+        assert_eq!(RenewBefore::parse(" 15% ").unwrap(), RenewBefore::Percent(15));
+        assert_eq!(RenewBefore::parse("20d").unwrap(), RenewBefore::Days(20));
+        assert!(RenewBefore::parse("0%").is_err());
+        assert!(RenewBefore::parse("95%").is_err());
+        assert!(RenewBefore::parse("0d").is_err());
+        assert!(RenewBefore::parse("30").is_err());
+        assert!(RenewBefore::parse("").is_err());
     }
 }

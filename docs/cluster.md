@@ -214,6 +214,18 @@ Note that the proposed change stays in the Raft log: if enough nodes come back l
 
 ---
 
+## ACME certificates in cluster mode
+
+Certificates obtained via [ACME](acme.md) are cluster state: the leader
+performs issuance and renewal, commits the certificate to the Raft log, and
+every node — including nodes that join later — receives it, stores it on
+disk, and hot-swaps it into its TLS listeners. On restart, disk and Raft
+state reconcile per hostname: the valid certificate with the most remaining
+lifetime becomes the source of truth. Nothing is re-issued unless a
+certificate is missing, expired, or due for renewal everywhere.
+
+---
+
 ## Split brain behavior
 
 During a network partition:

@@ -8,7 +8,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **ACME certificates replicate through Raft in cluster mode.** Only the
+  leader talks to the CA; issued/renewed certificates are committed to the
+  Raft log and every node (including late joiners, via snapshot) writes them
+  to its own storage and hot-swaps them. Disk and Raft state reconcile
+  continuously — the valid certificate with the most remaining lifetime wins
+  and overwrites the other, so a full-cluster restart recovers certificates
+  from disk without re-issuing.
+- **Top-level `certificates:` section** for standalone certs (hosts Keel
+  fronts as TCP/TLS-passthrough without terminating TLS). Mergeable from
+  conf.d files like vhosts, so teams declare cert needs next to their pools.
+  Replaces `acme.issuers.<name>.domains`.
+
+### Changed
+
+- **BREAKING: ACME config restructured around named issuers.** The flat
+  `acme: { email, directory, root_ca, domains }` block becomes
+  `acme.issuers.<name>` entries; `tls.acme` accepts `true` (issuer `default`,
+  implicitly Let's Encrypt) or an issuer name, so different vhosts can use
+  different CAs (Let's Encrypt, staging, an internal CA) side by side. One
+  ACME account per issuer, stored under `storage/<issuer>/account.json`.
+- **Renewal threshold is now relative by default.** New `acme.renew_before`
+  (default `30%`): renew when less than that share of the certificate's
+  total lifetime remains — correct for both 90-day and short-lived (6-day)
+  certificates. Absolute form (`20d`) also accepted; per-issuer override
+  available. Replaces the fixed 30-day rule.
 
 ---
 

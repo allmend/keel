@@ -165,6 +165,7 @@ mod tests {
             include: vec![],
             cluster: None,
             acme: None,
+            certificates: vec![],
         }
     }
 

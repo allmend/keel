@@ -24,7 +24,13 @@ pub enum ClientRequest {
     DrainBackend { pool: String, address: String },
     /// Re-activate a drained backend.
     ActivateBackend { pool: String, address: String },
+    /// Replicate an ACME-issued certificate so every node (including late
+    /// joiners, via snapshot) serves it without re-issuing.
+    SetCert { host: String, cert_pem: String, key_pem: String },
 }
+
+/// host → (cert PEM, key PEM). Replicated ACME certificates.
+pub type CertMap = BTreeMap<String, (String, String)>;
 
 /// Response from the state machine after applying a log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,4 +52,7 @@ pub struct ClusterState {
     pub config_yaml: Option<String>,
     /// Drain overrides: "pool/addr" → true means draining.
     pub draining: BTreeMap<String, bool>,
+    /// ACME certificates replicated cluster-wide.
+    #[serde(default)]
+    pub certs: CertMap,
 }

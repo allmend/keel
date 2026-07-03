@@ -128,6 +128,8 @@ pub struct ClusterHandle {
     pub raft: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
     /// Fires when a new config YAML is committed to the Raft log.
     pub config_rx: watch::Receiver<Option<String>>,
+    /// Current replicated ACME certificate map; updated on commit and snapshot.
+    pub certs_rx: watch::Receiver<crate::cluster::types::CertMap>,
     /// mTLS client config for peer RPCs (set together with `raft`). Used by the
     /// control plane to forward commands (e.g. stepdown) to the leader.
     pub client_tls: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
@@ -505,6 +507,7 @@ pub struct ClusterService {
     raft_slot: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
     tls_slot: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
     config_tx: Arc<watch::Sender<Option<String>>>,
+    certs_tx: Arc<watch::Sender<crate::cluster::types::CertMap>>,
 }
 
 #[async_trait]
@@ -558,6 +561,7 @@ impl ClusterService {
 
         let sm = StateMachine::default();
         sm.set_config_tx(Arc::clone(&self.config_tx));
+        sm.set_certs_tx(Arc::clone(&self.certs_tx));
 
         let log_store = LogStore::default();
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
@@ -686,13 +690,16 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let tls_slot = Arc::new(Mutex::new(None));
     let (config_tx, config_rx) = watch::channel(None);
     let config_tx = Arc::new(config_tx);
+    let (certs_tx, certs_rx) = watch::channel(crate::cluster::types::CertMap::new());
+    let certs_tx = Arc::new(certs_tx);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
         config_rx,
+        certs_rx,
         client_tls: Arc::clone(&tls_slot),
     };
-    let service = ClusterService { opts, raft_slot, tls_slot, config_tx };
+    let service = ClusterService { opts, raft_slot, tls_slot, config_tx, certs_tx };
 
     (handle, service)
 }
@@ -704,6 +711,20 @@ pub async fn push_config(raft: &ClusterRaft, yaml: String) -> Result<()> {
     raft.client_write(ClientRequest::SetConfig { yaml })
         .await
         .map_err(|e| anyhow::anyhow!("config push failed: {e:?}"))?;
+    Ok(())
+}
+
+/// Replicate an ACME certificate to the cluster via Raft. Returns when
+/// committed — every current node has it; late joiners get it via snapshot.
+pub async fn push_cert(
+    raft: &ClusterRaft,
+    host: String,
+    cert_pem: String,
+    key_pem: String,
+) -> Result<()> {
+    raft.client_write(ClientRequest::SetCert { host, cert_pem, key_pem })
+        .await
+        .map_err(|e| anyhow::anyhow!("cert push failed: {e:?}"))?;
     Ok(())
 }
 

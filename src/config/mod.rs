@@ -64,9 +64,10 @@ pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
                 cfg.pools.insert(name, pool);
             }
 
-            // Vhosts and listeners are appended in load order.
+            // Vhosts, listeners, and certificates are appended in load order.
             cfg.vhosts.extend(fragment.vhosts);
             cfg.listeners.extend(fragment.listeners);
+            cfg.certificates.extend(fragment.certificates);
         }
     }
 
@@ -103,6 +104,9 @@ struct IncludeFragment {
 
     #[serde(default)]
     listeners: Vec<Listener>,
+
+    #[serde(default)]
+    certificates: Vec<CertificateRequest>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,6 +149,11 @@ pub struct Config {
 
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+
+    /// Standalone certificate requests (no vhost). Merged from conf.d files
+    /// like vhosts are.
+    #[serde(default)]
+    pub certificates: Vec<CertificateRequest>,
 }
 
 impl Config {
@@ -169,10 +178,10 @@ impl Config {
                 }
             }
             if let Some(tls) = &vhost.tls {
-                if tls.acme {
+                if tls.acme.enabled() {
                     if tls.cert.is_some() || tls.key.is_some() {
                         anyhow::bail!(
-                            "vhost '{}': tls.acme is true — remove cert/key (they are managed in the ACME storage dir)",
+                            "vhost '{}': tls.acme is set — remove cert/key (they are managed in the ACME storage dir)",
                             vhost.host
                         );
                     }
@@ -184,51 +193,122 @@ impl Config {
                     }
                 } else if tls.cert.is_none() || tls.key.is_none() {
                     anyhow::bail!(
-                        "vhost '{}': tls requires cert and key paths (or acme: true)",
+                        "vhost '{}': tls requires cert and key paths (or acme)",
                         vhost.host
                     );
                 }
             }
         }
+        self.validate_acme()?;
+        Ok(())
+    }
+
+    fn validate_acme(&self) -> Result<()> {
+        let issuer_defined = |name: &str| {
+            self.acme.as_ref().map_or(false, |a| a.issuers.contains_key(name))
+        };
+
+        // Issuer references must exist ("default" may be implicit).
+        for vhost in &self.vhosts {
+            let Some(name) = vhost.tls.as_ref().and_then(|t| t.acme.issuer_name()) else {
+                continue;
+            };
+            if !issuer_defined(name) && name != DEFAULT_ISSUER {
+                anyhow::bail!(
+                    "vhost '{}': tls.acme references issuer '{name}', which is not defined under acme.issuers",
+                    vhost.host
+                );
+            }
+        }
+        for cert in &self.certificates {
+            if !issuer_defined(&cert.issuer) && cert.issuer != DEFAULT_ISSUER {
+                anyhow::bail!(
+                    "certificates '{}': references issuer '{}', which is not defined under acme.issuers",
+                    cert.host, cert.issuer
+                );
+            }
+            if cert.host.contains('*') {
+                anyhow::bail!(
+                    "certificates '{}': ACME HTTP-01 cannot issue wildcard certificates",
+                    cert.host
+                );
+            }
+        }
+
         if let Some(acme) = &self.acme {
-            for domain in &acme.domains {
-                if domain.contains('*') {
-                    anyhow::bail!("acme.domains '{domain}': HTTP-01 cannot issue wildcard certificates");
+            RenewBefore::parse(&acme.renew_before)
+                .with_context(|| format!("acme.renew_before '{}'", acme.renew_before))?;
+            for (name, issuer) in &acme.issuers {
+                if let Some(rb) = &issuer.renew_before {
+                    RenewBefore::parse(rb).with_context(|| {
+                        format!("acme.issuers.{name}.renew_before '{rb}'")
+                    })?;
+                }
+            }
+        }
+
+        // Each hostname has exactly one certificate — one issuer. Check the raw
+        // config (not the deduplicated assignments) so conflicts surface.
+        let mut owner: HashMap<&str, &str> = HashMap::new();
+        let mut claims: Vec<(&str, &str)> = Vec::new();
+        for v in &self.vhosts {
+            if let Some(name) = v.tls.as_ref().and_then(|t| t.acme.issuer_name()) {
+                claims.push((v.host.as_str(), name));
+            }
+        }
+        for c in &self.certificates {
+            claims.push((c.host.as_str(), c.issuer.as_str()));
+        }
+        for (host, issuer) in claims {
+            if let Some(prev) = owner.insert(host, issuer) {
+                if prev != issuer {
+                    anyhow::bail!(
+                        "host '{host}' is assigned to both ACME issuer '{prev}' and '{issuer}' — a host can only have one certificate"
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    /// The effective ACME config: the `acme:` block, or defaults when any vhost
-    /// enables `tls.acme` without one. `None` when ACME is unused entirely.
+    /// The effective ACME config with the implicit "default" issuer
+    /// materialized when referenced but not defined. `None` when ACME is
+    /// unused entirely.
     pub fn acme_effective(&self) -> Option<AcmeConfig> {
-        let vhost_acme = self.vhosts.iter().any(|v| v.tls.as_ref().map_or(false, |t| t.acme));
-        match (&self.acme, vhost_acme) {
-            (Some(a), _) => Some(a.clone()),
-            (None, true) => Some(AcmeConfig::default()),
-            (None, false) => None,
+        let assignments = self.acme_assignments();
+        if assignments.is_empty() {
+            return None;
         }
-    }
-
-    /// All hostnames Keel manages certificates for: ACME vhosts plus the
-    /// standalone `acme.domains` list. Deduplicated, order preserved.
-    pub fn acme_hosts(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut hosts = Vec::new();
-        for v in &self.vhosts {
-            if v.tls.as_ref().map_or(false, |t| t.acme) && seen.insert(v.host.clone()) {
-                hosts.push(v.host.clone());
+        let mut acme = self.acme.clone().unwrap_or_default();
+        for (_, issuer, _) in &assignments {
+            if !acme.issuers.contains_key(*issuer) {
+                // validate() guarantees only "default" can be undefined.
+                acme.issuers.insert((*issuer).to_owned(), AcmeIssuer::default());
             }
         }
-        if let Some(acme) = &self.acme {
-            for d in &acme.domains {
-                if seen.insert(d.clone()) {
-                    hosts.push(d.clone());
+        Some(acme)
+    }
+
+    /// Every ACME-managed hostname as `(host, issuer, vhost_managed)`.
+    /// `vhost_managed` is true when Keel terminates TLS for the host (the cert
+    /// goes into the CertStore) and false for standalone `certificates:`
+    /// entries (cert files only). Deduplicated, order preserved.
+    pub fn acme_assignments(&self) -> Vec<(&str, &str, bool)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for v in &self.vhosts {
+            if let Some(name) = v.tls.as_ref().and_then(|t| t.acme.issuer_name()) {
+                if seen.insert(v.host.as_str()) {
+                    out.push((v.host.as_str(), name, true));
                 }
             }
         }
-        hosts
+        for c in &self.certificates {
+            if seen.insert(c.host.as_str()) {
+                out.push((c.host.as_str(), c.issuer.as_str(), false));
+            }
+        }
+        out
     }
 }
 
@@ -439,7 +519,7 @@ impl Vhost {
     /// to true (the challenge path bypasses the redirect in the proxy).
     pub fn redirect_http_effective(&self) -> bool {
         self.redirect_http
-            .unwrap_or_else(|| self.tls.as_ref().map_or(false, |t| t.acme))
+            .unwrap_or_else(|| self.tls.as_ref().map_or(false, |t| t.acme.enabled()))
     }
 }
 
@@ -453,48 +533,147 @@ pub struct Route {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
-    /// Certificate path (BYO cert). Not set when `acme: true`.
+    /// Certificate path (BYO cert). Not set when ACME is enabled.
     pub cert: Option<String>,
-    /// Private key path (BYO cert). Not set when `acme: true`.
+    /// Private key path (BYO cert). Not set when ACME is enabled.
     pub key: Option<String>,
-    /// Obtain and renew the certificate automatically via ACME (HTTP-01).
+    /// Automatic certificates via ACME: `true` uses the issuer named
+    /// `default`; a string names an issuer from `acme.issuers`.
     #[serde(default)]
-    pub acme: bool,
+    pub acme: AcmeRef,
 }
+
+/// `tls.acme` accepts a bool (`true` → issuer "default") or an issuer name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AcmeRef {
+    Enabled(bool),
+    Issuer(String),
+}
+
+impl Default for AcmeRef {
+    fn default() -> Self {
+        AcmeRef::Enabled(false)
+    }
+}
+
+impl AcmeRef {
+    /// The issuer this vhost uses, or `None` when ACME is off.
+    pub fn issuer_name(&self) -> Option<&str> {
+        match self {
+            AcmeRef::Enabled(false) => None,
+            AcmeRef::Enabled(true) => Some(DEFAULT_ISSUER),
+            AcmeRef::Issuer(name) => Some(name.as_str()),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.issuer_name().is_some()
+    }
+}
+
+/// Issuer name that `tls: { acme: true }` refers to.
+pub const DEFAULT_ISSUER: &str = "default";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcmeConfig {
-    /// Contact email for the ACME account (expiry warnings from the CA).
+    /// Directory for certificates, keys, accounts, and challenge tokens.
+    #[serde(default = "default_acme_storage")]
+    pub storage: String,
+
+    /// When to renew: a percentage of the certificate's total lifetime
+    /// remaining ("30%", works for both 90-day and short-lived certs) or an
+    /// absolute window ("20d"). Per-issuer override available.
+    #[serde(default = "default_renew_before")]
+    pub renew_before: String,
+
+    /// Named certificate issuers. Vhosts reference them via `tls.acme`.
+    /// `tls: { acme: true }` means the issuer named "default", which is
+    /// implicitly Let's Encrypt production when not defined here.
+    #[serde(default)]
+    pub issuers: HashMap<String, AcmeIssuer>,
+}
+
+impl Default for AcmeConfig {
+    fn default() -> Self {
+        Self {
+            storage: default_acme_storage(),
+            renew_before: default_renew_before(),
+            issuers: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AcmeIssuer {
+    /// Contact email for this issuer's ACME account (expiry warnings).
     pub email: Option<String>,
 
     /// ACME v2 directory URL. Defaults to Let's Encrypt production.
     #[serde(default = "default_acme_directory")]
     pub directory: String,
 
-    /// Directory for certificates, keys, the account, and challenge tokens.
-    #[serde(default = "default_acme_storage")]
-    pub storage: String,
-
-    /// Extra hostnames to obtain certificates for even though they have no TLS
-    /// vhost — e.g. domains Keel fronts as plain TCP / TLS passthrough. Keel
-    /// serves only the HTTP-01 challenge for these; the cert/key files land in
-    /// `storage` for the operator or backend to consume (Lego standalone-style).
-    #[serde(default)]
-    pub domains: Vec<String>,
-
     /// PEM file with an additional trust root for the ACME directory itself.
-    /// Only needed when testing against Pebble or an internal CA.
+    /// Only needed for internal CAs or testing against Pebble.
     pub root_ca: Option<String>,
+
+    /// Per-issuer renewal override; same syntax as the global `renew_before`.
+    pub renew_before: Option<String>,
 }
 
-impl Default for AcmeConfig {
+impl Default for AcmeIssuer {
     fn default() -> Self {
         Self {
             email: None,
             directory: default_acme_directory(),
-            storage: default_acme_storage(),
-            domains: Vec::new(),
             root_ca: None,
+            renew_before: None,
+        }
+    }
+}
+
+/// A standalone certificate request: a hostname Keel obtains a certificate
+/// for without terminating TLS for it (plain TCP / TLS-passthrough backends).
+/// Keel answers the HTTP-01 challenge; the cert/key files land in
+/// `acme.storage` for the operator or backend to consume (Lego
+/// standalone-style). Lives at the top level so conf.d files can declare
+/// their own, next to their vhosts and pools.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CertificateRequest {
+    pub host: String,
+    /// Issuer name from `acme.issuers`. Defaults to "default".
+    #[serde(default = "default_issuer_name")]
+    pub issuer: String,
+}
+
+fn default_issuer_name() -> String { DEFAULT_ISSUER.into() }
+
+/// Parsed `renew_before` value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenewBefore {
+    /// Renew when less than this percentage of total lifetime remains.
+    Percent(u8),
+    /// Renew when fewer than this many days remain.
+    Days(u32),
+}
+
+impl RenewBefore {
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if let Some(p) = s.strip_suffix('%') {
+            let pct: u8 = p.trim().parse().context("renew_before percentage")?;
+            if !(1..=90).contains(&pct) {
+                anyhow::bail!("renew_before percentage must be 1–90, got {pct}%");
+            }
+            Ok(RenewBefore::Percent(pct))
+        } else if let Some(d) = s.strip_suffix('d') {
+            let days: u32 = d.trim().parse().context("renew_before days")?;
+            if days == 0 {
+                anyhow::bail!("renew_before days must be at least 1");
+            }
+            Ok(RenewBefore::Days(days))
+        } else {
+            anyhow::bail!("renew_before must be a percentage ('30%') or days ('20d'), got '{s}'")
         }
     }
 }
@@ -503,6 +682,7 @@ fn default_acme_directory() -> String {
     "https://acme-v02.api.letsencrypt.org/directory".into()
 }
 fn default_acme_storage() -> String { "/var/lib/keel/acme".into() }
+fn default_renew_before() -> String { "30%".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccessLogConfig {
