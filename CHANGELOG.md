@@ -8,6 +8,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [0.1.0-alpha] — 2026-07-03
+
+First tagged alpha. Everything in 0.1.0 plus the changes below.
+
 ### Added
 
 - **`keel cluster stepdown [--force]`** — gracefully remove the local node from the
