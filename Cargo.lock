@@ -1245,6 +1245,7 @@ dependencies = [
  "pingora",
  "prometheus 0.14.0",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",

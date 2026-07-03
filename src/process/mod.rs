@@ -25,6 +25,10 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 pub fn run_master(cfg: Config) -> Result<()> {
     install_signal_handlers()?;
 
+    // Validate that workers will be able to drop privileges before forking any,
+    // so a misconfigured user/group fails fast instead of fork/exit looping.
+    preflight_privileges(&cfg.keel.user, &cfg.keel.group)?;
+
     let n = cfg.keel.workers;
     info!(workers = n, "master: spawning workers");
 
@@ -104,26 +108,87 @@ fn run_worker(cfg: &Config, index: usize) -> ! {
     proxy::run(cfg)
 }
 
-/// Drop root privileges to `user`:`group`. Logs and continues on failure
-/// (e.g. when running as non-root in dev).
+/// Resolve the configured user and group up front (only meaningful as root).
+/// Returns an error if either is missing so startup fails before forking workers.
+fn preflight_privileges(user: &str, group: &str) -> Result<()> {
+    use nix::unistd::{getuid, Group, User};
+
+    if !getuid().is_root() {
+        return Ok(());
+    }
+    if !matches!(Group::from_name(group), Ok(Some(_))) {
+        anyhow::bail!("group '{group}' not found — cannot drop privileges (set keel.group)");
+    }
+    if !matches!(User::from_name(user), Ok(Some(_))) {
+        anyhow::bail!("user '{user}' not found — cannot drop privileges (set keel.user)");
+    }
+    Ok(())
+}
+
+/// Drop root privileges to `user`:`group`.
+///
+/// When running as root this is a hard requirement: if any step fails the worker
+/// exits rather than serve traffic with root privileges. When already unprivileged
+/// (typical in dev) there is nothing to drop, so it returns quietly.
 fn drop_privileges(user: &str, group: &str) {
-    use nix::unistd::{setgid, setuid, Group, User};
+    use nix::unistd::{getuid, setgid, setuid, Group, User};
 
-    if let Ok(Some(g)) = Group::from_name(group) {
-        if let Err(e) = setgid(g.gid) {
-            warn!(group, error = %e, "worker: could not setgid (running as non-root?)");
-        }
-    } else {
-        warn!(group, "worker: group not found, skipping setgid");
+    if !getuid().is_root() {
+        warn!("worker: not running as root, skipping privilege drop");
+        return;
     }
 
-    if let Ok(Some(u)) = User::from_name(user) {
-        if let Err(e) = setuid(u.uid) {
-            warn!(user, error = %e, "worker: could not setuid (running as non-root?)");
+    let gid = match Group::from_name(group) {
+        Ok(Some(g)) => g.gid,
+        _ => {
+            error!(group, "worker: group not found, refusing to run as root");
+            std::process::exit(1);
         }
-    } else {
-        warn!(user, "worker: user not found, skipping setuid");
+    };
+    let uid = match User::from_name(user) {
+        Ok(Some(u)) => u.uid,
+        _ => {
+            error!(user, "worker: user not found, refusing to run as root");
+            std::process::exit(1);
+        }
+    };
+
+    // Order matters: drop supplementary groups, then gid, then uid. uid last so
+    // the earlier privileged calls still succeed. setgroups([]) clears root's
+    // supplementary groups — setuid alone does NOT remove them.
+    if let Err(e) = clear_supplementary_groups() {
+        error!(error = %e, "worker: setgroups failed, refusing to run as root");
+        std::process::exit(1);
     }
+    if let Err(e) = setgid(gid) {
+        error!(error = %e, "worker: setgid failed, refusing to run as root");
+        std::process::exit(1);
+    }
+    if let Err(e) = setuid(uid) {
+        error!(error = %e, "worker: setuid failed, refusing to run as root");
+        std::process::exit(1);
+    }
+
+    // Sanity check: privileges must actually be gone.
+    if getuid().is_root() {
+        error!("worker: still root after privilege drop, refusing to continue");
+        std::process::exit(1);
+    }
+
+    info!(user, group, "worker: dropped privileges");
+}
+
+/// Drop all supplementary groups. nix exposes `setgroups` only off Apple targets;
+/// macOS is dev-only and runs unprivileged, so the no-op there is never reached
+/// in a real privilege drop.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn clear_supplementary_groups() -> nix::Result<()> {
+    nix::unistd::setgroups(&[])
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clear_supplementary_groups() -> nix::Result<()> {
+    Ok(())
 }
 
 fn install_signal_handlers() -> Result<()> {

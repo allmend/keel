@@ -38,7 +38,11 @@ use tracing::{error, info};
 
 pub struct ProxyCtx {
     pool: String,
+    /// Canonical configured vhost label (bounded — exact host, "*", or "unmatched").
+    /// Safe to use as an access-log filename component and metric label.
     vhost: String,
+    /// Raw Host header from the client. Used only for the X-Forwarded-Host header.
+    host_header: String,
     backend: Option<SocketAddr>,
     started_at: Instant,
     backend_started_at: Option<Instant>,
@@ -70,6 +74,7 @@ impl ProxyHttp for KProxy {
         ProxyCtx {
             pool: String::new(),
             vhost: String::new(),
+            host_header: String::new(),
             backend: None,
             started_at: Instant::now(),
             backend_started_at: None,
@@ -161,11 +166,21 @@ impl ProxyHttp for KProxy {
             .map(|a| a.to_string());
         let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
 
+        // Resolve the raw Host header to a bounded, operator-configured label before
+        // using it as a metric label or log filename. Unmatched hosts collapse into a
+        // single "unmatched" bucket — never the raw client-supplied value.
+        let routing = self.routing.load();
+        let vhost_label = routing
+            .vhost_label(&host)
+            .unwrap_or("unmatched")
+            .to_owned();
+
         ctx.method = method;
         ctx.uri = uri;
         ctx.protocol = protocol;
         ctx.user_agent = user_agent;
-        ctx.vhost = host.clone();
+        ctx.vhost = vhost_label;
+        ctx.host_header = host.clone();
         ctx.client_ip = client_ip;
         ctx.client_addr_str = client_addr_str;
         ctx.is_tls = is_tls;
@@ -175,11 +190,10 @@ impl ProxyHttp for KProxy {
             .map(|ip| ip.to_string().into_bytes())
             .unwrap_or_default();
 
-        let routing = self.routing.load();
         let pool_name = routing
             .resolve(&host, &path)
             .ok_or_else(|| {
-                crate::metrics::record_lb_error("", &host, "no_route");
+                crate::metrics::record_lb_error("", &ctx.vhost, "no_route");
                 Error::explain(
                     ErrorType::HTTPStatus(502),
                     format!("no vhost match for host='{host}' path='{path}'"),
@@ -194,7 +208,7 @@ impl ProxyHttp for KProxy {
             .pools
             .select(&pool_name, &key)
             .ok_or_else(|| {
-                crate::metrics::record_lb_error(&pool_name, &host, "no_backend");
+                crate::metrics::record_lb_error(&pool_name, &ctx.vhost, "no_backend");
                 Error::explain(
                     ErrorType::HTTPStatus(502),
                     format!("pool '{pool_name}' has no available backends"),
@@ -257,7 +271,8 @@ impl ProxyHttp for KProxy {
         };
 
         let proto = if ctx.is_tls { "https" } else { "http" };
-        let host = &ctx.vhost;
+        // Forward the original client-supplied Host, not the internal label.
+        let host = &ctx.host_header;
 
         upstream_request.insert_header("x-forwarded-for", xff.as_str())?;
         upstream_request.insert_header("x-real-ip", real_ip.to_string().as_str())?;
@@ -664,6 +679,27 @@ where
     }
 }
 
+// Build TLS listener settings with our SNI cert resolver and a TLS 1.2 floor.
+// TLS 1.0/1.1 are obsolete and must never be negotiable.
+fn build_tls_settings(
+    cert_store: &Arc<CertStore>,
+    address: &str,
+) -> pingora::listeners::tls::TlsSettings {
+    let mut settings =
+        pingora::listeners::tls::TlsSettings::with_callbacks(cert_store.make_callbacks())
+            .unwrap_or_else(|e| {
+                error!(address, error = %e, "failed to create TLS settings");
+                std::process::exit(1);
+            });
+    if let Err(e) =
+        settings.set_min_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
+    {
+        error!(address, error = %e, "failed to set minimum TLS version");
+        std::process::exit(1);
+    }
+    settings
+}
+
 fn log_cache_mode(cfg: &CacheConfig) {
     match (&cfg.memory, &cfg.disk) {
         (Some(mem), Some(disk)) => {
@@ -743,13 +779,7 @@ pub fn run(cfg: &Config) -> ! {
             svc.add_tcp(&l.address);
         }
         for l in tls {
-            let settings = pingora::listeners::tls::TlsSettings::with_callbacks(
-                cert_store.make_callbacks(),
-            )
-            .unwrap_or_else(|e| {
-                error!(address = l.address, error = %e, "failed to create TLS settings");
-                std::process::exit(1);
-            });
+            let settings = build_tls_settings(&cert_store, &l.address);
             info!(address = l.address, "adding TLS listener");
             svc.add_tls_with_settings(&l.address, None, settings);
         }
@@ -887,13 +917,7 @@ pub fn run_cluster(
             svc.add_tcp(&l.address);
         }
         for l in tls_listeners {
-            let settings = pingora::listeners::tls::TlsSettings::with_callbacks(
-                cert_store.make_callbacks(),
-            )
-            .unwrap_or_else(|e| {
-                error!(address = l.address, error = %e, "failed to create TLS settings");
-                std::process::exit(1);
-            });
+            let settings = build_tls_settings(&cert_store, &l.address);
             info!(address = l.address, "adding TLS listener");
             svc.add_tls_with_settings(&l.address, None, settings);
         }

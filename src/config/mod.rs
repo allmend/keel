@@ -228,7 +228,10 @@ impl Default for MetricsConfig {
     }
 }
 
-fn default_metrics_address() -> String { "0.0.0.0:9090".into() }
+// Localhost by default — metrics expose backend addresses, pool/vhost names, and
+// traffic volumes. Operators that scrape remotely set 0.0.0.0 explicitly and are
+// expected to firewall the port (or run a local agent scraping 127.0.0.1).
+fn default_metrics_address() -> String { "127.0.0.1:9090".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pool {

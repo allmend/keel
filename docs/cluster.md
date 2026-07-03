@@ -51,6 +51,11 @@ cluster:
   secret: mysecret
 ```
 
+A non-empty secret is **mandatory** — Keel refuses to start cluster mode without
+one, because the join listener would otherwise hand a cluster identity to any peer
+that can reach the port. Use a high-entropy token, e.g. `openssl rand -hex 32`.
+A weak secret is brute-forceable offline if an attacker captures a join exchange.
+
 On bootstrap, Keel generates a cluster CA and issues a node certificate. All inter-node communication uses mTLS with this CA.
 
 ---
@@ -64,6 +69,12 @@ keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mysecret
 ```
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
+
+The join exchange happens before mTLS is established, so it is encrypted with a key
+derived from the shared secret (ChaCha20-Poly1305). The secret itself is never sent
+on the wire — the join request and the response (which carries the new node's private
+key and the CA) are both AEAD-encrypted, so a passive eavesdropper on the network
+segment learns nothing and a peer without the secret cannot decrypt or forge them.
 
 The `--join` address is only used once at startup. After a node has joined the cluster, it reconnects to peers on restart using the addresses stored in Raft state.
 

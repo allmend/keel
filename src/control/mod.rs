@@ -56,10 +56,18 @@ pub struct ControlServer {
 #[async_trait]
 impl pingora::services::background::BackgroundService for ControlServer {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        use std::os::unix::fs::PermissionsExt;
+
         let _ = std::fs::remove_file(&self.socket_path);
         if let Some(parent) = std::path::Path::new(&self.socket_path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 error!(path = self.socket_path, error = %e, "control: failed to create socket directory");
+                return;
+            }
+            // Restrict the directory first so the socket is never traversable by
+            // other users, even during the brief window before its own mode is set.
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
+                error!(path = %parent.display(), error = %e, "control: failed to set socket directory permissions");
                 return;
             }
         }
@@ -71,6 +79,17 @@ impl pingora::services::background::BackgroundService for ControlServer {
                 return;
             }
         };
+
+        // The control protocol can drain backends, reload config, and push config
+        // to the whole cluster — anyone who can open the socket owns the proxy.
+        // Restrict to owner+group (0660); refuse to serve if we cannot lock it down.
+        if let Err(e) =
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))
+        {
+            error!(path = self.socket_path, error = %e, "control: failed to restrict socket permissions");
+            let _ = std::fs::remove_file(&self.socket_path);
+            return;
+        }
 
         info!(path = self.socket_path, "control: socket ready");
 

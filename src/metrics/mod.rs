@@ -6,7 +6,7 @@ use prometheus::{
     gather, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec,
     Encoder, GaugeVec, HistogramVec, TextEncoder,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -201,13 +201,38 @@ impl BackgroundService for MetricsService {
                     match result {
                         Ok((mut stream, _)) => {
                             tokio::spawn(async move {
+                                // Read the request head and only serve metrics for
+                                // GET /metrics; anything else gets a 404.
+                                let mut buf = [0u8; 1024];
+                                let n = match stream.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => n,
+                                };
+                                let head = String::from_utf8_lossy(&buf[..n]);
+                                let request_line = head.lines().next().unwrap_or("");
+                                let mut parts = request_line.split_whitespace();
+                                let method = parts.next().unwrap_or("");
+                                let path = parts.next().unwrap_or("");
+                                let path = path.split('?').next().unwrap_or(path);
+
+                                if method != "GET" || path != "/metrics" {
+                                    let body = "Not Found";
+                                    let response = format!(
+                                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        body.len(),
+                                        body
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    return;
+                                }
+
                                 let encoder = TextEncoder::new();
                                 let families = gather();
                                 let body = encoder
                                     .encode_to_string(&families)
                                     .unwrap_or_default();
                                 let response = format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                     encoder.format_type(),
                                     body.len(),
                                     body

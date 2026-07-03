@@ -10,7 +10,7 @@ use openraft::raft::{
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -74,11 +74,9 @@ impl ClusterNetwork {
         stream.write_all(&body).await.map_err(|e| NetworkError::new(&e))?;
         stream.flush().await.map_err(|e| NetworkError::new(&e))?;
 
-        let mut hdr = [0u8; 4];
-        stream.read_exact(&mut hdr).await.map_err(|e| NetworkError::new(&e))?;
-        let rlen = u32::from_be_bytes(hdr) as usize;
-        let mut buf = vec![0u8; rlen];
-        stream.read_exact(&mut buf).await.map_err(|e| NetworkError::new(&e))?;
+        let buf = crate::cluster::read_frame(&mut stream, crate::cluster::MAX_RPC_FRAME)
+            .await
+            .map_err(|e| NetworkError::new(&e))?;
 
         let resp: RpcResponse<Resp> = serde_json::from_slice(&buf)
             .map_err(|e| NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e)))?;

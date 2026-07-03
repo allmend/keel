@@ -8,6 +8,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Host header no longer used as a filesystem or metrics key.** A crafted `Host`
+  header could traverse outside the access-log directory, exhaust file descriptors
+  and inodes, and explode Prometheus metric cardinality. Requests now map to a
+  bounded, operator-configured vhost label for logs and metrics.
+- **Cluster join channel is now encrypted.** The join request and response (which
+  carries the new node's private key and the cluster CA) were sent in cleartext
+  over plain TCP before mTLS existed. They are now AEAD-encrypted with a key
+  derived from the shared secret; the secret itself is never transmitted.
+- **Cluster mode requires a non-empty shared secret.** Keel refuses to start
+  bootstrap/join without one, closing an open-join takeover path.
+- **Control socket permissions restricted** to `0660` (dir `0750`).
+- **Worker privilege drop hardened** — drops supplementary groups and aborts
+  rather than continuing as root on failure.
+- **Minimum TLS 1.2** enforced on proxy listeners.
+- **Metrics endpoint defaults to `127.0.0.1`** and serves only `GET /metrics`.
+- **Length-prefixed cluster reads are capped** before allocation (DoS guard).
+- **Corrupt Raft snapshots surface as errors** instead of silently resetting state.
+
+### Changed
+
+- **BREAKING:** clusters previously bootstrapped without `--secret` will no longer
+  start. Set `cluster.secret` (or `--secret`) to a high-entropy token.
+- **BREAKING:** the metrics endpoint default changed from `0.0.0.0:9090` to
+  `127.0.0.1:9090`. Set `metrics.address: 0.0.0.0:9090` to restore remote scrape.
+
 ---
 
 ## [0.1.0] — 2026-05-15

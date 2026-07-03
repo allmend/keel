@@ -63,7 +63,7 @@ impl AccessLogger {
             return;
         }
 
-        let vhost = if entry.vhost.is_empty() { "unknown" } else { &entry.vhost };
+        let vhost = sanitize_vhost(&entry.vhost);
         self.write_to(&format!("access_{vhost}.log"), &line);
         if entry.error.is_some() {
             self.write_to(&format!("error_{vhost}.log"), &line);
@@ -71,6 +71,7 @@ impl AccessLogger {
     }
 
     fn write_to(&self, filename: &str, line: &str) {
+        // filename is always built from a sanitized vhost — see sanitize_vhost.
         let mut files = self.files.lock().unwrap();
         if !files.contains_key(filename) {
             let path = format!("{}/{}", self.dir, filename);
@@ -88,5 +89,51 @@ impl AccessLogger {
             let _ = writeln!(writer, "{line}");
             let _ = writer.flush();
         }
+    }
+}
+
+/// Reduce a vhost label to a safe filename component. The proxy already maps
+/// requests to a bounded set of configured hosts, but this is a final guard so
+/// no path separator, `..`, or control character can ever reach the filesystem.
+fn sanitize_vhost(vhost: &str) -> String {
+    if vhost.is_empty() {
+        return "unknown".to_owned();
+    }
+    let cleaned: String = vhost
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '*') { c } else { '_' })
+        .collect();
+    // A name consisting only of dots ("." / "..") would be filesystem-unsafe.
+    if cleaned.chars().all(|c| c == '.') {
+        "unknown".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_vhost;
+
+    #[test]
+    fn rejects_path_traversal() {
+        // Dots are kept (valid in hostnames) but every path separator becomes '_',
+        // so no traversal sequence can survive.
+        let cleaned = sanitize_vhost("../../etc/cron.d/x");
+        assert!(!cleaned.contains('/'));
+        assert_eq!(cleaned, ".._.._etc_cron.d_x");
+        assert_eq!(sanitize_vhost("a/b"), "a_b");
+        // A name that is only dots would be filesystem-unsafe ("." / "..").
+        assert_eq!(sanitize_vhost(".."), "unknown");
+        assert_eq!(sanitize_vhost(""), "unknown");
+        // Control characters and null bytes are scrubbed.
+        assert_eq!(sanitize_vhost("a\nb\0c"), "a_b_c");
+    }
+
+    #[test]
+    fn keeps_normal_hosts() {
+        assert_eq!(sanitize_vhost("api.example.com"), "api.example.com");
+        assert_eq!(sanitize_vhost("*"), "*");
+        assert_eq!(sanitize_vhost("unmatched"), "unmatched");
     }
 }

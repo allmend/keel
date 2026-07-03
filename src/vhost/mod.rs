@@ -96,6 +96,22 @@ impl RoutingTable {
         if vhost_cache.enabled { Some(vhost_cache) } else { None }
     }
 
+    /// Maps an incoming Host header to the canonical configured vhost label that
+    /// serves it: the exact host key if configured, else `"*"` if a wildcard vhost
+    /// exists, else `None`. Used as a *bounded* key for access logs and metrics so
+    /// an attacker-supplied Host header cannot create unbounded files or metric
+    /// series. The returned value is always one of the operator-configured hosts.
+    pub fn vhost_label(&self, host: &str) -> Option<&str> {
+        let host = host.split(':').next().unwrap_or(host);
+        if let Some((key, _)) = self.vhosts.get_key_value(host) {
+            Some(key.as_str())
+        } else if self.vhosts.contains_key("*") {
+            Some("*")
+        } else {
+            None
+        }
+    }
+
     /// Returns the forwarded headers config for the given host, or `None` if not set.
     pub fn forwarded_config(&self, host: &str) -> Option<&ForwardedHeadersConfig> {
         let host = host.split(':').next().unwrap_or(host);

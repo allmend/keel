@@ -25,6 +25,91 @@ use crate::cluster::types::{ClientRequest, NodeId, TypeConfig};
 
 pub type ClusterRaft = Raft<TypeConfig>;
 
+// Wire-frame limits — every length-prefixed read is capped before allocating so a
+// peer-supplied length cannot drive a multi-gigabyte allocation (DoS).
+/// Join requests/responses are small JSON (secret + node id, or a few PEMs).
+pub(crate) const MAX_JOIN_FRAME: usize = 64 * 1024; // 64 KiB
+/// Raft AppendEntries / InstallSnapshot can be larger; still bounded.
+pub(crate) const MAX_RPC_FRAME: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Read a 4-byte big-endian length prefix, reject lengths above `max`, then read
+/// exactly that many bytes. Caps the allocation a remote peer can force.
+pub(crate) async fn read_frame<R>(reader: &mut R, max: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut hdr = [0u8; 4];
+    reader.read_exact(&mut hdr).await?;
+    let rlen = u32::from_be_bytes(hdr) as usize;
+    if rlen > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame length {rlen} exceeds maximum {max}"),
+        ));
+    }
+    let mut buf = vec![0u8; rlen];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+// Join-channel encryption
+//
+// The join exchange happens over plain TCP before any mTLS identity exists, so it
+// must protect both the request and the response: the response carries the new
+// node's private key and the cluster CA. We derive a symmetric AEAD key from the
+// shared secret and encrypt both directions. A passive eavesdropper on the segment
+// learns nothing; an active attacker without the secret cannot decrypt the request
+// or forge a response. Successful AEAD decryption is itself proof that the peer
+// holds the secret — so the secret is never transmitted, not even encrypted.
+//
+// Residual risk: if the shared secret is low-entropy, a captured exchange is open
+// to offline brute force. Operators must use a high-entropy token (e.g. the output
+// of `openssl rand -hex 32`). This is documented in the cluster setup docs.
+
+const JOIN_KEY_CONTEXT: &[u8] = b"keel-cluster-join-v1\0";
+
+/// Derive the AEAD key for the join channel from the shared secret.
+fn join_key(secret: &str) -> ring::aead::LessSafeKey {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(JOIN_KEY_CONTEXT);
+    ctx.update(secret.as_bytes());
+    let digest = ctx.finish();
+    // SHA-256 output (32 bytes) is exactly a ChaCha20-Poly1305 key.
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, digest.as_ref())
+        .expect("32-byte key is valid for CHACHA20_POLY1305");
+    ring::aead::LessSafeKey::new(unbound)
+}
+
+/// Seal `plaintext` as `nonce(12) || ciphertext || tag` using a fresh random nonce.
+fn join_seal(key: &ring::aead::LessSafeKey, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use ring::rand::SecureRandom;
+    let mut nonce_bytes = [0u8; ring::aead::NONCE_LEN];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| anyhow::anyhow!("rng failure"))?;
+    let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
+        .map_err(|_| anyhow::anyhow!("seal failure"))?;
+    let mut out = Vec::with_capacity(ring::aead::NONCE_LEN + in_out.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&in_out);
+    Ok(out)
+}
+
+/// Open a `nonce(12) || ciphertext || tag` frame. Returns None on any auth failure
+/// (wrong secret or tampering) without distinguishing the cause.
+fn join_open(key: &ring::aead::LessSafeKey, framed: &[u8]) -> Option<Vec<u8>> {
+    if framed.len() < ring::aead::NONCE_LEN {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = framed.split_at(ring::aead::NONCE_LEN);
+    let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce_bytes).ok()?;
+    let mut in_out = ciphertext.to_vec();
+    let plaintext = key.open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out).ok()?;
+    Some(plaintext.to_vec())
+}
+
 // Options
 
 pub struct ClusterOpts {
@@ -145,7 +230,6 @@ fn build_server_tls(
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JoinRequest {
-    secret: String,
     node_id: NodeId,
     addr: String,
 }
@@ -175,20 +259,19 @@ async fn do_join(
         .await
         .with_context(|| format!("cannot connect to {join_addr}"))?;
 
-    let req = JoinRequest { secret: secret.to_owned(), node_id, addr: my_addr.to_owned() };
-    let body = serde_json::to_vec(&req)?;
+    let key = join_key(secret);
+    let req = JoinRequest { node_id, addr: my_addr.to_owned() };
+    let body = join_seal(&key, &serde_json::to_vec(&req)?)?;
 
     stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
     stream.write_all(&body).await?;
     stream.flush().await?;
 
-    let mut hdr = [0u8; 4];
-    stream.read_exact(&mut hdr).await?;
-    let rlen = u32::from_be_bytes(hdr) as usize;
-    let mut buf = vec![0u8; rlen];
-    stream.read_exact(&mut buf).await?;
+    let buf = read_frame(&mut stream, MAX_JOIN_FRAME).await?;
+    let plaintext = join_open(&key, &buf)
+        .context("join response decryption failed — wrong cluster secret?")?;
 
-    match serde_json::from_slice::<JoinEnvelope>(&buf)? {
+    match serde_json::from_slice::<JoinEnvelope>(&plaintext)? {
         JoinEnvelope::Ok(resp) => Ok((resp.ca_cert_pem, resp.node_cert_pem, resp.node_key_pem)),
         JoinEnvelope::Err { message } => anyhow::bail!("join rejected: {message}"),
     }
@@ -201,15 +284,10 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
     let (mut read_half, write_half) = tokio::io::split(stream);
     let mut write_half = write_half;
 
-    let mut hdr = [0u8; 4];
-    if read_half.read_exact(&mut hdr).await.is_err() {
-        return;
-    }
-    let rlen = u32::from_be_bytes(hdr) as usize;
-    let mut buf = vec![0u8; rlen];
-    if read_half.read_exact(&mut buf).await.is_err() {
-        return;
-    }
+    let buf = match read_frame(&mut read_half, MAX_RPC_FRAME).await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
 
     let resp_bytes = match serde_json::from_slice::<RpcRequest>(&buf) {
         Ok(RpcRequest::AppendEntries(req)) => match raft.append_entries(req).await {
@@ -243,38 +321,34 @@ async fn handle_join(
     raft: Arc<ClusterRaft>,
 ) {
     let result = async {
-        let mut hdr = [0u8; 4];
-        stream.read_exact(&mut hdr).await?;
-        let rlen = u32::from_be_bytes(hdr) as usize;
-        let mut buf = vec![0u8; rlen];
-        stream.read_exact(&mut buf).await?;
+        let key = join_key(expected_secret);
+        let buf = read_frame(&mut stream, MAX_JOIN_FRAME).await?;
 
-        let req: JoinRequest = serde_json::from_slice(&buf)?;
-
-        let envelope = if req.secret != expected_secret {
-            JoinEnvelope::Err { message: "invalid secret".to_owned() }
-        } else {
-            match ca.issue_node_cert(req.node_id) {
-                Ok((cert_pem, key_pem)) => {
-                    // Add the joining node as a learner — non-blocking.
-                    let node = BasicNode { addr: req.addr.clone() };
-                    let _ = raft.add_learner(req.node_id, node, false).await;
-                    info!(
-                        node_id = req.node_id,
-                        addr = req.addr,
-                        "cluster: node joined"
-                    );
-                    JoinEnvelope::Ok(JoinResponse {
-                        ca_cert_pem: ca.cert_pem.clone(),
-                        node_cert_pem: cert_pem,
-                        node_key_pem: key_pem,
-                    })
-                }
-                Err(e) => JoinEnvelope::Err { message: e.to_string() },
-            }
+        // Successful AEAD decryption proves the peer holds the shared secret; a
+        // wrong secret or any tampering fails here and the connection is dropped.
+        let Some(plaintext) = join_open(&key, &buf) else {
+            warn!("cluster: join rejected — could not decrypt request (invalid secret)");
+            return Ok(());
         };
 
-        let resp = serde_json::to_vec(&envelope)?;
+        let req: JoinRequest = serde_json::from_slice(&plaintext)?;
+
+        let envelope = match ca.issue_node_cert(req.node_id) {
+            Ok((cert_pem, key_pem)) => {
+                // Add the joining node as a learner — non-blocking.
+                let node = BasicNode { addr: req.addr.clone() };
+                let _ = raft.add_learner(req.node_id, node, false).await;
+                info!(node_id = req.node_id, addr = req.addr, "cluster: node joined");
+                JoinEnvelope::Ok(JoinResponse {
+                    ca_cert_pem: ca.cert_pem.clone(),
+                    node_cert_pem: cert_pem,
+                    node_key_pem: key_pem,
+                })
+            }
+            Err(e) => JoinEnvelope::Err { message: e.to_string() },
+        };
+
+        let resp = join_seal(&key, &serde_json::to_vec(&envelope)?)?;
         stream.write_all(&(resp.len() as u32).to_be_bytes()).await?;
         stream.write_all(&resp).await?;
         stream.flush().await?;
@@ -312,6 +386,17 @@ impl ClusterService {
             anyhow::bail!("cluster mode requires --bootstrap or --join");
         }
 
+        // A non-empty shared secret is mandatory. Without it the join listener would
+        // hand a CA-signed mTLS identity to any peer that can reach the cluster port,
+        // which is a full cluster takeover. Refuse to start rather than run open.
+        let secret = opts.secret.as_deref().unwrap_or("").to_owned();
+        if secret.is_empty() {
+            anyhow::bail!(
+                "cluster mode requires a non-empty shared secret \
+                 (--secret or cluster.secret in config); refusing to start with an open join listener"
+            );
+        }
+
         let (ca_cert_pem, node_cert_pem, node_key_pem, ca) = if opts.bootstrap {
             let ca = Ca::generate().context("CA generation failed")?;
             let (cert, key) = ca.issue_node_cert(opts.node_id)?;
@@ -319,9 +404,8 @@ impl ClusterService {
             (ca_pem, cert, key, Some(ca))
         } else {
             let join_addr = opts.join.as_ref().unwrap();
-            let secret = opts.secret.as_deref().unwrap_or("");
             let (ca_pem, cert, key) =
-                do_join(join_addr, secret, opts.node_id, &opts.cluster_addr)
+                do_join(join_addr, &secret, opts.node_id, &opts.cluster_addr)
                     .await
                     .context("cluster join failed")?;
             (ca_pem, cert, key, None)
@@ -363,7 +447,6 @@ impl ClusterService {
 
         info!(addr = opts.cluster_addr, "cluster: peer listener ready");
 
-        let secret = opts.secret.clone().unwrap_or_default();
         let ca: Option<Arc<Ca>> = ca.map(Arc::new);
 
         loop {
@@ -409,6 +492,44 @@ impl ClusterService {
         info!("cluster: shutting down");
         raft.shutdown().await.ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_key, join_open, join_seal};
+
+    #[test]
+    fn join_roundtrip_same_secret() {
+        let key = join_key("a-high-entropy-cluster-token");
+        let sealed = join_seal(&key, b"hello cluster").unwrap();
+        // Ciphertext must not contain the plaintext.
+        assert!(!sealed.windows(5).any(|w| w == b"hello"));
+        assert_eq!(join_open(&key, &sealed).unwrap(), b"hello cluster");
+    }
+
+    #[test]
+    fn join_wrong_secret_rejected() {
+        let sealed = join_seal(&join_key("correct-secret"), b"payload").unwrap();
+        assert!(join_open(&join_key("wrong-secret"), &sealed).is_none());
+    }
+
+    #[test]
+    fn join_tamper_rejected() {
+        let key = join_key("secret");
+        let mut sealed = join_seal(&key, b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff; // flip a tag bit
+        assert!(join_open(&key, &sealed).is_none());
+    }
+
+    #[test]
+    fn join_nonces_differ_per_message() {
+        let key = join_key("secret");
+        let a = join_seal(&key, b"x").unwrap();
+        let b = join_seal(&key, b"x").unwrap();
+        // Random nonce ⇒ identical plaintext produces different frames.
+        assert_ne!(a, b);
     }
 }
 

@@ -241,8 +241,11 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
-        let data: ClusterState = serde_json::from_slice(snapshot.get_ref())
-            .unwrap_or_default();
+        // A corrupt snapshot must surface as a storage error, not silently reset
+        // the cluster state (config + drain map) to default.
+        let data: ClusterState = serde_json::from_slice(snapshot.get_ref()).map_err(|e| {
+            openraft::StorageIOError::read_snapshot(Some(meta.signature()), openraft::AnyError::new(&e))
+        })?;
         let mut d = self.0.write().unwrap();
         d.state = data;
         d.last_applied = meta.last_log_id;

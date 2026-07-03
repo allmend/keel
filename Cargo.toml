@@ -58,3 +58,5 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# AEAD + digest for encrypting the cluster join exchange (already in tree via rustls)
+ring = "0.17"
