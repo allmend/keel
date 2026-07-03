@@ -33,10 +33,12 @@ First tagged alpha. Everything in 0.1.0 plus the changes below.
   to voters by the leader once their log catches up, making the documented quorum
   model (3 nodes = 2 of 3, etc.) actually hold. `keel cluster status` now shows
   each member's Raft role (`voter` / `learner`).
-- **Release pipeline.** Version tags build static binaries (Linux x86_64/arm64
-  MUSL, FreeBSD x86_64), publish a multi-arch `FROM scratch` container to
+- **Release pipeline.** Version tags build fully static binaries (Linux
+  x86_64/arm64 MUSL), publish a multi-arch `FROM scratch` container to
   `ghcr.io/allmend/keel`, and create a GitHub Release with checksums. New
-  `vendored-openssl` cargo feature for static builds.
+  `vendored-openssl` cargo feature for static builds. FreeBSD binaries are
+  deferred: pingora-core pins nix 0.24, which no longer compiles for FreeBSD
+  against current libc — revisit when upstream updates.
 - **LICENSE file** (Apache-2.0, matching the Cargo.toml declaration).
 
 ### Fixed

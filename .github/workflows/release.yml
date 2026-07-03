@@ -25,9 +25,9 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # FreeBSD is best-effort: its leg must never block the Linux binaries,
-    # the container, or the GitHub Release.
-    continue-on-error: ${{ matrix.experimental || false }}
+    # FreeBSD (x86_64-unknown-freebsd) is currently not built: pingora-core 0.8
+    # pins nix 0.24, which no longer compiles against modern libc's FreeBSD
+    # kevent ABI. Revisit when pingora bumps its nix dependency.
     strategy:
       fail-fast: false
       matrix:
@@ -36,24 +36,15 @@ jobs:
             target: x86_64-unknown-linux-musl
           - name: linux_arm64
             target: aarch64-unknown-linux-musl
-          - name: freebsd_x86_64
-            target: x86_64-unknown-freebsd
-            experimental: true
-            cross-git: true # release images are dated; main has newer FreeBSD sysroots
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross (release)
-        if: ${{ !matrix.cross-git }}
+      - name: Install cross
         uses: taiki-e/install-action@v2
         with:
           tool: cross
-
-      - name: Install cross (git main)
-        if: ${{ matrix.cross-git }}
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Build
         run: cross build --release --locked --target ${{ matrix.target }} --features vendored-openssl
@@ -179,12 +170,9 @@ jobs:
             echo
             echo "Verify with \`sha256sum -c SHA256SUMS\`."
             echo
-            if ! ls pkgs/*freebsd* >/dev/null 2>&1; then
-              echo "The FreeBSD build did not succeed for this release and is not attached."
-              echo
-            fi
-            echo "FreeBSD arm64 is not provided: aarch64-unknown-freebsd is a Rust tier-3"
-            echo "target without prebuilt standard library support."
+            echo "FreeBSD binaries are not yet provided: pingora-core pins a nix version"
+            echo "that does not compile for FreeBSD against current libc. Planned once"
+            echo "upstream updates."
             echo
             echo "See CHANGELOG.md for what changed in this release."
           } > notes.md
