@@ -79,7 +79,7 @@ fn check_no_root_sections(path: &str, raw: &str) -> Result<()> {
     let value: serde_yml::Value = serde_yml::from_str(raw)
         .with_context(|| format!("cannot parse {path}"))?;
 
-    let forbidden = ["keel", "metrics", "access_log", "include", "cluster"];
+    let forbidden = ["keel", "metrics", "access_log", "include", "cluster", "acme"];
     if let Some(map) = value.as_mapping() {
         for key in &forbidden {
             if map.contains_key(*key) {
@@ -142,6 +142,9 @@ pub struct Config {
 
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
 }
 
 impl Config {
@@ -165,8 +168,67 @@ impl Config {
                     );
                 }
             }
+            if let Some(tls) = &vhost.tls {
+                if tls.acme {
+                    if tls.cert.is_some() || tls.key.is_some() {
+                        anyhow::bail!(
+                            "vhost '{}': tls.acme is true — remove cert/key (they are managed in the ACME storage dir)",
+                            vhost.host
+                        );
+                    }
+                    if vhost.host.contains('*') {
+                        anyhow::bail!(
+                            "vhost '{}': ACME HTTP-01 cannot issue wildcard certificates",
+                            vhost.host
+                        );
+                    }
+                } else if tls.cert.is_none() || tls.key.is_none() {
+                    anyhow::bail!(
+                        "vhost '{}': tls requires cert and key paths (or acme: true)",
+                        vhost.host
+                    );
+                }
+            }
+        }
+        if let Some(acme) = &self.acme {
+            for domain in &acme.domains {
+                if domain.contains('*') {
+                    anyhow::bail!("acme.domains '{domain}': HTTP-01 cannot issue wildcard certificates");
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The effective ACME config: the `acme:` block, or defaults when any vhost
+    /// enables `tls.acme` without one. `None` when ACME is unused entirely.
+    pub fn acme_effective(&self) -> Option<AcmeConfig> {
+        let vhost_acme = self.vhosts.iter().any(|v| v.tls.as_ref().map_or(false, |t| t.acme));
+        match (&self.acme, vhost_acme) {
+            (Some(a), _) => Some(a.clone()),
+            (None, true) => Some(AcmeConfig::default()),
+            (None, false) => None,
+        }
+    }
+
+    /// All hostnames Keel manages certificates for: ACME vhosts plus the
+    /// standalone `acme.domains` list. Deduplicated, order preserved.
+    pub fn acme_hosts(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut hosts = Vec::new();
+        for v in &self.vhosts {
+            if v.tls.as_ref().map_or(false, |t| t.acme) && seen.insert(v.host.clone()) {
+                hosts.push(v.host.clone());
+            }
+        }
+        if let Some(acme) = &self.acme {
+            for d in &acme.domains {
+                if seen.insert(d.clone()) {
+                    hosts.push(d.clone());
+                }
+            }
+        }
+        hosts
     }
 }
 
@@ -366,9 +428,19 @@ pub struct Vhost {
     pub cache: Option<VhostCacheConfig>,
 
     /// Redirect plain HTTP requests to HTTPS with a 301.
-    /// Defaults to true when `tls.acme: true`; must be set explicitly for BYO certs.
+    /// Defaults to true when `tls.acme: true` (override with an explicit false);
+    /// must be set explicitly for BYO certs.
     #[serde(default)]
-    pub redirect_http: bool,
+    pub redirect_http: Option<bool>,
+}
+
+impl Vhost {
+    /// Effective HTTP→HTTPS redirect: explicit value wins; ACME vhosts default
+    /// to true (the challenge path bypasses the redirect in the proxy).
+    pub fn redirect_http_effective(&self) -> bool {
+        self.redirect_http
+            .unwrap_or_else(|| self.tls.as_ref().map_or(false, |t| t.acme))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -381,9 +453,56 @@ pub struct Route {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
-    pub cert: String,
-    pub key: String,
+    /// Certificate path (BYO cert). Not set when `acme: true`.
+    pub cert: Option<String>,
+    /// Private key path (BYO cert). Not set when `acme: true`.
+    pub key: Option<String>,
+    /// Obtain and renew the certificate automatically via ACME (HTTP-01).
+    #[serde(default)]
+    pub acme: bool,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AcmeConfig {
+    /// Contact email for the ACME account (expiry warnings from the CA).
+    pub email: Option<String>,
+
+    /// ACME v2 directory URL. Defaults to Let's Encrypt production.
+    #[serde(default = "default_acme_directory")]
+    pub directory: String,
+
+    /// Directory for certificates, keys, the account, and challenge tokens.
+    #[serde(default = "default_acme_storage")]
+    pub storage: String,
+
+    /// Extra hostnames to obtain certificates for even though they have no TLS
+    /// vhost — e.g. domains Keel fronts as plain TCP / TLS passthrough. Keel
+    /// serves only the HTTP-01 challenge for these; the cert/key files land in
+    /// `storage` for the operator or backend to consume (Lego standalone-style).
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// PEM file with an additional trust root for the ACME directory itself.
+    /// Only needed when testing against Pebble or an internal CA.
+    pub root_ca: Option<String>,
+}
+
+impl Default for AcmeConfig {
+    fn default() -> Self {
+        Self {
+            email: None,
+            directory: default_acme_directory(),
+            storage: default_acme_storage(),
+            domains: Vec::new(),
+            root_ca: None,
+        }
+    }
+}
+
+fn default_acme_directory() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".into()
+}
+fn default_acme_storage() -> String { "/var/lib/keel/acme".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccessLogConfig {

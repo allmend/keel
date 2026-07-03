@@ -1,4 +1,5 @@
 mod access_log;
+mod acme;
 mod backend;
 mod cache;
 mod cluster;

@@ -30,7 +30,7 @@ arc-swap = "1"
 ipnet = "2"
 
 # Unix process management — fork, setuid, signals
-nix = { version = "0.31", features = ["process", "user", "signal"] }
+nix = { version = "0.31", features = ["process", "user", "signal", "fs"] }
 libc = "0.2"
 
 # Error handling
@@ -64,6 +64,7 @@ ring = "0.17"
 # Already in tree via pingora's openssl feature; declared here so release builds
 # can force the vendored (compiled-from-source, statically linked) OpenSSL.
 openssl = "0.10"
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 
 [features]
 default = []

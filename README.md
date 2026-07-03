@@ -141,6 +141,7 @@ All inter-node traffic is mTLS. The cluster CA is generated automatically from t
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
 - [Access logging](docs/access-logging.md)
+- [Automatic TLS / ACME](docs/acme.md)
 - [CLI reference](docs/cli.md)
 - [Security hardening](docs/security.md)
 

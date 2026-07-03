@@ -64,6 +64,8 @@ pub struct KProxy {
     pools: Arc<PoolRegistry>,
     access_logger: Arc<AccessLogger>,
     cache: Option<CacheHandle>,
+    /// HTTP-01 challenge token directory — Some when any host is ACME-managed.
+    acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -99,6 +101,29 @@ impl ProxyHttp for KProxy {
         let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
         if is_tls {
             return Ok(false);
+        }
+
+        // ACME HTTP-01 responder. Must come before the HTTPS redirect and works
+        // for any Host — including hosts with no vhost at all (TLS-passthrough /
+        // TCP domains from acme.domains). Serves ONLY tokens that exist in the
+        // challenge directory; unknown tokens fall through to normal routing so
+        // backends managing their own certificates keep working.
+        if let Some(dir) = &self.acme_challenge_dir {
+            let path = session.req_header().uri.path();
+            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                if crate::acme::valid_token(token) {
+                    if let Ok(body) = std::fs::read(dir.join(token)) {
+                        let mut resp = pingora::http::ResponseHeader::build(200, Some(2))?;
+                        resp.insert_header("content-type", "text/plain")?;
+                        resp.insert_header("content-length", body.len().to_string())?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(body)), true)
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
         }
 
         let host = session
@@ -764,7 +789,18 @@ pub fn run(cfg: &Config) -> ! {
         },
     ));
 
-    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger, cache };
+    // ACME: register the issuance/renewal service and enable the HTTP-01
+    // responder when any host is ACME-managed.
+    let acme_challenge_dir = cfg
+        .acme_effective()
+        .filter(|_| !cfg.acme_hosts().is_empty())
+        .map(|a| crate::acme::challenge_dir(&a.storage));
+    if let Some(acme_svc) = crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store)) {
+        server.add_service(background_service("acme", acme_svc));
+    }
+
+    let proxy =
+        KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
@@ -902,7 +938,16 @@ pub fn run_cluster(
         },
     ));
 
-    let proxy = KProxy { routing, pools: Arc::clone(&pools), access_logger, cache };
+    let acme_challenge_dir = cfg
+        .acme_effective()
+        .filter(|_| !cfg.acme_hosts().is_empty())
+        .map(|a| crate::acme::challenge_dir(&a.storage));
+    if let Some(acme_svc) = crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store)) {
+        server.add_service(background_service("acme", acme_svc));
+    }
+
+    let proxy =
+        KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();

@@ -191,14 +191,38 @@ vhosts:
 | `host` | string | required | Exact hostname or `*` wildcard |
 | `pool` | string | none | Default pool; required if no `routes` |
 | `routes` | list | none | Path-prefix routing; see [Virtual hosts](virtual-hosts.md) |
-| `tls.cert` | string | none | Path to PEM certificate |
-| `tls.key` | string | none | Path to PEM private key |
+| `tls.cert` | string | none | Path to PEM certificate (BYO cert) |
+| `tls.key` | string | none | Path to PEM private key (BYO cert) |
+| `tls.acme` | bool | `false` | Obtain/renew the certificate automatically via ACME — see [ACME](acme.md) |
+| `redirect_http` | bool | `false` (`true` when `tls.acme`) | 301 plain HTTP to HTTPS |
 | `forwarded_headers.mode` | string | `replace` | `replace`, `append`, or `off` |
 | `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode |
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
 | `cache.ttl` | integer | none | Seconds; fallback TTL when origin omits `Cache-Control` |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
+
+---
+
+## acme
+
+Automatic TLS via Let's Encrypt or any ACME v2 CA. See [ACME](acme.md).
+
+```yaml
+acme:
+  email: ops@example.com
+  directory: https://acme-v02.api.letsencrypt.org/directory
+  storage: /var/lib/keel/acme
+  domains: []               # standalone certs for TCP/passthrough backends
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `email` | string | none | ACME account contact |
+| `directory` | string | Let's Encrypt production | ACME v2 directory URL |
+| `storage` | string | `/var/lib/keel/acme` | Certs, keys, account, challenge tokens |
+| `domains` | list | `[]` | Hostnames without a TLS vhost to issue cert files for |
+| `root_ca` | string | none | Extra trust root for the ACME API (testing only) |
 
 ---
 

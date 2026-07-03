@@ -18,6 +18,13 @@ First tagged alpha. Everything in 0.1.0 plus the changes below.
 
 ### Added
 
+- **Automatic TLS via ACME (Let's Encrypt).** `tls: { acme: true }` on a vhost
+  obtains and renews certificates automatically (HTTP-01, renewal 30 days before
+  expiry, hot-swapped without restart). Global `acme:` block for account email,
+  directory URL (default Let's Encrypt), and storage. `acme.domains` issues
+  standalone cert files for hostnames Keel fronts as TCP/TLS-passthrough —
+  Keel answers the challenge, backends consume the files (Lego standalone
+  style). ACME vhosts redirect HTTP→HTTPS implicitly (challenge path exempt).
 - **`keel cluster stepdown [--force]`** — gracefully remove the local node from the
   cluster. Hands leadership over if the node is the leader, commits the removal to
   the Raft log so all remaining nodes accept it, and refuses (without `--force`)

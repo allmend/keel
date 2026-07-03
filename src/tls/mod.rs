@@ -49,23 +49,46 @@ impl CertStore {
     }
 }
 
+/// Cert/key file paths for an ACME-managed host inside the storage directory.
+pub fn acme_cert_paths(storage: &str, host: &str) -> (String, String) {
+    (format!("{storage}/{host}.crt"), format!("{storage}/{host}.key"))
+}
+
 fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
     let mut map = HashMap::new();
+    let acme = cfg.acme_effective();
 
     for vhost in &cfg.vhosts {
         let Some(tls_cfg) = &vhost.tls else { continue };
 
-        let cert_bytes = std::fs::read(&tls_cfg.cert)
-            .map_err(|e| anyhow::anyhow!("cannot read cert '{}': {e}", tls_cfg.cert))?;
-        let key_bytes = std::fs::read(&tls_cfg.key)
-            .map_err(|e| anyhow::anyhow!("cannot read key '{}': {e}", tls_cfg.key))?;
+        let (cert_path, key_path) = if tls_cfg.acme {
+            let storage = &acme.as_ref().expect("validated: acme vhost implies acme config").storage;
+            let (cert, key) = acme_cert_paths(storage, &vhost.host);
+            // Before first issuance the files don't exist — start without a cert
+            // for this host; AcmeService hot-swaps it in once issued.
+            if !std::path::Path::new(&cert).exists() {
+                info!(vhost = vhost.host, "TLS: ACME certificate not yet issued; serving without it until issuance");
+                continue;
+            }
+            (cert, key)
+        } else {
+            (
+                tls_cfg.cert.clone().expect("validated: cert required without acme"),
+                tls_cfg.key.clone().expect("validated: key required without acme"),
+            )
+        };
+
+        let cert_bytes = std::fs::read(&cert_path)
+            .map_err(|e| anyhow::anyhow!("cannot read cert '{cert_path}': {e}"))?;
+        let key_bytes = std::fs::read(&key_path)
+            .map_err(|e| anyhow::anyhow!("cannot read key '{key_path}': {e}"))?;
 
         let cert = X509::from_pem(&cert_bytes)
-            .map_err(|e| anyhow::anyhow!("invalid cert '{}': {e}", tls_cfg.cert))?;
+            .map_err(|e| anyhow::anyhow!("invalid cert '{cert_path}': {e}"))?;
         let key = PKey::private_key_from_pem(&key_bytes)
-            .map_err(|e| anyhow::anyhow!("invalid key '{}': {e}", tls_cfg.key))?;
+            .map_err(|e| anyhow::anyhow!("invalid key '{key_path}': {e}"))?;
 
-        info!(vhost = vhost.host, cert = tls_cfg.cert, "TLS: certificate loaded");
+        info!(vhost = vhost.host, cert = cert_path, "TLS: certificate loaded");
         map.insert(vhost.host.clone(), CertPair { cert, key });
     }
 

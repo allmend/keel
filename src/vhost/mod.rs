@@ -64,7 +64,7 @@ impl RoutingTable {
                 cache.insert(vhost.host.clone(), cc.clone());
             }
 
-            if vhost.redirect_http {
+            if vhost.redirect_http_effective() {
                 redirect_http.insert(vhost.host.clone());
             }
         }
@@ -164,6 +164,7 @@ mod tests {
             cache: crate::config::CacheConfig::default(),
             include: vec![],
             cluster: None,
+            acme: None,
         }
     }
 
@@ -183,7 +184,7 @@ mod tests {
             tls: None,
             forwarded_headers: None,
             cache: None,
-            redirect_http: false,
+            redirect_http: None,
         }
     }
 
@@ -208,7 +209,7 @@ mod tests {
                 tls: None,
                 forwarded_headers: None,
                 cache: None,
-                redirect_http: false,
+                redirect_http: None,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -258,7 +259,7 @@ mod tests {
                     statuses: vec![],
                     content_types: vec![],
                 }),
-                redirect_http: false,
+                redirect_http: None,
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -292,7 +293,7 @@ mod tests {
                 tls: None,
                 forwarded_headers: None,
                 cache: Some(VhostCacheConfig { enabled: true, ttl: Some(60), ..Default::default() }),
-                redirect_http: false,
+                redirect_http: None,
             }],
             [pool("api"), pool("web")].into(),
         );
