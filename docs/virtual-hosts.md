@@ -76,7 +76,7 @@ Keel sets forwarded headers on every upstream request so backends can see the re
 
 Headers set:
 - `X-Forwarded-For` — client IP address
-- `X-Real-IP` — client IP address (nginx-style single value)
+- `X-Real-IP` — client IP address (single value)
 - `X-Forwarded-Proto` — protocol of the client-to-Keel connection (`http` or `https`)
 - `X-Forwarded-Host` — original `Host` header value
 - `Forwarded` — RFC 7239 standard header
@@ -118,7 +118,7 @@ Forwarded header configuration defaults to `mode: replace` if the `forwarded_hea
 
 ## PROXY Protocol
 
-When Keel sits behind a cloud load balancer (AWS NLB, HAProxy, etc.) that uses PROXY Protocol to convey the real client IP at the TCP level, enable PROXY Protocol on the listener:
+When Keel sits behind a cloud load balancer or fronting proxy that uses PROXY Protocol to convey the real client IP at the TCP level, enable PROXY Protocol on the listener:
 
 ```yaml
 listeners:

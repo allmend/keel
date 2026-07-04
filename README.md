@@ -10,8 +10,8 @@ A fast, modern, self-hosted load balancer, reverse proxy, and API gateway built 
 
 - **Live backend drain** — gracefully remove a backend without dropping connections
 - **Runtime pool management** — no reload required to change backend state
-- **Automatic TLS** — ACME (Let's Encrypt or any ACME v2 CA), issuance to renewal, no restarts
-- **Balanced workers** — async multithreaded (Tokio), not per-process like Nginx
+- **Automatic TLS** — ACME v2 (any compatible CA), issuance to renewal, no restarts
+- **Balanced workers** — async multithreaded (Tokio), CPU balanced across cores
 - **True config hot-swap** — SIGHUP reloads config and TLS certs without restart
 - **Clustering built in** — Raft consensus, mTLS peer mesh, distributed drain, replicated certificates
 - **Written in Rust** — memory safe, single static binary, minimal attack surface
@@ -27,7 +27,7 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
 - TLS termination with per-vhost certificates
-- **ACME / automatic TLS** — named issuers (Let's Encrypt default, internal CAs supported), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
+- **ACME / automatic TLS** — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Health checks — TCP and HTTP
 - Backend drain with live connection tracking
@@ -50,16 +50,16 @@ In the roadmap: API gateway features (rate limiting, auth, transforms), TCP/UDP 
 
 ### Container / prebuilt binaries
 
-Releases ship a multi-arch container (`FROM scratch`, static binary) and
-static Linux binaries (x86_64 + arm64, MUSL):
+Run the container:
 
 ```bash
 docker pull ghcr.io/allmend/keel:0.2.0-alpha
 docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.2.0-alpha
 ```
 
-Or grab a tarball from the [releases page](https://github.com/allmend/keel/releases)
-— binary, example config, and `SHA256SUMS` included.
+Or download a Linux binary (x86_64 or arm64) from the
+[releases page](https://github.com/allmend/keel/releases) — each release
+includes the binary, an example config, and `SHA256SUMS`.
 
 ### Docker Compose (recommended for trying it out)
 
@@ -130,7 +130,7 @@ vhosts:
   - host: example.com
     pool: web
     tls:
-      acme: true      # HTTP-01 via Let's Encrypt; renews automatically
+      acme: true      # HTTP-01 challenge; renews automatically
 ```
 
 See [docs/acme.md](docs/acme.md) for named issuers (multiple CAs side by

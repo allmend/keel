@@ -206,7 +206,7 @@ See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and
 
 ## acme
 
-Automatic TLS via Let's Encrypt or any ACME v2 CA, organized as named
+Automatic TLS via any ACME v2 CA, organized as named
 issuers. Vhosts reference an issuer with `tls: { acme: true }` (the issuer
 named `default`) or `tls: { acme: <name> }`. See [ACME](acme.md).
 
@@ -227,8 +227,8 @@ acme:
 | `storage` | string | `/var/lib/keel/acme` | Certs, keys, accounts, challenge tokens |
 | `renew_before` | string | `30%` | Renew when less than this remains: `%` of lifetime or absolute `Nd` |
 | `issuers.<name>.email` | string | none | ACME account contact for this issuer |
-| `issuers.<name>.directory` | string | Let's Encrypt production | ACME v2 directory URL |
-| `issuers.<name>.root_ca` | string | none | Extra trust root for the ACME API (internal CAs / Pebble) |
+| `issuers.<name>.directory` | string | `https://acme-v02.api.letsencrypt.org/directory` | ACME v2 directory URL |
+| `issuers.<name>.root_ca` | string | none | Extra trust root for the ACME API (internal or self-signed CAs) |
 | `issuers.<name>.renew_before` | string | global value | Per-issuer renewal override |
 
 ---

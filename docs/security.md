@@ -1,30 +1,16 @@
 # Security Hardening
 
-This page documents the security hardening applied to Keel's alpha codebase: what
-was exposed, what changed, and what operators need to do about it. Two of the
-changes are breaking — see [Operator impact](#operator-impact) at the end.
+This page describes the security measures applied to Keel's cluster and proxy code: what each one protects against and what it means for operators. Two of them are breaking changes — see [Operator impact](#operator-impact) at the end.
 
 ---
 
-## Cluster join exchange is encrypted
+## Encrypted cluster join
 
-**Risk:** the join handshake between a new node and the bootstrap node runs over
-plain TCP, *before* any mTLS identity exists. The response carries the cluster CA
-certificate and the new node's freshly issued **private key**. Previously this
-exchange was cleartext JSON, and the shared secret itself was transmitted inside
-the request — anyone sniffing the network segment could capture a node private key,
-the CA, and the cluster secret.
+The join handshake between a new node and the bootstrap node runs over plain TCP, before any mTLS identity exists. Its response carries the cluster CA certificate and the new node's freshly issued private key. If that exchange were cleartext, anyone able to sniff the network segment could capture a node private key, the CA, and the shared secret.
 
-**Now:** both directions of the join exchange are AEAD-encrypted with
-ChaCha20-Poly1305. The key is derived from the shared secret
-(`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh
-random nonce. The secret is never sent on the wire — not even encrypted.
-Successful decryption on the receiving side is itself proof that the peer holds
-the secret, so a peer without it can neither read a captured exchange nor forge a
-join request or response.
+Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. The key is derived from the shared secret (`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh random nonce. The secret is never sent on the wire, not even encrypted — successful decryption on the receiving side is itself proof that the peer holds it. A peer without the secret can neither read a captured exchange nor forge a join request or response.
 
-**Residual risk:** a captured exchange can be brute-forced offline against a
-low-entropy secret. Use a high-entropy token:
+A captured exchange can still be brute-forced offline against a low-entropy secret, so use a high-entropy token:
 
 ```bash
 keel --config keel.yaml --cluster --bootstrap --secret "$(openssl rand -hex 32)"
@@ -36,136 +22,89 @@ See [Cluster](cluster.md) for the full join flow.
 
 ## Cluster mode requires a shared secret
 
-**Risk:** cluster mode would previously start with no secret at all. The join
-listener then handed a CA-signed mTLS identity to any peer that could reach the
-cluster port — a full cluster takeover with one TCP connection.
+Cluster mode used to start with no secret at all. The join listener would then hand a CA-signed mTLS identity to any peer that could reach the cluster port — a full takeover from a single TCP connection.
 
-**Now:** Keel refuses to start `--cluster` mode (bootstrap or join) without a
-non-empty secret from `--secret` or `cluster.secret` in `keel.yaml`.
+Keel now refuses to start `--cluster` mode, bootstrap or join, without a non-empty secret from `--secret` or `cluster.secret` in `keel.yaml`.
 
 ---
 
-## Cluster RPC reads are bounded
+## Bounded cluster RPC reads
 
-**Risk:** the length-prefixed wire protocol on the cluster port allocated a buffer
-of whatever size the peer's 4-byte length header claimed — a remote peer could
-drive multi-gigabyte allocations and take the node down (memory-exhaustion DoS).
+The length-prefixed wire protocol on the cluster port allocated a buffer of whatever size the peer's 4-byte length header claimed, so a remote peer could drive multi-gigabyte allocations and take the node down.
 
-**Now:** every length-prefixed read is capped before allocation:
+Every length-prefixed read is now capped before allocation. Frames above the limit are rejected and the connection is dropped.
 
 | Channel | Limit |
 |---|---|
 | Join exchange (plain TCP, AEAD-encrypted) | 64 KiB |
 | Raft RPC (mTLS: AppendEntries, Vote, InstallSnapshot) | 64 MiB |
 
-Frames above the limit are rejected and the connection is dropped.
-
 ---
 
-## Host header is no longer a filesystem or metrics key
+## Host header is not a filesystem or metrics key
 
-**Risk:** the raw client-supplied `Host` header was used directly as the access
-log filename (`access_<host>.log`) and as a Prometheus label. A crafted header
-could:
+The raw client-supplied `Host` header was used directly as the access log filename (`access_<host>.log`) and as a Prometheus label. A crafted header could traverse outside the log directory (`Host: ../../etc/cron.d/x`), create unbounded log files until file descriptors or inodes ran out, or explode metric cardinality until Prometheus scrapes failed.
 
-- traverse outside the log directory (`Host: ../../etc/cron.d/x`),
-- create unbounded log files, exhausting file descriptors and inodes,
-- explode metric cardinality until Prometheus scrapes fall over.
+Requests are now mapped to a bounded, operator-configured vhost label before anything is logged or recorded: the exact configured host, `"*"` if only a wildcard vhost matches, or `"unmatched"`. The raw header never reaches the filesystem or the metrics registry, and the access logger sanitizes the label to filesystem-safe characters as a second line of defense.
 
-**Now:** requests are mapped to a *bounded, operator-configured* vhost label
-before logging or metric recording: the exact configured host, `"*"` if only a
-wildcard vhost matches, or `"unmatched"`. The raw header never reaches the
-filesystem or the metrics registry. As defense in depth, the access logger also
-sanitizes the label to filesystem-safe characters before building a filename.
-
-The original `Host` value is still forwarded upstream in `X-Forwarded-Host` —
-backends see what the client sent; only Keel's internal keys are bounded.
+The original `Host` value is still forwarded upstream in `X-Forwarded-Host`, so backends see what the client sent. Only Keel's internal keys are bounded.
 
 ---
 
 ## Metrics endpoint locked down
 
-**Risk:** metrics expose backend addresses, pool and vhost names, and traffic
-volumes — a network map of your infrastructure. The endpoint bound to
-`0.0.0.0:9090` by default and answered every path and method.
+Metrics reveal backend addresses, pool and vhost names, and traffic volumes — effectively a network map of the infrastructure. The endpoint used to bind to `0.0.0.0:9090` and answer every path and method.
 
-**Now:**
-
-- Default bind is `127.0.0.1:9090`. Remote scraping requires explicitly setting
-  `metrics.address: 0.0.0.0:9090` (and firewalling the port), or running a local
-  scrape agent against loopback.
-- Only `GET /metrics` is served; any other method or path returns `404`.
+- The default bind is now `127.0.0.1:9090`. Remote scraping requires setting `metrics.address: 0.0.0.0:9090` explicitly and firewalling the port, or running a local scrape agent against loopback.
+- Only `GET /metrics` is served. Any other method or path returns `404`.
 
 ---
 
-## Control socket permissions restricted
+## Control socket permissions
 
-**Risk:** anyone who can open the control socket owns the proxy — it can drain
-backends, reload config, and push config to the entire cluster. The socket was
-created with default (world-writable, umask-dependent) permissions.
+Anyone who can open the control socket controls the proxy — draining backends, reloading config, pushing config to the whole cluster. The socket was created with default, umask-dependent permissions.
 
-**Now:** the socket directory is created `0750` *before* the socket is bound, and
-the socket itself is set to `0660` (owner + group only). If the permissions cannot
-be applied, Keel refuses to serve the control socket rather than run it open.
+The socket directory is now created `0750` before the socket is bound, and the socket itself is set to `0660` (owner and group only). If those permissions cannot be applied, Keel refuses to serve the control socket rather than run it open.
 
 ---
 
-## Worker privilege drop is fail-closed
+## Fail-closed privilege drop
 
-**Risk:** the privilege drop from root to `keel.user` / `keel.group` logged a
-warning and *continued as root* if `setuid`/`setgid` failed or the configured
-user didn't exist. Supplementary groups were never dropped, so workers kept
-root's group memberships even after a successful `setuid`.
+The drop from root to `keel.user` / `keel.group` used to log a warning and continue as root if `setuid` or `setgid` failed, or if the configured user did not exist. Supplementary groups were never dropped, so a worker kept root's group memberships even after a successful `setuid`.
 
-**Now:**
-
-- The master resolves `keel.user` and `keel.group` *before forking any worker*,
-  so a misconfigured name fails startup fast instead of fork/exit looping.
-- Workers drop supplementary groups (`setgroups([])`), then gid, then uid — in
-  that order — and **exit** if any step fails while running as root.
-- After the drop, the worker verifies it is actually no longer root and exits if
-  it somehow still is.
-- Running unprivileged (typical in dev) skips the drop as before.
+- The master resolves `keel.user` and `keel.group` before forking any worker, so a misconfigured name fails startup immediately instead of fork/exit looping.
+- Each worker drops supplementary groups (`setgroups([])`), then gid, then uid, in that order, and exits if any step fails while running as root.
+- After the drop, the worker confirms it is no longer root and exits if it somehow still is.
+- A process already running unprivileged (typical in dev) skips the drop, as before.
 
 ---
 
 ## Minimum TLS 1.2 on proxy listeners
 
-**Risk:** TLS listeners negotiated whatever the OpenSSL default allowed,
-including the obsolete TLS 1.0 and 1.1.
+TLS listeners used to negotiate whatever the OpenSSL default allowed, including the obsolete TLS 1.0 and 1.1.
 
-**Now:** every TLS listener sets a TLS 1.2 floor. TLS 1.0/1.1 handshakes are
-rejected. This applies to all proxy listeners in both standalone and cluster
-mode; cluster-internal mTLS already used rustls with modern defaults.
+Every TLS listener now sets a TLS 1.2 floor and rejects 1.0/1.1 handshakes. This applies to all proxy listeners in standalone and cluster mode; cluster-internal mTLS already used rustls with modern defaults.
 
 ---
 
 ## Corrupt Raft snapshots surface as errors
 
-**Risk:** a Raft snapshot that failed to deserialize was silently replaced with
-`ClusterState::default()` — wiping the replicated config and drain map without
-any signal to the operator, and letting a corrupted (or tampered) snapshot pass
-as valid.
+A Raft snapshot that failed to deserialize was silently replaced with `ClusterState::default()`, wiping the replicated config and drain map with no signal to the operator and letting a corrupt or tampered snapshot pass as valid.
 
-**Now:** snapshot deserialization failure is returned as a storage error, which
-surfaces through openraft instead of silently resetting cluster state.
+Snapshot deserialization failure is now returned as a storage error, which surfaces through openraft instead of resetting cluster state.
 
 ---
 
 ## Operator impact
 
-Two changes are **breaking**:
+Two changes are breaking:
 
 | Change | Action required |
 |---|---|
 | Cluster mode refuses to start without a secret | Set `cluster.secret` in `keel.yaml` or pass `--secret`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
 | Metrics default moved from `0.0.0.0:9090` to `127.0.0.1:9090` | To scrape from another host, set `metrics.address: 0.0.0.0:9090` explicitly and firewall the port. |
 
-Also note:
+Two more things to be aware of:
 
-- All nodes of a cluster must run the same build across a join: the join
-  exchange is now encrypted, so a new node cannot join an old (cleartext)
-  bootstrap node or vice versa.
-- If workers previously "worked" as root because the `keel` user was missing,
-  startup now fails with a clear error — create the user/group or set
-  `keel.user` / `keel.group`.
+- Every node in a cluster must run the same build across a join. The join exchange is encrypted now, so a new node cannot join an old cleartext bootstrap node, or the reverse.
+- If workers previously ran as root because the `keel` user was missing, startup now fails with a clear error. Create the user and group, or set `keel.user` / `keel.group`.

@@ -72,7 +72,7 @@ The joining node contacts the address given to `--join`, authenticates with the 
 
 A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
 
-If the join target is not reachable yet — the normal case when all nodes are started simultaneously by systemd, Docker Compose, or Kubernetes — the joiner retries with exponential backoff (1s doubling up to 30s) indefinitely, logging each attempt. Errors that retrying cannot fix are fatal and **terminate the process** so your supervisor notices: a wrong shared secret, a protocol mismatch, or an explicit rejection from the cluster.
+If the join target is not reachable yet — the normal case when all nodes are started together by a service manager or orchestrator — the joiner retries with exponential backoff (1s doubling up to 30s) indefinitely, logging each attempt. Errors that retrying cannot fix are fatal and **terminate the process** so your supervisor notices: a wrong shared secret, a protocol mismatch, or an explicit rejection from the cluster.
 
 The join exchange happens before mTLS is established, so it is encrypted with a key
 derived from the shared secret (ChaCha20-Poly1305). The secret itself is never sent
