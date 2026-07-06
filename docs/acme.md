@@ -161,6 +161,19 @@ In cluster mode certificates are replicated through the Raft log:
 - On startup, and continuously afterwards, disk and Raft state are reconciled per hostname: the valid certificate with the most remaining lifetime wins and overwrites the other side. A full-cluster restart recovers certificates from disk, and the leader pushes them back into Raft.
 - HTTP-01 challenge tokens are committed to the Raft log during issuance. The leader confirms every node holds the token before telling the CA to validate, so validation requests — which may come from multiple vantage points and land on any node — are answered wherever they arrive. Port 80 for the domain may reach any cluster node. Tokens are retracted from all nodes when the order completes.
 
+### Issuance flow
+
+The CA never pushes anything to Keel. Its only inbound request is the HTTP-01 validation `GET`; everything else happens over the leader's outbound connection to the CA's API.
+
+1. The leader starts the order and receives the challenge token from the CA.
+2. The token is committed to the Raft log; every node writes it to its challenge directory.
+3. The leader confirms every node holds the token, then tells the CA to validate. The validation requests may land on any node — each serves the same token.
+4. The leader polls the order until validation completes, submits the CSR, and downloads the certificate — all over its own connection to the CA. Which node answered the validation request plays no part here.
+5. The challenge tokens are retracted from all nodes; the certificate is committed to the Raft log.
+6. Every other node adopts the certificate and hot-swaps it into its TLS listeners on its next check cycle, within 60 seconds.
+
+During step 6 the leader serves the new certificate while the other nodes still serve the previous one. For a renewal both are valid, so this is invisible. For a first issuance, nodes other than the leader cannot terminate TLS for the hostname until they adopt the certificate — up to a minute after the leader obtains it.
+
 ---
 
 ## How it works
