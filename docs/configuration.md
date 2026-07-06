@@ -52,11 +52,13 @@ One entry per port. Keel binds all listeners before dropping privileges.
 
 ```yaml
 listeners:
-  - address: 0.0.0.0:80
-  - address: 0.0.0.0:443
+  - address: 0.0.0.0:80              # HTTP
+  - address: 0.0.0.0:443             # HTTPS — TLS terminated, certs per-vhost
     tls: true
   - address: 0.0.0.0:8080
     proxy_protocol: true
+  - address: 0.0.0.0:5432            # L4 — raw TCP spliced to a pool
+    tcp_pool: postgres
 ```
 
 | Field | Type | Default | Notes |
@@ -64,7 +66,9 @@ listeners:
 | `address` | string | required | `host:port` |
 | `tls` | bool | `false` | TLS termination; certs configured per-vhost |
 | `proxy_protocol` | bool | `false` | Accept PROXY Protocol v1/v2 from upstream LBs |
-| `tcp_pool` | string | none | L4 passthrough: splice raw TCP to this pool — see [TCP proxying](tcp-proxying.md). Excludes `tls` |
+| `tcp_pool` | string | none | Makes the listener L4: raw TCP is spliced to this pool (passthrough — the stream is never inspected). Vhosts and routes do not apply, and `tls` is rejected on the same listener. See [TCP proxying](tcp-proxying.md) |
+
+A `tcp_pool` listener references an ordinary entry in `pools` — health checks, weights, algorithms, and drain behave the same for TCP as for HTTP. Validation fails at startup for an unknown pool name or a `tcp_pool` + `tls` combination.
 
 Changing listener ports requires a process restart. Adding new listeners via hot reload is not supported.
 
@@ -83,7 +87,7 @@ metrics:
 |---|---|---|
 | `address` | string | `127.0.0.1:9090` |
 
-Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally.
+Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. Every exposed metric is listed in the [metrics reference](metrics.md).
 
 > **Security:** metrics reveal backend addresses, pool/vhost names, and traffic
 > volumes. The default binds to `127.0.0.1` so they are not world-readable. To

@@ -8,7 +8,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **TCP (L4) metrics**: `keel_tcp_connections_total`,
+  `keel_tcp_bytes_in_total` / `keel_tcp_bytes_out_total` (per pool and
+  backend), and `keel_tcp_errors_total` (per pool and reason).
+- **Metrics reference** — `docs/metrics.md` lists every exposed metric with
+  labels, types, and example queries.
+
+### Fixed
+
+- **`keel_backend_healthy` is now emitted.** Health-check state transitions
+  set the gauge (and log the transition per pool and backend); the metric
+  was registered but never updated.
 
 ---
 

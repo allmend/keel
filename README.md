@@ -202,6 +202,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
 - [Access logging](docs/access-logging.md)
+- [Metrics reference](docs/metrics.md)
 - [Automatic TLS / ACME](docs/acme.md)
 - [CLI reference](docs/cli.md)
 - [Remote control / keelctl](docs/keelctl.md)
