@@ -97,30 +97,29 @@ impl ProxyHttp for KProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
-        // Only redirect plain HTTP — TLS connections pass through.
         let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
-        if is_tls {
-            return Ok(false);
-        }
 
-        // ACME HTTP-01 responder. Must come before the HTTPS redirect and works
+        // ACME HTTP-01 responder (plain HTTP only — the challenge arrives on
+        // port 80). Must come before redirects and default actions, and works
         // for any Host — including hosts with no vhost at all (TLS-passthrough /
-        // TCP domains from acme.domains). Serves ONLY tokens that exist in the
-        // challenge directory; unknown tokens fall through to normal routing so
-        // backends managing their own certificates keep working.
-        if let Some(dir) = &self.acme_challenge_dir {
-            let path = session.req_header().uri.path();
-            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-                if crate::acme::valid_token(token) {
-                    if let Ok(body) = std::fs::read(dir.join(token)) {
-                        let mut resp = pingora::http::ResponseHeader::build(200, Some(2))?;
-                        resp.insert_header("content-type", "text/plain")?;
-                        resp.insert_header("content-length", body.len().to_string())?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session
-                            .write_response_body(Some(bytes::Bytes::from(body)), true)
-                            .await?;
-                        return Ok(true);
+        // TCP domains). Serves ONLY tokens that exist in the challenge
+        // directory; unknown tokens fall through to normal routing so backends
+        // managing their own certificates keep working.
+        if !is_tls {
+            if let Some(dir) = &self.acme_challenge_dir {
+                let path = session.req_header().uri.path();
+                if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                    if crate::acme::valid_token(token) {
+                        if let Ok(body) = std::fs::read(dir.join(token)) {
+                            let mut resp = pingora::http::ResponseHeader::build(200, Some(2))?;
+                            resp.insert_header("content-type", "text/plain")?;
+                            resp.insert_header("content-length", body.len().to_string())?;
+                            session.write_response_header(Box::new(resp), false).await?;
+                            session
+                                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                                .await?;
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -135,7 +134,44 @@ impl ProxyHttp for KProxy {
             .to_owned();
 
         let routing = self.routing.load();
-        if !routing.should_redirect_https(&host) {
+
+        // Default action: the matching vhost answers directly, no pool involved
+        // (IP-direct redirect, unknown-host 404, maintenance page). Applies on
+        // both plain HTTP and TLS.
+        if let Some(action) = routing.default_action(&host) {
+            if let Some(url) = &action.redirect {
+                let location = if action.preserve_path {
+                    let path = session
+                        .req_header()
+                        .uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or("/");
+                    format!("{}{path}", url.trim_end_matches('/'))
+                } else {
+                    url.clone()
+                };
+                let mut resp = pingora::http::ResponseHeader::build(301, Some(2))?;
+                resp.insert_header("location", location.as_str())?;
+                resp.insert_header("content-length", "0")?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
+            if let Some(status) = action.status {
+                let body = action.body.clone().unwrap_or_default();
+                let mut resp = pingora::http::ResponseHeader::build(status, Some(2))?;
+                resp.insert_header("content-type", "text/plain")?;
+                resp.insert_header("content-length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        // HTTP → HTTPS redirect — plain HTTP only, TLS passes through.
+        if is_tls || !routing.should_redirect_https(&host) {
             return Ok(false);
         }
 
@@ -740,14 +776,21 @@ fn log_cache_mode(cfg: &CacheConfig) {
     }
 }
 
+/// Build the Pingora server with Keel's shutdown timing. Pingora's default
+/// grace period is 300s — far beyond any supervisor's kill timeout, so a
+/// SIGTERM'd process would be SIGKILL'd long before exiting on its own.
+fn new_server(cfg: &Config) -> Server {
+    let mut conf = pingora::server::configuration::ServerConf::default();
+    conf.grace_period_seconds = Some(cfg.keel.grace_period_seconds);
+    conf.graceful_shutdown_timeout_seconds = Some(5);
+    Server::new_with_opt_and_conf(None::<pingora::server::configuration::Opt>, conf)
+}
+
 // Start the Pingora proxy server. Never returns.
 pub fn run(cfg: &Config) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
 
-    let mut server = Server::new(None).unwrap_or_else(|e| {
-        error!(error = %e, "failed to create Pingora server");
-        std::process::exit(1);
-    });
+    let mut server = new_server(cfg);
     server.bootstrap();
 
     let pools = match build_pools(cfg, &mut server) {
@@ -912,10 +955,7 @@ pub fn run_cluster(
 ) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
 
-    let mut server = Server::new(None).unwrap_or_else(|e| {
-        error!(error = %e, "failed to create Pingora server");
-        std::process::exit(1);
-    });
+    let mut server = new_server(cfg);
     server.bootstrap();
 
     let pools = match build_pools(cfg, &mut server) {

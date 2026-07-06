@@ -178,6 +178,46 @@ impl Config {
             }
         }
         for vhost in &self.vhosts {
+            if let Some(action) = &vhost.default_action {
+                if vhost.pool.is_some() || !vhost.routes.is_empty() {
+                    anyhow::bail!(
+                        "vhost '{}': default_action excludes pool and routes",
+                        vhost.host
+                    );
+                }
+                match (&action.redirect, action.status) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "vhost '{}': default_action takes redirect OR status, not both",
+                        vhost.host
+                    ),
+                    (None, None) => anyhow::bail!(
+                        "vhost '{}': default_action requires redirect or status",
+                        vhost.host
+                    ),
+                    (Some(url), None) => {
+                        if !url.starts_with("http://") && !url.starts_with("https://") {
+                            anyhow::bail!(
+                                "vhost '{}': default_action.redirect must be an absolute http(s) URL",
+                                vhost.host
+                            );
+                        }
+                        if action.body.is_some() {
+                            anyhow::bail!(
+                                "vhost '{}': default_action.body is only valid with status",
+                                vhost.host
+                            );
+                        }
+                    }
+                    (None, Some(s)) => {
+                        if !(100..=599).contains(&s) {
+                            anyhow::bail!(
+                                "vhost '{}': default_action.status {s} is not a valid HTTP status",
+                                vhost.host
+                            );
+                        }
+                    }
+                }
+            }
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("vhost '{}' references unknown pool '{pool}'", vhost.host);
@@ -339,6 +379,12 @@ pub struct KeelConfig {
 
     #[serde(default = "default_control_socket")]
     pub control_socket: String,
+
+    /// Seconds to let in-flight requests finish on graceful shutdown before
+    /// the process exits. Keep below the supervisor's kill timeout
+    /// (docker stop default 10s, K8s terminationGracePeriodSeconds 30s).
+    #[serde(default = "default_grace_period")]
+    pub grace_period_seconds: u64,
 }
 
 impl Default for KeelConfig {
@@ -348,9 +394,12 @@ impl Default for KeelConfig {
             user: default_user(),
             group: default_group(),
             control_socket: default_control_socket(),
+            grace_period_seconds: default_grace_period(),
         }
     }
 }
+
+fn default_grace_period() -> u64 { 10 }
 
 fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -532,7 +581,28 @@ pub struct Vhost {
     /// must be set explicitly for BYO certs.
     #[serde(default)]
     pub redirect_http: Option<bool>,
+
+    /// Answer requests directly without a backend pool: a 301 redirect to an
+    /// absolute URL, or a static status/body. Mutually exclusive with `pool`
+    /// and `routes`. Typical on the `"*"` wildcard vhost: IP-direct access
+    /// redirect, unknown-host 404, maintenance page.
+    pub default_action: Option<DefaultAction>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DefaultAction {
+    /// Absolute URL to 301 to. Path + query are appended unless
+    /// `preserve_path: false`.
+    pub redirect: Option<String>,
+    #[serde(default = "default_true")]
+    pub preserve_path: bool,
+    /// Static response status (e.g. 404, 503).
+    pub status: Option<u16>,
+    /// Static response body; only valid with `status`.
+    pub body: Option<String>,
+}
+
+fn default_true() -> bool { true }
 
 impl Vhost {
     /// Effective HTTP→HTTPS redirect: explicit value wins; ACME vhosts default

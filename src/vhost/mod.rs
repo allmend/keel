@@ -1,4 +1,4 @@
-use crate::config::{Config, ForwardedHeadersConfig, VhostCacheConfig};
+use crate::config::{Config, DefaultAction, ForwardedHeadersConfig, VhostCacheConfig};
 use std::collections::{HashMap, HashSet};
 
 /// Maps an incoming (host, path) pair to a pool name.
@@ -15,6 +15,8 @@ pub struct RoutingTable {
     cache: HashMap<String, VhostCacheConfig>,
     /// hosts that should redirect HTTP → HTTPS
     redirect_http: HashSet<String>,
+    /// host → direct response without a pool (redirect or static status)
+    default_actions: HashMap<String, DefaultAction>,
 }
 
 struct Route {
@@ -30,6 +32,7 @@ impl RoutingTable {
         let mut forwarded: HashMap<String, ForwardedHeadersConfig> = HashMap::new();
         let mut cache: HashMap<String, VhostCacheConfig> = HashMap::new();
         let mut redirect_http: HashSet<String> = HashSet::new();
+        let mut default_actions: HashMap<String, DefaultAction> = HashMap::new();
 
         for vhost in &cfg.vhosts {
             let routes = vhosts.entry(vhost.host.clone()).or_default();
@@ -67,9 +70,28 @@ impl RoutingTable {
             if vhost.redirect_http_effective() {
                 redirect_http.insert(vhost.host.clone());
             }
+
+            if let Some(action) = &vhost.default_action {
+                default_actions.insert(vhost.host.clone(), action.clone());
+            }
         }
 
-        RoutingTable { vhosts, forwarded, cache, redirect_http }
+        RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions }
+    }
+
+    /// Returns the default action for the given host: exact match first, then
+    /// the wildcard vhost. An exact vhost with a pool shadows the wildcard's
+    /// default action (the request routes normally).
+    pub fn default_action(&self, host: &str) -> Option<&DefaultAction> {
+        let host = host.split(':').next().unwrap_or(host);
+        if let Some(a) = self.default_actions.get(host) {
+            return Some(a);
+        }
+        // Wildcard default action applies only when no exact vhost matched.
+        if !self.vhosts.contains_key(host) || self.vhosts.get(host).is_some_and(|r| r.is_empty()) {
+            return self.default_actions.get("*");
+        }
+        None
     }
 
     /// Returns the pool name for the given host and path, or `None` if no match.
@@ -186,7 +208,31 @@ mod tests {
             forwarded_headers: None,
             cache: None,
             redirect_http: None,
+            default_action: None,
         }
+    }
+
+    #[test]
+    fn default_action_exact_pool_shadows_wildcard() {
+        let mut wildcard = vhost("*", "unused");
+        wildcard.pool = None;
+        wildcard.default_action = Some(crate::config::DefaultAction {
+            redirect: Some("https://example.com".into()),
+            preserve_path: true,
+            status: None,
+            body: None,
+        });
+        let cfg = make_config(
+            vec![vhost("api.example.com", "api"), wildcard],
+            [pool("api")].into(),
+        );
+        let t = RoutingTable::build(&cfg);
+        // Unknown host → wildcard default action fires.
+        assert!(t.default_action("unknown.example.com").is_some());
+        assert!(t.default_action("1.2.3.4:443").is_some());
+        // Exact vhost with a pool routes normally — wildcard must not apply.
+        assert!(t.default_action("api.example.com").is_none());
+        assert_eq!(t.resolve("api.example.com", "/"), Some("api"));
     }
 
     #[test]
@@ -211,6 +257,7 @@ mod tests {
                 forwarded_headers: None,
                 cache: None,
                 redirect_http: None,
+                default_action: None,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -261,6 +308,7 @@ mod tests {
                     content_types: vec![],
                 }),
                 redirect_http: None,
+                default_action: None,
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -295,6 +343,7 @@ mod tests {
                 forwarded_headers: None,
                 cache: Some(VhostCacheConfig { enabled: true, ttl: Some(60), ..Default::default() }),
                 redirect_http: None,
+                default_action: None,
             }],
             [pool("api"), pool("web")].into(),
         );
