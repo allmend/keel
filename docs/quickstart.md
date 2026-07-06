@@ -49,6 +49,7 @@ Check that the request reaches your backend and returns a response.
 - [Configuration reference](configuration.md) — full schema for all sections
 - [Virtual hosts](virtual-hosts.md) — host-based routing, TLS, path routing
 - [Load balancing](load-balancing.md) — algorithms, health checks, backend drain
+- [TCP proxying](tcp-proxying.md) — L4 passthrough for databases and TLS-on-connect services
 - [Caching](caching.md) — memory and disk cache
 - [Cluster](cluster.md) — multi-node HA deployment
 - [CLI reference](cli.md) — `keel` subcommands

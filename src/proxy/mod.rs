@@ -800,14 +800,16 @@ pub fn run(cfg: &Config) -> ! {
         server.add_service(background_service("acme", acme_svc));
     }
 
+    add_l4_services(&mut server, cfg, &pools, &access_logger);
+
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
-    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
+    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls && l.tcp_pool.is_none()).collect();
     let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 
-    if plain.is_empty() && tls.is_empty() {
+    if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
         svc.add_tcp("0.0.0.0:8080");
     } else {
@@ -835,6 +837,31 @@ pub fn run(cfg: &Config) -> ! {
     ));
 
     server.run_forever()
+}
+
+/// Register one L4 passthrough service per `tcp_pool` listener.
+fn add_l4_services(
+    server: &mut Server,
+    cfg: &Config,
+    pools: &Arc<crate::backend::PoolRegistry>,
+    access_logger: &Arc<AccessLogger>,
+) {
+    for l in cfg.listeners.iter().filter(|l| l.tcp_pool.is_some()) {
+        let pool = l.tcp_pool.clone().unwrap();
+        info!(address = l.address, pool, "adding TCP passthrough listener");
+        let app = crate::l4::TcpProxyApp {
+            listener: l.address.clone(),
+            pool,
+            pools: Arc::clone(pools),
+            access_logger: Arc::clone(access_logger),
+        };
+        let mut svc = pingora::services::listening::Service::new(
+            format!("tcp-{}", l.address),
+            app,
+        );
+        svc.add_tcp(&l.address);
+        server.add_service(svc);
+    }
 }
 
 // Cluster reload watcher
@@ -950,14 +977,16 @@ pub fn run_cluster(
         server.add_service(background_service("acme", acme_svc));
     }
 
+    add_l4_services(&mut server, cfg, &pools, &access_logger);
+
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
-    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls).collect();
+    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls && l.tcp_pool.is_none()).collect();
     let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 
-    if plain.is_empty() && tls_listeners.is_empty() {
+    if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
         svc.add_tcp("0.0.0.0:8080");
     } else {

@@ -6,6 +6,7 @@ mod cluster;
 mod config;
 mod control;
 mod health;
+mod l4;
 mod metrics;
 mod process;
 mod proxy;

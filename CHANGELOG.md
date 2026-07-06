@@ -8,7 +8,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **TCP (L4) passthrough proxying.** A listener with `tcp_pool: <name>` splices
+  raw TCP to a backend pool without inspecting the stream — TLS, if used, is
+  end-to-end between client and backend. Pool algorithms, weights, health
+  checks, drain (with live connection tracking), and `keel status` all apply
+  to TCP connections. One NDJSON access log entry per connection in
+  `access_tcp_<pool>.log`. TLS termination and re-encryption at L4 are
+  planned.
 
 ---
 

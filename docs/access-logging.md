@@ -123,6 +123,37 @@ jq 'select(.uri | startswith("/api/v2/"))' /var/log/keel/access_api.example.com.
 
 ---
 
+## TCP log format
+
+TCP passthrough listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection** to `access_tcp_<pool>.log` — L4 has no vhost or request concept, so routing and file naming are pool-based:
+
+```json
+{
+  "timestamp":    "2026-07-06T12:52:00.812Z",
+  "type":         "tcp",
+  "client_addr":  "203.0.113.42:57811",
+  "listener":     "0.0.0.0:5432",
+  "pool":         "postgres",
+  "backend_addr": "10.0.0.11:5432",
+  "bytes_in":     6420,
+  "bytes_out":    182034,
+  "duration_ms":  84210.5,
+  "error":        null
+}
+```
+
+| Field | Notes |
+|---|---|
+| `type` | Always `"tcp"` |
+| `listener` | Local address that accepted the connection |
+| `bytes_in` / `bytes_out` | Bytes from/to the client over the connection lifetime |
+| `duration_ms` | Full connection lifetime, accept to close |
+| `error` | `null`, `no_backend`, `upstream_connect`, `io`, or `shutdown` |
+
+No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no meaning at L4. No TLS fields in passthrough mode: the stream is opaque to Keel.
+
+---
+
 ## App logs vs access logs
 
 Access logs (NDJSON files) cover per-request data. Application logs — startup, health check transitions, config reloads, errors — are written to stderr as structured text. These two streams are intentionally separate so they can be routed to different destinations, retention policies, and alerting pipelines.

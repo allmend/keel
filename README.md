@@ -26,6 +26,7 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Virtual host routing (SNI + Host header)
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
+- TCP (L4) passthrough proxying — `tcp_pool` listeners, end-to-end TLS between client and backend
 - TLS termination with per-vhost certificates
 - **ACME / automatic TLS** — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
@@ -42,7 +43,7 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 
-In the roadmap: API gateway features (rate limiting, auth, transforms), TCP/UDP (L4) load balancing, PROXY protocol parsing, DNS-01/wildcards.
+In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, UDP load balancing, remote cluster control (keelctl), PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
@@ -174,6 +175,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [Configuration reference](docs/configuration.md)
 - [Virtual hosts](docs/virtual-hosts.md)
 - [Load balancing](docs/load-balancing.md)
+- [TCP proxying (L4)](docs/tcp-proxying.md)
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
 - [Access logging](docs/access-logging.md)

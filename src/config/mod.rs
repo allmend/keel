@@ -163,6 +163,20 @@ impl Config {
                 anyhow::bail!("pool '{name}' has no backends");
             }
         }
+        for l in &self.listeners {
+            if let Some(pool) = &l.tcp_pool {
+                if !self.pools.contains_key(pool) {
+                    anyhow::bail!("listener '{}' references unknown tcp_pool '{pool}'", l.address);
+                }
+                if l.tls {
+                    anyhow::bail!(
+                        "listener '{}': tcp_pool is passthrough — remove 'tls' \
+                         (TLS termination for TCP pools is not implemented)",
+                        l.address
+                    );
+                }
+            }
+        }
         for vhost in &self.vhosts {
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
@@ -356,6 +370,12 @@ pub struct Listener {
 
     #[serde(default)]
     pub proxy_protocol: bool,
+
+    /// L4 mode: splice raw TCP to this pool (passthrough — the stream is
+    /// never inspected, TLS is end-to-end between client and backend).
+    /// Mutually exclusive with `tls` (termination) and HTTP routing.
+    #[serde(default)]
+    pub tcp_pool: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

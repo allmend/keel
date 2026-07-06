@@ -25,6 +25,24 @@ pub struct AccessLogEntry {
     pub error: Option<String>,
 }
 
+/// One entry per L4 TCP connection. No method/uri/status/vhost — those are
+/// HTTP concepts with no meaning at L4; routing is pool-based. No TLS fields
+/// in passthrough mode: the stream is opaque, so Keel cannot know whether the
+/// client and backend negotiated TLS inside it.
+#[derive(Serialize)]
+pub struct TcpLogEntry {
+    pub timestamp: String,
+    pub r#type: &'static str,
+    pub client_addr: Option<String>,
+    pub listener: String,
+    pub pool: String,
+    pub backend_addr: Option<String>,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub duration_ms: f64,
+    pub error: Option<String>,
+}
+
 pub struct AccessLogger {
     enabled: bool,
     dir: String,
@@ -68,6 +86,26 @@ impl AccessLogger {
         if entry.error.is_some() {
             self.write_to(&format!("error_{vhost}.log"), &line);
         }
+    }
+
+    /// One file per pool: `access_tcp_<pool>.log`. L4 has no vhost concept.
+    pub fn log_tcp(&self, entry: &TcpLogEntry) {
+        if !self.enabled {
+            return;
+        }
+        let line = match serde_json::to_string(entry) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "tcp access log serialization failed");
+                return;
+            }
+        };
+        if self.dir == "-" {
+            println!("{line}");
+            return;
+        }
+        // Pool names come from validated config, sanitized as a final guard.
+        self.write_to(&format!("access_tcp_{}.log", sanitize_vhost(&entry.pool)), &line);
     }
 
     fn write_to(&self, filename: &str, line: &str) {

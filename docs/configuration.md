@@ -59,6 +59,7 @@ listeners:
 | `address` | string | required | `host:port` |
 | `tls` | bool | `false` | TLS termination; certs configured per-vhost |
 | `proxy_protocol` | bool | `false` | Accept PROXY Protocol v1/v2 from upstream LBs |
+| `tcp_pool` | string | none | L4 passthrough: splice raw TCP to this pool — see [TCP proxying](tcp-proxying.md). Excludes `tls` |
 
 Changing listener ports requires a process restart. Adding new listeners via hot reload is not supported.
 
