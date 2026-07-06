@@ -17,7 +17,6 @@ These flags are used when starting Keel as a server (no subcommand).
 | `--secret <secret>` | none | Shared secret for cluster join/bootstrap |
 | `--ca-cert <path>` | none | BYO cluster CA certificate |
 | `--ca-key <path>` | none | BYO cluster CA key |
-| `--upgrade` | false | Trigger a zero-downtime binary upgrade |
 
 Examples:
 
