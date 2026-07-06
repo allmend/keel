@@ -27,10 +27,19 @@ pub enum ClientRequest {
     /// Replicate an ACME-issued certificate so every node (including late
     /// joiners, via snapshot) serves it without re-issuing.
     SetCert { host: String, cert_pem: String, key_pem: String },
+    /// Publish an HTTP-01 challenge token so every node can answer the CA's
+    /// validation request, which may arrive at any node.
+    SetChallenge { token: String, key_auth: String },
+    /// Retract a challenge token once its order has completed.
+    RemoveChallenge { token: String },
 }
 
 /// host → (cert PEM, key PEM). Replicated ACME certificates.
 pub type CertMap = BTreeMap<String, (String, String)>;
+
+/// token → key authorization. Live HTTP-01 challenges, replicated so any node
+/// can serve them.
+pub type ChallengeMap = BTreeMap<String, String>;
 
 /// Response from the state machine after applying a log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,4 +64,7 @@ pub struct ClusterState {
     /// ACME certificates replicated cluster-wide.
     #[serde(default)]
     pub certs: CertMap,
+    /// Live HTTP-01 challenge tokens replicated cluster-wide.
+    #[serde(default)]
+    pub challenges: ChallengeMap,
 }

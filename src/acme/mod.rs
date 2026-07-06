@@ -47,6 +47,15 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
 /// …up to this cap, so a broken domain cannot hammer the CA (rate limits).
 const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
+/// Cluster mode: how long the leader waits for a challenge token to reach
+/// every node's log before telling the CA to validate. On timeout it proceeds
+/// on the quorum guarantee alone — a node that is down is not serving port 80
+/// traffic anyway, and blocking issuance on it forever would be worse.
+const CHALLENGE_REPLICATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Replication confirms the entry is in each node's log; applying it (which
+/// writes the token file) follows within a heartbeat. This grace covers that
+/// gap before the CA is signalled.
+const CHALLENGE_APPLY_GRACE: Duration = Duration::from_secs(1);
 
 /// Only characters that appear in base64url ACME tokens — this is the guard
 /// that keeps the challenge responder from ever touching another path.
@@ -129,6 +138,30 @@ impl pingora::services::background::BackgroundService for AcmeService {
             info!(host = m.host, issuer = m.issuer, vhost = m.vhost_managed, "acme: managing certificate");
         }
 
+        // Cluster: mirror the replicated challenge map into the local
+        // challenge directory, so THIS node answers HTTP-01 requests for
+        // orders started by the leader. Every node runs this; the map is the
+        // single source of truth for the directory in cluster mode.
+        if let Some(cluster) = &self.cluster {
+            let mut rx = cluster.challenges_rx.clone();
+            let dir = challenge_dir(&self.acme.storage);
+            let mut shutdown_c = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    let map = rx.borrow_and_update().clone();
+                    sync_challenge_dir(&dir, &map);
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() { break; }
+                        }
+                        _ = shutdown_c.changed() => {
+                            if *shutdown_c.borrow() { break; }
+                        }
+                    }
+                }
+            });
+        }
+
         let mut issuers = IssuerPool::new(&self.acme);
         let mut cert_mtimes: HashMap<String, SystemTime> = HashMap::new();
 
@@ -147,7 +180,7 @@ impl pingora::services::background::BackgroundService for AcmeService {
                             if *shutdown.borrow() {
                                 break;
                             }
-                            issuers.maybe_issue(&m.host, &m.issuer).await;
+                            issuers.maybe_issue(&m.host, &m.issuer, self.cluster.as_ref()).await;
                         }
                         // _lock drops here, releasing the flock.
                     }
@@ -263,6 +296,36 @@ impl AcmeService {
     }
 }
 
+/// Make the on-disk challenge directory mirror the replicated challenge map
+/// exactly: write tokens that are missing or differ, delete token-shaped files
+/// that are no longer in the map. Cluster mode only — there the map is the
+/// single source of truth for the directory.
+///
+/// Token names arrive via the Raft log and are re-validated here; a node never
+/// trusts replicated data with a filesystem path.
+fn sync_challenge_dir(dir: &Path, map: &crate::cluster::types::ChallengeMap) {
+    for (token, key_auth) in map {
+        if !valid_token(token) {
+            warn!(token, "acme: replicated challenge token failed validation; skipped");
+            continue;
+        }
+        let path = dir.join(token);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(key_auth.as_str()) {
+            if let Err(e) = std::fs::write(&path, key_auth) {
+                warn!(token, error = %e, "acme: cannot write replicated challenge token");
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if valid_token(name) && !map.contains_key(name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn prepare_storage(storage: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(storage).with_context(|| format!("create {storage}"))?;
@@ -333,7 +396,12 @@ impl IssuerPool {
     }
 
     /// Issue or renew `host` via `issuer_name` if due, honoring the backoff.
-    async fn maybe_issue(&mut self, host: &str, issuer_name: &str) {
+    async fn maybe_issue(
+        &mut self,
+        host: &str,
+        issuer_name: &str,
+        cluster: Option<&crate::cluster::ClusterHandle>,
+    ) {
         let issuer = self.issuer(issuer_name);
         if !needs_issuance(&self.storage, host, self.renew_before(&issuer)) {
             return;
@@ -344,7 +412,7 @@ impl IssuerPool {
             }
         }
 
-        match self.issue(host, issuer_name, &issuer).await {
+        match self.issue(host, issuer_name, &issuer, cluster).await {
             Ok(()) => {
                 self.backoff.remove(host);
                 info!(host, issuer = issuer_name, "acme: certificate issued");
@@ -367,7 +435,13 @@ impl IssuerPool {
         }
     }
 
-    async fn issue(&mut self, host: &str, issuer_name: &str, issuer: &AcmeIssuer) -> Result<()> {
+    async fn issue(
+        &mut self,
+        host: &str,
+        issuer_name: &str,
+        issuer: &AcmeIssuer,
+        cluster: Option<&crate::cluster::ClusterHandle>,
+    ) -> Result<()> {
         let account = self.account(issuer_name, issuer).await?;
 
         let identifier = Identifier::Dns(host.to_owned());
@@ -378,7 +452,15 @@ impl IssuerPool {
 
         // Publish HTTP-01 responses for all pending authorizations, then tell
         // the CA to validate. Tokens are cleaned up when we're done, pass or fail.
+        //
+        // Standalone: the token is written straight to the challenge dir.
+        // Cluster: the token is committed to the Raft log and the challenge
+        // sync task writes the file on every node (including this one); the CA
+        // is signalled only after every node is confirmed to hold the token,
+        // because it may validate from multiple vantage points that can reach
+        // any node.
         let mut published: Vec<PathBuf> = Vec::new();
+        let mut cluster_tokens: Vec<String> = Vec::new();
         let result = async {
             let mut authorizations = order.authorizations();
             let mut ready = 0usize;
@@ -397,10 +479,15 @@ impl IssuerPool {
                     anyhow::bail!("CA sent a token with unexpected characters");
                 }
                 let key_auth = challenge.key_authorization();
-                let token_path = challenge_dir(&self.storage).join(&token);
-                std::fs::write(&token_path, key_auth.as_str())
-                    .with_context(|| format!("write {}", token_path.display()))?;
-                published.push(token_path);
+                if let Some(cluster) = cluster {
+                    self.replicate_challenge(cluster, &token, key_auth.as_str()).await?;
+                    cluster_tokens.push(token);
+                } else {
+                    let token_path = challenge_dir(&self.storage).join(&token);
+                    std::fs::write(&token_path, key_auth.as_str())
+                        .with_context(|| format!("write {}", token_path.display()))?;
+                    published.push(token_path);
+                }
                 ready += 1;
                 challenge.set_ready().await.context("set challenge ready")?;
             }
@@ -424,7 +511,65 @@ impl IssuerPool {
         for p in published {
             let _ = std::fs::remove_file(p);
         }
+        // Retract replicated tokens; the sync task removes the files on every
+        // node. Best effort — if leadership was lost mid-order this fails and
+        // the tokens linger in the map until a later issuance cycle; a stale
+        // token is served but validates nothing.
+        if !cluster_tokens.is_empty() {
+            if let Some(raft) = match cluster {
+                Some(c) => c.raft().await,
+                None => None,
+            } {
+                for token in cluster_tokens {
+                    if let Err(e) = crate::cluster::remove_challenge(&raft, token).await {
+                        warn!(host, error = %format!("{e:#}"), "acme: challenge retraction failed");
+                    }
+                }
+            }
+        }
         result
+    }
+
+    /// Commit a challenge token to the Raft log and confirm every node holds
+    /// it before returning, so the CA can validate against any node. Commit
+    /// alone only proves a quorum has the entry.
+    async fn replicate_challenge(
+        &self,
+        cluster: &crate::cluster::ClusterHandle,
+        token: &str,
+        key_auth: &str,
+    ) -> Result<()> {
+        let raft = cluster.raft().await.context("cluster raft not initialized")?;
+        let index =
+            crate::cluster::push_challenge(&raft, token.to_owned(), key_auth.to_owned()).await?;
+        match crate::cluster::wait_replicated_to_all(&raft, index, CHALLENGE_REPLICATION_TIMEOUT)
+            .await
+        {
+            Ok(()) => {
+                // Every node has the entry in its log; applying it (the file
+                // write) follows within a heartbeat.
+                tokio::time::sleep(CHALLENGE_APPLY_GRACE).await;
+                info!(token, "acme: challenge replicated to all cluster nodes");
+            }
+            Err(lagging) => warn!(
+                token,
+                lagging = ?lagging,
+                "acme: challenge not confirmed on all nodes within {}s; \
+                 proceeding — quorum has it",
+                CHALLENGE_REPLICATION_TIMEOUT.as_secs()
+            ),
+        }
+        // Belt and braces: the local file is written by the same sync task
+        // pipeline as on followers. Seeing it appear confirms that pipeline
+        // end-to-end before the CA is signalled.
+        let local = challenge_dir(&self.storage).join(token);
+        for _ in 0..20 {
+            if local.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!("challenge token committed but never appeared in {}", local.display())
     }
 
     /// Load the persisted ACME account for `issuer_name`, or register one.
@@ -570,6 +715,33 @@ mod tests {
         assert!(!valid_token("a/b"));
         assert!(!valid_token("a.b"));
         assert!(!valid_token(&"x".repeat(300)));
+    }
+
+    #[test]
+    fn challenge_dir_mirrors_replicated_map() {
+        let dir = std::env::temp_dir().join(format!("keel-chal-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stale token from a completed order + a file that must survive.
+        std::fs::write(dir.join("staletoken"), "old").unwrap();
+        std::fs::write(dir.join("not-a-token!"), "keep").unwrap();
+
+        let mut map = crate::cluster::types::ChallengeMap::new();
+        map.insert("newtoken-123_abc".into(), "newtoken-123_abc.keyauth".into());
+        map.insert("../../etc/passwd".into(), "attack".into());
+        super::sync_challenge_dir(&dir, &map);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("newtoken-123_abc")).unwrap(),
+            "newtoken-123_abc.keyauth"
+        );
+        assert!(!dir.join("staletoken").exists(), "stale token must be removed");
+        assert!(dir.join("not-a-token!").exists(), "non-token files must be untouched");
+        // The traversal "token" must have been skipped, not written anywhere:
+        // the dir holds exactly the valid token and the non-token file.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

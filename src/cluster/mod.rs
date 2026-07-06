@@ -130,6 +130,8 @@ pub struct ClusterHandle {
     pub config_rx: watch::Receiver<Option<String>>,
     /// Current replicated ACME certificate map; updated on commit and snapshot.
     pub certs_rx: watch::Receiver<crate::cluster::types::CertMap>,
+    /// Current replicated HTTP-01 challenge map; updated on commit and snapshot.
+    pub challenges_rx: watch::Receiver<crate::cluster::types::ChallengeMap>,
     /// mTLS client config for peer RPCs (set together with `raft`). Used by the
     /// control plane to forward commands (e.g. stepdown) to the leader.
     pub client_tls: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
@@ -508,6 +510,7 @@ pub struct ClusterService {
     tls_slot: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
     config_tx: Arc<watch::Sender<Option<String>>>,
     certs_tx: Arc<watch::Sender<crate::cluster::types::CertMap>>,
+    challenges_tx: Arc<watch::Sender<crate::cluster::types::ChallengeMap>>,
 }
 
 #[async_trait]
@@ -562,6 +565,7 @@ impl ClusterService {
         let sm = StateMachine::default();
         sm.set_config_tx(Arc::clone(&self.config_tx));
         sm.set_certs_tx(Arc::clone(&self.certs_tx));
+        sm.set_challenges_tx(Arc::clone(&self.challenges_tx));
 
         let log_store = LogStore::default();
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
@@ -692,14 +696,19 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let config_tx = Arc::new(config_tx);
     let (certs_tx, certs_rx) = watch::channel(crate::cluster::types::CertMap::new());
     let certs_tx = Arc::new(certs_tx);
+    let (challenges_tx, challenges_rx) =
+        watch::channel(crate::cluster::types::ChallengeMap::new());
+    let challenges_tx = Arc::new(challenges_tx);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
         config_rx,
         certs_rx,
+        challenges_rx,
         client_tls: Arc::clone(&tls_slot),
     };
-    let service = ClusterService { opts, raft_slot, tls_slot, config_tx, certs_tx };
+    let service =
+        ClusterService { opts, raft_slot, tls_slot, config_tx, certs_tx, challenges_tx };
 
     (handle, service)
 }
@@ -726,6 +735,70 @@ pub async fn push_cert(
         .await
         .map_err(|e| anyhow::anyhow!("cert push failed: {e:?}"))?;
     Ok(())
+}
+
+/// Publish an HTTP-01 challenge token to the cluster via Raft. Returns the
+/// log index of the entry once committed; use [`wait_replicated_to_all`] to
+/// confirm every node holds it before telling the CA to validate.
+pub async fn push_challenge(
+    raft: &ClusterRaft,
+    token: String,
+    key_auth: String,
+) -> Result<u64> {
+    let resp = raft
+        .client_write(ClientRequest::SetChallenge { token, key_auth })
+        .await
+        .map_err(|e| anyhow::anyhow!("challenge push failed: {e:?}"))?;
+    Ok(resp.log_id.index)
+}
+
+/// Retract a challenge token after its order completes (pass or fail).
+pub async fn remove_challenge(raft: &ClusterRaft, token: String) -> Result<()> {
+    raft.client_write(ClientRequest::RemoveChallenge { token })
+        .await
+        .map_err(|e| anyhow::anyhow!("challenge removal failed: {e:?}"))?;
+    Ok(())
+}
+
+/// Wait until every cluster member's log has replicated up to `index`, or
+/// `timeout` elapses. Runs on the leader (followers have no replication view).
+///
+/// Commit only proves a quorum holds the entry; this confirms ALL members do —
+/// the CA may validate an HTTP-01 challenge from multiple vantage points that
+/// can land on any node. On timeout the lagging node IDs are returned so the
+/// caller can log them and decide to proceed on the quorum guarantee alone.
+pub async fn wait_replicated_to_all(
+    raft: &ClusterRaft,
+    index: u64,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), Vec<NodeId>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let m = raft.metrics().borrow().clone();
+        let members: Vec<NodeId> =
+            m.membership_config.membership().nodes().map(|(id, _)| *id).collect();
+        let lagging: Vec<NodeId> = members
+            .iter()
+            .filter(|id| {
+                if **id == m.id {
+                    return m.last_applied.is_none_or(|l| l.index < index);
+                }
+                let matched = m
+                    .replication
+                    .as_ref()
+                    .and_then(|r| r.get(*id).cloned().flatten());
+                matched.is_none_or(|l| l.index < index)
+            })
+            .copied()
+            .collect();
+        if lagging.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(lagging);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 // Stepdown

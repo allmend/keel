@@ -224,6 +224,10 @@ state reconcile per hostname: the valid certificate with the most remaining
 lifetime becomes the source of truth. Nothing is re-issued unless a
 certificate is missing, expired, or due for renewal everywhere.
 
+HTTP-01 challenge tokens flow through the Raft log the same way: the leader
+commits each token and confirms every node holds it before asking the CA to
+validate, so the CA's requests are answered by whichever node they reach.
+
 ---
 
 ## Split brain behavior

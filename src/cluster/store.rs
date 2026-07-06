@@ -10,7 +10,9 @@ use openraft::{
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 
-use crate::cluster::types::{CertMap, ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig};
+use crate::cluster::types::{
+    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig,
+};
 
 // Log store
 
@@ -134,6 +136,7 @@ struct StateMachineData {
     state: ClusterState,
     config_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<String>>>>,
     certs_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<CertMap>>>,
+    challenges_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -146,6 +149,10 @@ impl StateMachine {
 
     pub fn set_certs_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<CertMap>>) {
         self.0.write().unwrap().certs_tx = Some(tx);
+    }
+
+    pub fn set_challenges_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>) {
+        self.0.write().unwrap().challenges_tx = Some(tx);
     }
 }
 
@@ -225,6 +232,20 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             }
                             ClientResponse::ok()
                         }
+                        ClientRequest::SetChallenge { token, key_auth } => {
+                            d.state.challenges.insert(token, key_auth);
+                            if let Some(tx) = &d.challenges_tx {
+                                let _ = tx.send(d.state.challenges.clone());
+                            }
+                            ClientResponse::ok()
+                        }
+                        ClientRequest::RemoveChallenge { token } => {
+                            d.state.challenges.remove(&token);
+                            if let Some(tx) = &d.challenges_tx {
+                                let _ = tx.send(d.state.challenges.clone());
+                            }
+                            ClientResponse::ok()
+                        }
                     };
                     responses.push(resp);
                 }
@@ -266,6 +287,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         // compacted out of the log — notify watchers just like apply() does.
         if let Some(tx) = &d.certs_tx {
             let _ = tx.send(d.state.certs.clone());
+        }
+        if let Some(tx) = &d.challenges_tx {
+            let _ = tx.send(d.state.challenges.clone());
         }
         if let (Some(tx), Some(yaml)) = (&d.config_tx, &d.state.config_yaml) {
             let _ = tx.send(Some(yaml.clone()));

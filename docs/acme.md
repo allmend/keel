@@ -159,8 +159,7 @@ In cluster mode certificates are replicated through the Raft log:
 - Only the leader contacts the CAs. One account, one issuance, no duplicate certificates across nodes.
 - Issued and renewed certificates are committed as Raft entries. Every node — including any node that joins later, via snapshot — writes them to its own `storage` and hot-swaps them into its listeners.
 - On startup, and continuously afterwards, disk and Raft state are reconciled per hostname: the valid certificate with the most remaining lifetime wins and overwrites the other side. A full-cluster restart recovers certificates from disk, and the leader pushes them back into Raft.
-
-One limitation applies today: during issuance the HTTP-01 token is served only by the leader, so port-80 traffic for the domain must be able to reach the leader. Replicating challenge tokens to every node is a planned follow-up.
+- HTTP-01 challenge tokens are committed to the Raft log during issuance. The leader confirms every node holds the token before telling the CA to validate, so validation requests — which may come from multiple vantage points and land on any node — are answered wherever they arrive. Port 80 for the domain may reach any cluster node. Tokens are retracted from all nodes when the order completes.
 
 ---
 
@@ -174,7 +173,7 @@ A request for `/.well-known/acme-challenge/<token>` where the token is unknown i
 
 ## Testing against a local CA
 
-For local testing, point an issuer at a self-hosted ACME test server and supply its trust root:
+For local testing, point an issuer at a self-hosted ACME test server such as Pebble and supply its trust root:
 
 ```yaml
 acme:
