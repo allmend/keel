@@ -58,6 +58,16 @@ Metrics reveal backend addresses, pool and vhost names, and traffic volumes — 
 
 ---
 
+## Remote control requires mTLS
+
+The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the node's control CA — a connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
+
+The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but never replaces mTLS.
+
+Every remote command is audit-logged with the client certificate's CN and source address. To invalidate all issued credentials, delete `control.remote.ca_dir` and restart — a new CA is generated and every existing keelconfig stops working.
+
+---
+
 ## Control socket permissions
 
 Anyone who can open the control socket controls the proxy — draining backends, reloading config, pushing config to the whole cluster.

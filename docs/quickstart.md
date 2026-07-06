@@ -53,4 +53,5 @@ Check that the request reaches your backend and returns a response.
 - [Caching](caching.md) — memory and disk cache
 - [Cluster](cluster.md) — multi-node HA deployment
 - [CLI reference](cli.md) — `keel` subcommands
+- [Remote control](keelctl.md) — keelctl over mTLS from a workstation or CI
 - [Access logging](access-logging.md) — NDJSON request logs

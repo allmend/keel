@@ -230,6 +230,12 @@ validate, so the CA's requests are answered by whichever node they reach.
 
 ---
 
+## Remote control
+
+With `control.remote` configured, every node serves [keelctl](keelctl.md) connections over mTLS; commands that change cluster state (`config push`, `stepdown`) are forwarded to the leader internally, so any node works as the endpoint across failovers. Each node's control CA is independent — share the `ca_dir` contents across nodes to use one keelconfig for the whole cluster.
+
+---
+
 ## Split brain behavior
 
 During a network partition:

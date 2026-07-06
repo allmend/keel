@@ -2,6 +2,8 @@
 
 The `keel` binary serves two roles: running the proxy and acting as a CLI client to a running instance. Mode is determined by subcommand.
 
+Every client command on this page also works remotely via **keelctl** over mTLS, with identical output — see [Remote control](keelctl.md).
+
 ## Server flags
 
 These flags are used when starting Keel as a server (no subcommand).
@@ -230,6 +232,23 @@ node 3 removed from cluster membership (committed by quorum). It is safe to stop
 The node keeps serving traffic until you stop the process. See [Cluster — Stepping down](cluster.md#stepping-down-removing-a-node) for details and edge cases.
 
 Only available in cluster mode.
+
+---
+
+## keel credentials create
+
+Issue an operator client certificate from the control CA and print a keelconfig for [keelctl](keelctl.md) to stdout. Runs locally on the node (it reads the CA key from `control.remote.ca_dir`); it does not need a running keel.
+
+```bash
+keel credentials create <name> --endpoint <host:port> > keelconfig
+```
+
+| Argument | Notes |
+|---|---|
+| `name` | Operator name — becomes the certificate CN and the audit-log identity. `[A-Za-z0-9.-_@]` |
+| `--endpoint` | Address keelctl dials; written into the keelconfig verbatim (DNS name, VIP, or IP) |
+
+The control CA is generated on first use. The output contains a private key — store it like one.
 
 ---
 
