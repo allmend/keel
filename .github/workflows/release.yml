@@ -37,7 +37,7 @@ jobs:
           - name: linux_arm64
             target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -59,7 +59,7 @@ jobs:
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pkg-${{ matrix.name }}
           path: dist/*.tar.gz
@@ -68,10 +68,62 @@ jobs:
       # Raw binaries for the container job (linux targets only)
       - name: Upload binary
         if: startsWith(matrix.name, 'linux')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bin-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/keel
+          retention-days: 7
+
+  keelctl:
+    name: keelctl ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # keelctl has no pingora/OpenSSL dependency, so it builds for platforms
+    # where full keel cannot (FreeBSD) and as tiny static binaries.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux_x86_64,   os: ubuntu-latest, target: x86_64-unknown-linux-musl,  cross: true }
+          - { name: linux_arm64,    os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: true }
+          - { name: freebsd_x86_64, os: ubuntu-latest, target: x86_64-unknown-freebsd,     cross: true }
+          - { name: macos_arm64,    os: macos-14,      target: aarch64-apple-darwin,       cross: false }
+          - { name: macos_x86_64,   os: macos-14,      target: x86_64-apple-darwin,        cross: false }
+    continue-on-error: ${{ matrix.name == 'freebsd_x86_64' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked -p keelctl --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p keelctl --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="keelctl-${VERSION}-${{ matrix.name }}"
+          mkdir -p "dist/${PKG}"
+          cp "target/${{ matrix.target }}/release/keelctl" "dist/${PKG}/"
+          cp README.md LICENSE "dist/${PKG}/"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v6
+        with:
+          name: pkg-keelctl-${{ matrix.name }}
+          path: dist/*.tar.gz
           retention-days: 7
 
   container:
@@ -79,10 +131,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download linux binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: bin-linux_*
           path: bins
@@ -93,11 +145,11 @@ jobs:
           install -m 0755 bins/bin-linux_x86_64/keel dist/linux-amd64/keel
           install -m 0755 bins/bin-linux_arm64/keel  dist/linux-arm64/keel
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -107,7 +159,7 @@ jobs:
       # {major}.{minor} and latest (metadata-action skips those for prereleases).
       - name: Container metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -115,7 +167,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.release
@@ -126,11 +178,11 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [build, container]
+    needs: [build, keelctl, container]
     runs-on: ubuntu-latest
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: pkg-*
           path: pkgs
@@ -163,6 +215,8 @@ jobs:
                 *linux_x86_64*)   plat="Linux x86_64 (MUSL, fully static)" ;;
                 *linux_arm64*)    plat="Linux aarch64 (MUSL, fully static)" ;;
                 *freebsd_x86_64*) plat="FreeBSD x86_64" ;;
+                *macos_arm64*)    plat="macOS arm64" ;;
+                *macos_x86_64*)   plat="macOS x86_64" ;;
                 *)                plat="" ;;
               esac
               echo "| \`$base\` | $plat |"
@@ -170,15 +224,16 @@ jobs:
             echo
             echo "Verify with \`sha256sum -c SHA256SUMS\`."
             echo
-            echo "FreeBSD binaries are not yet provided: pingora-core pins a nix version"
-            echo "that does not compile for FreeBSD against current libc. Planned once"
-            echo "upstream updates."
+            echo "keel binaries for FreeBSD are not yet provided: pingora-core pins a nix"
+            echo "version that does not compile for FreeBSD against current libc. Planned"
+            echo "once upstream updates. keelctl (the remote control CLI) has no such"
+            echo "dependency and ships for FreeBSD, macOS, and Linux."
             echo
             echo "See CHANGELOG.md for what changed in this release."
           } > notes.md
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: notes.md
           files: |

@@ -1,49 +1,17 @@
+pub mod ca;
+pub mod remote;
+
 use crate::backend::{BackendStatus, PoolRegistry, DRAIN_ACTIVE, DRAIN_DRAINING, DRAIN_REMOVED};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
-// Protocol types
-
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum ControlRequest {
-    Status,
-    BackendList { pool: String },
-    BackendDrain { address: String, #[serde(default)] wait: bool },
-    ConfigReload,
-    ClusterStatus,
-    ClusterDemote,
-    ClusterStepdown { #[serde(default)] force: bool },
-    ConfigPush { yaml: String },
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ControlResponse {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl ControlResponse {
-    fn ok(data: impl Serialize) -> String {
-        let val = serde_json::to_value(data).unwrap_or_default();
-        let r = ControlResponse { ok: true, data: Some(val), error: None };
-        serde_json::to_string(&r).unwrap_or_default()
-    }
-
-    fn err(msg: impl Into<String>) -> String {
-        let r = ControlResponse { ok: false, data: None, error: Some(msg.into()) };
-        serde_json::to_string(&r).unwrap_or_default()
-    }
-}
+// Wire types live in the keel-control crate, shared with keelctl.
+pub use keel_control::{ControlRequest, ControlResponse};
 
 // Server
 
@@ -106,7 +74,9 @@ impl pingora::services::background::BackgroundService for ControlServer {
                             let started_at = self.started_at;
                             let cluster = self.cluster.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, pools, started_at, cluster).await {
+                                if let Err(e) =
+                                    handle_connection(stream, pools, started_at, cluster, None).await
+                                {
                                     error!(error = %e, "control: connection error");
                                 }
                             });
@@ -126,13 +96,17 @@ impl pingora::services::background::BackgroundService for ControlServer {
 
 // Connection handler
 
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
+/// Handle one control connection over any byte stream (Unix socket or mTLS
+/// TCP). `audit` carries the remote client identity (`cn@addr`) when the
+/// transport is remote; local socket connections pass `None`.
+pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
+    stream: S,
     pools: Arc<PoolRegistry>,
     started_at: Instant,
     cluster: Option<crate::cluster::ClusterHandle>,
+    audit: Option<String>,
 ) -> anyhow::Result<()> {
-    let (reader_half, mut writer) = stream.into_split();
+    let (reader_half, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
@@ -148,6 +122,10 @@ async fn handle_connection(
             return Ok(());
         }
     };
+
+    if let Some(who) = &audit {
+        info!(client = who, command = request.name(), "control: remote command");
+    }
 
     match request {
         ControlRequest::Status => {
@@ -231,12 +209,10 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn write_line(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    line: &str,
-) -> anyhow::Result<()> {
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> anyhow::Result<()> {
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 

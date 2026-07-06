@@ -1,0 +1,14 @@
+[package]
+name = "keelctl"
+version = "0.5.0"
+edition = "2021"
+authors = ["Allmend Contributors"]
+license = "Apache-2.0"
+description = "Remote control CLI for Keel clusters and standalone nodes (mTLS)"
+
+[dependencies]
+keel-control = { path = "../keel-control" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"

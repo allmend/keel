@@ -188,6 +188,7 @@ mod tests {
             cluster: None,
             acme: None,
             certificates: vec![],
+            control: None,
         }
     }
 

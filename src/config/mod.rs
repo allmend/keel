@@ -80,7 +80,7 @@ fn check_no_root_sections(path: &str, raw: &str) -> Result<()> {
     let value: serde_yml::Value = serde_yml::from_str(raw)
         .with_context(|| format!("cannot parse {path}"))?;
 
-    let forbidden = ["keel", "metrics", "access_log", "include", "cluster", "acme"];
+    let forbidden = ["keel", "metrics", "access_log", "include", "cluster", "acme", "control"];
     if let Some(map) = value.as_mapping() {
         for key in &forbidden {
             if map.contains_key(*key) {
@@ -154,13 +154,47 @@ pub struct Config {
     /// like vhosts are.
     #[serde(default)]
     pub certificates: Vec<CertificateRequest>,
+
+    /// Remote control plane (keelctl). Off unless `control.remote` is set.
+    #[serde(default)]
+    pub control: Option<ControlConfig>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControlConfig {
+    pub remote: Option<RemoteControlConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteControlConfig {
+    /// TCP listen address for keelctl connections (mTLS required).
+    pub address: String,
+
+    /// Optional source-CIDR restriction, checked before the TLS handshake.
+    /// Empty = allow any source. Narrows exposure; mTLS stays mandatory.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Directory holding the control CA (ca.crt / ca.key). Generated on
+    /// first use; `keel credentials create` signs client certs with it.
+    #[serde(default = "default_control_ca_dir")]
+    pub ca_dir: String,
+}
+
+pub fn default_control_ca_dir() -> String { "/var/lib/keel/control".into() }
 
 impl Config {
     fn validate(&self) -> Result<()> {
         for (name, pool) in &self.pools {
             if pool.backends.is_empty() {
                 anyhow::bail!("pool '{name}' has no backends");
+            }
+        }
+        if let Some(remote) = self.control.as_ref().and_then(|c| c.remote.as_ref()) {
+            for cidr in &remote.allow {
+                cidr.parse::<ipnet::IpNet>().map_err(|e| {
+                    anyhow::anyhow!("control.remote.allow: invalid CIDR '{cidr}': {e}")
+                })?;
             }
         }
         for l in &self.listeners {

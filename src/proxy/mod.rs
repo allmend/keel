@@ -878,8 +878,28 @@ pub fn run(cfg: &Config) -> ! {
             cluster: None,
         },
     ));
+    add_remote_control(&mut server, cfg, &pools, None);
 
     server.run_forever()
+}
+
+/// Register the mTLS remote control listener when `control.remote` is set.
+fn add_remote_control(
+    server: &mut Server,
+    cfg: &Config,
+    pools: &Arc<crate::backend::PoolRegistry>,
+    cluster: Option<crate::cluster::ClusterHandle>,
+) {
+    let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.clone()) else { return };
+    server.add_service(background_service(
+        "control-remote",
+        crate::control::remote::RemoteControlServer {
+            cfg: remote,
+            pools: Arc::clone(pools),
+            started_at: std::time::Instant::now(),
+            cluster,
+        },
+    ));
 }
 
 /// Register one L4 passthrough service per `tcp_pool` listener.
@@ -1043,6 +1063,7 @@ pub fn run_cluster(
 
     server.add_service(svc);
     server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
+    add_remote_control(&mut server, cfg, &pools, Some(cluster.clone()));
     server.add_service(background_service(
         "control",
         ControlServer {

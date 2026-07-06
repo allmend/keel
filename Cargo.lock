@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "keel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1415,6 +1415,7 @@ dependencies = [
  "hex",
  "instant-acme",
  "ipnet",
+ "keel-control",
  "libc",
  "nix 0.31.2",
  "once_cell",
@@ -1434,6 +1435,27 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "keel-control"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "serde_yml",
+]
+
+[[package]]
+name = "keelctl"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "keel-control",
+ "rustls",
+ "rustls-pemfile",
 ]
 
 [[package]]
