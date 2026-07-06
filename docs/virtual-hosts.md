@@ -163,3 +163,45 @@ listeners:
 `redirect_http` defaults to `false`. Setting it without a TLS vhost for the same host is valid — Keel will redirect regardless of whether it terminates TLS itself or another component does.
 
 The wildcard host (`host: "*"`) supports `redirect_http: true` to redirect all unmatched HTTP hosts.
+
+---
+
+## Default action
+
+A vhost with `default_action` answers requests directly — no backend pool involved. It takes a redirect **or** a static status, and excludes `pool` and `routes` on the same vhost:
+
+```yaml
+vhosts:
+  - host: example.com
+    pool: web
+
+  # Bare-IP access or unknown Host header → send to the real site
+  - host: "*"
+    default_action:
+      redirect: https://example.com    # 301; path + query appended
+```
+
+```yaml
+  # Or: refuse unknown hosts with a static response
+  - host: "*"
+    default_action:
+      status: 404
+      body: "Not found"
+```
+
+```yaml
+  # Maintenance page for one host, no pool needed
+  - host: app.example.com
+    default_action:
+      status: 503
+      body: "Down for maintenance — back shortly"
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `redirect` | string | — | Absolute `http(s)://` URL; responds `301` |
+| `preserve_path` | bool | `true` | Append the request path + query to `redirect` |
+| `status` | integer | — | Static response status (100–599) |
+| `body` | string | empty | Static response body; only valid with `status` |
+
+The action applies on both plain HTTP and TLS listeners, and the ACME challenge path is served before it. On a wildcard vhost, the action fires only for hosts no exact vhost matches — exact vhosts route to their pools as usual.

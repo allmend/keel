@@ -8,6 +8,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+---
+
+## [0.4.0] — 2026-07-06
+
 ### Added
 
 - **TCP (L4) passthrough proxying.** A listener with `tcp_pool: <name>` splices
@@ -17,6 +23,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
   to TCP connections. One NDJSON access log entry per connection in
   `access_tcp_<pool>.log`. TLS termination and re-encryption at L4 are
   planned.
+- **Default vhost action.** `default_action` on a vhost answers requests
+  without a backend pool: `redirect: <url>` (301, path + query appended
+  unless `preserve_path: false`) or `status:` + `body:` (static response).
+  Covers bare-IP redirect, unknown-host 404, and maintenance pages. On a
+  wildcard vhost the action fires only for hosts no exact vhost matches.
+- **`keel.grace_period_seconds`** (default `10`): how long in-flight requests
+  may finish on graceful shutdown before the process exits.
+
+### Fixed
+
+- **SIGTERM and SIGINT trigger graceful shutdown.** The master stops and
+  reaps its workers on `SIGTERM`/`SIGINT`/`SIGQUIT`, and the shutdown grace
+  period defaults to 10 seconds. `docker stop`, `systemd stop`, and
+  Kubernetes pod termination now stop Keel cleanly within their default
+  timeouts. (The master previously died on SIGTERM's default action, leaving
+  workers running; workers then slept 300 seconds before exiting.)
 
 ---
 
@@ -245,7 +267,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/allmend/keel/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/allmend/keel/compare/v0.2.0-alpha...v0.3.0
 [0.2.0-alpha]: https://github.com/allmend/keel/compare/v0.1.0-alpha...v0.2.0-alpha
 [0.1.0-alpha]: https://github.com/allmend/keel/releases/tag/v0.1.0-alpha

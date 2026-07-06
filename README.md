@@ -30,6 +30,8 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - TLS termination with per-vhost certificates
 - **ACME / automatic TLS** — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
+- Default vhost action — redirect or static response for unknown hosts, no pool needed
+- Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
 - Health checks — TCP and HTTP
 - Backend drain with live connection tracking
 - Config hot reload (SIGHUP or `keel config reload`)
@@ -54,8 +56,8 @@ In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS 
 Run the container:
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.3.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.3.0
+docker pull ghcr.io/allmend/keel:0.4.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.4.0
 ```
 
 Or download a Linux binary (x86_64 or arm64) from the
@@ -187,7 +189,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is at v0.3.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.4.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 

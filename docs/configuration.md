@@ -28,6 +28,7 @@ keel:
   user: keel              # drop to this user after binding privileged ports
   group: keel             # drop to this group
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
+  grace_period_seconds: 10   # graceful shutdown: time for in-flight requests
 ```
 
 | Field | Type | Default |
@@ -36,6 +37,9 @@ keel:
 | `user` | string | `keel` |
 | `group` | string | `keel` |
 | `control_socket` | string | `/var/run/keel/keel.sock` |
+| `grace_period_seconds` | integer | `10` |
+
+On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
 Changing `workers` requires a process restart. All other settings can be changed via hot reload.
 
@@ -200,6 +204,7 @@ vhosts:
 | `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode |
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
 | `cache.ttl` | integer | none | Seconds; fallback TTL when origin omits `Cache-Control` |
+| `default_action` | object | none | Answer directly without a pool: `redirect:` or `status:`/`body:` — see [Virtual hosts](virtual-hosts.md#default-action). Excludes `pool`/`routes` |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
 
