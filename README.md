@@ -1,4 +1,9 @@
-# Keel
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/keel-wordmark-dark.svg">
+    <img src="docs/assets/keel-wordmark-light.svg" alt="Keel" width="310">
+  </picture>
+</p>
 
 > **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not recommended for production yet. Feedback welcome.
 
