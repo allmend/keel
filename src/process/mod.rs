@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn handle_sigquit(_: libc::c_int) {
+extern "C" fn handle_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
@@ -44,7 +44,9 @@ pub fn run_master(cfg: Config) -> Result<()> {
         if SHUTDOWN.load(Ordering::SeqCst) {
             info!("master: shutdown signal received, stopping workers");
             for pid in &pids {
-                let _ = signal::kill(*pid, Signal::SIGQUIT);
+                // SIGTERM = Pingora's plain graceful exit (finish in-flight,
+                // no upgrade-socket handoff like SIGQUIT).
+                let _ = signal::kill(*pid, Signal::SIGTERM);
             }
             for pid in &pids {
                 let _ = waitpid(*pid, None);
@@ -192,10 +194,16 @@ fn clear_supplementary_groups() -> nix::Result<()> {
 }
 
 fn install_signal_handlers() -> Result<()> {
-    let sigquit = SigAction::new(SigHandler::Handler(handle_sigquit), SaFlags::SA_RESTART, SigSet::empty());
+    // SIGTERM (docker stop, systemd, K8s), SIGINT (foreground ^C), and SIGQUIT
+    // all trigger graceful shutdown: workers are stopped and reaped, then the
+    // master exits. Without a SIGTERM handler the master would die on the
+    // default action and orphan its workers, which keep serving.
+    let shutdown = SigAction::new(SigHandler::Handler(handle_shutdown), SaFlags::SA_RESTART, SigSet::empty());
     let sighup = SigAction::new(SigHandler::Handler(handle_sighup), SaFlags::SA_RESTART, SigSet::empty());
     unsafe {
-        signal::sigaction(Signal::SIGQUIT, &sigquit)?;
+        signal::sigaction(Signal::SIGTERM, &shutdown)?;
+        signal::sigaction(Signal::SIGINT, &shutdown)?;
+        signal::sigaction(Signal::SIGQUIT, &shutdown)?;
         signal::sigaction(Signal::SIGHUP, &sighup)?;
         // Ignore SIGPIPE — broken pipe on a client must not kill the master
         signal::sigaction(
