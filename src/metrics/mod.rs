@@ -120,6 +120,44 @@ pub static BACKEND_DRAIN_STATE: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("register keel_backend_drain_state")
 });
 
+// TCP (L4) metrics
+
+pub static TCP_CONNECTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_tcp_connections_total",
+        "Total TCP (L4) connections accepted per pool and backend",
+        &["pool", "backend"]
+    )
+    .expect("register keel_tcp_connections_total")
+});
+
+pub static TCP_BYTES_IN: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_tcp_bytes_in_total",
+        "Total bytes received from TCP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_tcp_bytes_in_total")
+});
+
+pub static TCP_BYTES_OUT: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_tcp_bytes_out_total",
+        "Total bytes sent to TCP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_tcp_bytes_out_total")
+});
+
+pub static TCP_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_tcp_errors_total",
+        "TCP (L4) connections that ended in an error",
+        &["pool", "reason"]
+    )
+    .expect("register keel_tcp_errors_total")
+});
+
 // Helper functions
 
 pub fn record_request(pool: &str, vhost: &str, status: u16, duration_secs: f64) {
@@ -150,7 +188,19 @@ pub fn record_backend_connection_error(pool: &str, backend: &str) {
     BACKEND_CONNECTION_ERRORS.with_label_values(&[pool, backend]).inc();
 }
 
-#[allow(dead_code)]
+pub fn record_tcp_connection(pool: &str, backend: &str) {
+    TCP_CONNECTIONS_TOTAL.with_label_values(&[pool, backend]).inc();
+}
+
+pub fn add_tcp_bytes(pool: &str, backend: &str, bytes_in: u64, bytes_out: u64) {
+    TCP_BYTES_IN.with_label_values(&[pool, backend]).inc_by(bytes_in as f64);
+    TCP_BYTES_OUT.with_label_values(&[pool, backend]).inc_by(bytes_out as f64);
+}
+
+pub fn record_tcp_error(pool: &str, reason: &str) {
+    TCP_ERRORS_TOTAL.with_label_values(&[pool, reason]).inc();
+}
+
 pub fn set_backend_healthy(pool: &str, backend: &str, healthy: bool) {
     BACKEND_HEALTHY
         .with_label_values(&[pool, backend])

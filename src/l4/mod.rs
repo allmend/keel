@@ -74,15 +74,18 @@ impl ServerApp for TcpProxyApp {
         let key = client_addr.clone().unwrap_or_default();
         let Some(backend) = self.pools.select(&self.pool, key.as_bytes()) else {
             warn!(pool = self.pool, listener = self.listener, "tcp: no healthy backend");
+            crate::metrics::record_tcp_error(&self.pool, "no_backend");
             self.log(client_addr, None, 0, 0, started, Some("no_backend"));
             return None;
         };
+        crate::metrics::record_tcp_connection(&self.pool, &backend.to_string());
 
         let mut upstream = match tokio::net::TcpStream::connect(backend).await {
             Ok(s) => s,
             Err(e) => {
                 warn!(pool = self.pool, backend = %backend, error = %e, "tcp: upstream connect failed");
                 self.pools.release(&self.pool, backend);
+                crate::metrics::record_tcp_error(&self.pool, "upstream_connect");
                 self.log(client_addr, Some(backend.to_string()), 0, 0, started, Some("upstream_connect"));
                 return None;
             }
@@ -104,6 +107,10 @@ impl ServerApp for TcpProxyApp {
         };
 
         self.pools.release(&self.pool, backend);
+        crate::metrics::add_tcp_bytes(&self.pool, &backend.to_string(), bytes_in, bytes_out);
+        if let Some(reason) = error {
+            crate::metrics::record_tcp_error(&self.pool, reason);
+        }
         self.log(client_addr, Some(backend.to_string()), bytes_in, bytes_out, started, error);
         None
     }

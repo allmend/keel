@@ -1,10 +1,33 @@
 use crate::config::{HealthCheck, HealthCheckKind};
-use pingora::lb::health_check::{HealthCheck as PingoraHealthCheck, HttpHealthCheck, TcpHealthCheck};
+use async_trait::async_trait;
+use pingora::lb::health_check::{
+    HealthCheck as PingoraHealthCheck, HealthObserve, HttpHealthCheck, TcpHealthCheck,
+};
+use pingora::lb::Backend;
 use std::time::Duration;
 
+/// Logs health transitions and keeps the `keel_backend_healthy` metric current.
+struct HealthObserver {
+    pool: String,
+}
+
+#[async_trait]
+impl HealthObserve for HealthObserver {
+    async fn observe(&self, target: &Backend, healthy: bool) {
+        let addr = target.addr.to_string();
+        crate::metrics::set_backend_healthy(&self.pool, &addr, healthy);
+        if healthy {
+            tracing::info!(pool = self.pool, backend = addr, "health: backend healthy");
+        } else {
+            tracing::warn!(pool = self.pool, backend = addr, "health: backend unhealthy");
+        }
+    }
+}
+
 /// Build a Pingora health check from the pool config.
-pub fn build(cfg: &HealthCheck, host: &str) -> Box<dyn PingoraHealthCheck + Send + Sync> {
+pub fn build(cfg: &HealthCheck, host: &str, pool: &str) -> Box<dyn PingoraHealthCheck + Send + Sync> {
     let timeout = parse_duration(&cfg.timeout);
+    let observer = Box::new(HealthObserver { pool: pool.to_owned() });
 
     match cfg.kind {
         HealthCheckKind::Tcp => {
@@ -12,6 +35,7 @@ pub fn build(cfg: &HealthCheck, host: &str) -> Box<dyn PingoraHealthCheck + Send
             hc.consecutive_success = cfg.healthy_threshold as usize;
             hc.consecutive_failure = cfg.unhealthy_threshold as usize;
             hc.peer_template.options.connection_timeout = Some(timeout);
+            hc.health_changed_callback = Some(observer);
             Box::new(hc)
         }
         HealthCheckKind::Http => {
@@ -21,6 +45,7 @@ pub fn build(cfg: &HealthCheck, host: &str) -> Box<dyn PingoraHealthCheck + Send
             hc.consecutive_failure = cfg.unhealthy_threshold as usize;
             hc.peer_template.options.connection_timeout = Some(timeout);
             hc.peer_template.options.read_timeout = Some(timeout);
+            hc.health_changed_callback = Some(observer);
             Box::new(hc)
         }
     }

@@ -725,7 +725,7 @@ where
         .map_err(|e| anyhow::anyhow!("pool '{name}': {e}"))?;
 
     if let Some(hc_cfg) = &pool_cfg.health_check {
-        let hc = health::build(hc_cfg, addrs.first().copied().unwrap_or(""));
+        let hc = health::build(hc_cfg, addrs.first().copied().unwrap_or(""), name);
         lb.set_health_check(hc);
         lb.health_check_frequency = Some(health::parse_duration(&hc_cfg.interval));
         lb.parallel_health_check = true;
