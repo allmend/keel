@@ -1,12 +1,12 @@
 # Keel
 
-> **Alpha.** Keel is still finding its sea legs. Expect rough edges, breaking config changes between versions, and the occasional existential crisis about whether Raft really needs that many log entries. Core proxy, TLS + ACME, clustering, and caching work — but we wouldn't stake a production fleet on it just yet. Early feedback very welcome.
+> **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not recommended for production yet. Feedback welcome.
 
 ---
 
 ## What is Keel?
 
-A fast, modern, self-hosted load balancer, reverse proxy, and API gateway built in Rust on Cloudflare's Pingora framework.
+A fast, modern, self-hosted load balancer, reverse proxy, and API gateway written in Rust.
 
 - **Live backend drain** — gracefully remove a backend without dropping connections
 - **Runtime pool management** — no reload required to change backend state
@@ -39,7 +39,7 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - conf.d config splitting — vhosts, pools, and certificates per team file
 - Raft-based clustering with mTLS, encrypted join, automatic voter promotion
 - Distributed config push via `keel config push`
-- Cluster-replicated ACME certificates — leader issues, every node serves
+- Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 
 In the roadmap: API gateway features (rate limiting, auth, transforms), TCP/UDP (L4) load balancing, PROXY protocol parsing, DNS-01/wildcards.
@@ -53,8 +53,8 @@ In the roadmap: API gateway features (rate limiting, auth, transforms), TCP/UDP 
 Run the container:
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.2.0-alpha
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.2.0-alpha
+docker pull ghcr.io/allmend/keel:0.3.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.3.0
 ```
 
 Or download a Linux binary (x86_64 or arm64) from the
@@ -68,7 +68,7 @@ git clone https://github.com/allmend/keel
 cd keel
 docker compose up --build
 
-# Keel is now proxying :8080 → three whoami backends
+# Keel is now proxying :8080 → three test backends
 curl http://localhost:8080          # round-robins across backend1/2/3
 curl http://localhost:9090/metrics  # Prometheus metrics
 
@@ -185,7 +185,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is pre-release (v0.2.0-alpha). Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.3.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 
