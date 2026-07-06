@@ -15,6 +15,7 @@ Keel is configured via a YAML file, defaulting to `keel.yaml` in the working dir
 | `vhosts` | Virtual host routing rules | [Virtual hosts](virtual-hosts.md) |
 | `include` | Glob patterns for conf.d-style config splitting | [below](#config-splitting) |
 | `cluster` | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
+| `control` | Remote control listener (keelctl, mTLS) | [Remote control](keelctl.md) |
 
 ---
 
@@ -282,6 +283,27 @@ cluster:
 | `ca_key` | string | none | BYO CA key path |
 
 See [Cluster](cluster.md) for bootstrap, join, and CA options.
+
+---
+
+## control
+
+Remote control for `keelctl`. Off unless `remote` is set. mTLS is mandatory;
+see [Remote control](keelctl.md).
+
+```yaml
+control:
+  remote:
+    address: 0.0.0.0:10789
+    allow:
+      - 10.1.2.0/24
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `remote.address` | string | none | TCP listen address for keelctl |
+| `remote.allow` | list | none | Optional source-CIDR restriction; empty = any source. mTLS stays mandatory |
+| `remote.ca_dir` | string | `/var/lib/keel/control` | Control CA storage (`ca.crt` / `ca.key`) |
 
 ---
 

@@ -12,6 +12,37 @@ _Nothing yet._
 
 ---
 
+## [0.5.0] — 2026-07-06
+
+### Added
+
+- **keelctl — remote control over mTLS.** A dedicated CLI for controlling a
+  Keel node or cluster from a workstation or CI job, with binaries for Linux
+  (x86_64/arm64, static), macOS (arm64/x86_64), and FreeBSD (x86_64). Same
+  commands and output as the on-node `keel` CLI: `status`, `backend
+  list/drain --wait`, `config reload/push`, `cluster status/stepdown`.
+- **`control.remote` listener.** TCP control endpoint over mandatory mTLS:
+  clients must present a certificate signed by the node's control CA, with
+  an optional `allow:` source-CIDR restriction. Every remote command is
+  audit-logged as `operator@address command`; the local Unix socket is
+  unchanged.
+- **`keel credentials create <name> --endpoint <host:port>`** issues an
+  operator client certificate from the control CA (generated on first use in
+  `control.remote.ca_dir`) and prints a **keelconfig** — endpoint, CA cert,
+  client cert, and key in one YAML file, kubeconfig-style. keelctl resolves
+  it via `--config`, `$KEEL_CONFIG`, `./keelconfig`, or `~/.keel/config`.
+- In cluster mode every node with `control.remote` listens; cluster writes
+  are forwarded to the leader internally. Nodes have independent control CAs
+  today — share `ca_dir` across nodes for a single cluster-wide keelconfig.
+  Control-CA replication via Raft is planned.
+
+### Changed
+
+- The repository is a Cargo workspace: `keel` (root), `keel-control` (shared
+  protocol), and `keelctl`.
+
+---
+
 ## [0.4.0] — 2026-07-06
 
 ### Added
@@ -267,7 +298,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/allmend/keel/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/allmend/keel/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/allmend/keel/compare/v0.2.0-alpha...v0.3.0
 [0.2.0-alpha]: https://github.com/allmend/keel/compare/v0.1.0-alpha...v0.2.0-alpha

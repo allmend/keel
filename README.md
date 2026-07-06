@@ -49,8 +49,9 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Distributed config push via `keel config push`
 - Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
+- **keelctl** — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, UDP load balancing, remote cluster control (keelctl), PROXY protocol parsing, DNS-01/wildcards.
+In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, UDP load balancing, PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
@@ -61,8 +62,8 @@ In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS 
 Run the container:
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.4.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.4.0
+docker pull ghcr.io/allmend/keel:0.5.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.5.0
 ```
 
 Or download a Linux binary (x86_64 or arm64) from the
@@ -158,6 +159,21 @@ keel cluster status                      # cluster membership and Raft roles
 keel cluster stepdown                    # gracefully leave the cluster (--force to override quorum guard)
 ```
 
+The same commands work remotely with **keelctl** over mTLS — create credentials
+once on the node, then control the node or cluster from a workstation or CI:
+
+```bash
+# on the node (once)
+keel credentials create john --endpoint lb1.example.com:10789 > keelconfig
+
+# from anywhere with the keelconfig
+keelctl status
+keelctl backend drain 10.0.0.1:8080 --wait
+keelctl config push keel.yaml
+```
+
+See [docs/keelctl.md](docs/keelctl.md).
+
 ---
 
 ## Clustering
@@ -188,13 +204,14 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [Access logging](docs/access-logging.md)
 - [Automatic TLS / ACME](docs/acme.md)
 - [CLI reference](docs/cli.md)
+- [Remote control / keelctl](docs/keelctl.md)
 - [Security hardening](docs/security.md)
 
 ---
 
 ## Status
 
-Keel is at v0.4.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.5.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 
