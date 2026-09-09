@@ -10,6 +10,29 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.9.0] — 2026-09-09
+
+### Added
+
+- **Control CA replicated through Raft.** The leader publishes its control
+  CA; every node, including late joiners, installs it into `ca_dir` and
+  re-keys its remote listener without restart. One keelconfig works against
+  every node and `keel credentials create` works on any node.
+
+### Fixed
+
+- **Runtime directories are prepared before the privilege drop.** The root
+  process now creates the control-socket, control-CA, and ACME directories
+  and assigns them to `keel.user`; the remote control listener could not
+  create `/var/lib/keel/control` after the drop and never started.
+- **Cluster mode drops privileges.** A cluster node started as root stayed
+  root for its whole life: cluster mode bypasses the master/worker model, and
+  nothing dropped. It now binds its listeners and ICMP sockets as root,
+  drops to `keel.user`, and starts everything else unprivileged, the same
+  outcome as standalone workers.
+
+---
+
 ## [0.8.0] — 2026-09-09
 
 ### Added
@@ -24,21 +47,6 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `tls`, `tls_sni`, `tls_version`, `tls_cipher`; new error values
   `tls_handshake` and `upstream_tls`. A client that closes without TLS
   close_notify is logged as a normal end.
-
-### Added
-
-- **Control CA replicated through Raft.** The leader publishes its control
-  CA; every node, including late joiners, installs it into `ca_dir` and
-  re-keys its remote listener without restart. One keelconfig works against
-  every node and `keel credentials create` works on any node.
-
-### Fixed
-
-- **Cluster mode drops privileges.** A cluster node started as root stayed
-  root for its whole life: cluster mode bypasses the master/worker model, and
-  nothing dropped. It now binds its listeners and ICMP sockets as root,
-  drops to `keel.user`, and starts everything else unprivileged, the same
-  outcome as standalone workers.
 
 ### Changed
 
@@ -409,7 +417,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/allmend/keel/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/allmend/keel/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/allmend/keel/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/allmend/keel/compare/v0.5.0...v0.6.0
