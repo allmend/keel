@@ -233,6 +233,9 @@ vhosts:
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
 | `cache.ttl` | integer | none | Seconds; fallback TTL when origin omits `Cache-Control` |
 | `default_action` | object | none | Answer directly without a pool: `redirect:` or `status:`/`body:` — see [Virtual hosts](virtual-hosts.md#default-action). Excludes `pool`/`routes` |
+| `rate_limit` | object | none | Per-client-IP token bucket: `requests`, `per` (default `1s`), `burst` (default `requests`). Also per route. See [API gateway](gateway.md) |
+| `headers` | object | none | `request` and `response` blocks, each with `set` (map) and `remove` (list). Also per route |
+| `rewrite` | object | none | `strip_prefix`, `add_prefix` applied to the backend path. Also per route |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
 

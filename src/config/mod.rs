@@ -368,6 +368,10 @@ impl Config {
                     }
                 }
             }
+            validate_gateway(&format!("vhost '{}'", vhost.host), vhost.rate_limit.as_ref(), vhost.headers.as_ref(), vhost.rewrite.as_ref())?;
+            for route in &vhost.routes {
+                validate_gateway(&format!("vhost '{}' route '{}'", vhost.host, route.path), route.rate_limit.as_ref(), route.headers.as_ref(), route.rewrite.as_ref())?;
+            }
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("vhost '{}' references unknown pool '{pool}'", vhost.host);
@@ -894,6 +898,53 @@ impl<'de> Deserialize<'de> for HealthCheck {
     }
 }
 
+fn validate_gateway(
+    what: &str,
+    rate_limit: Option<&RateLimitConfig>,
+    headers: Option<&HeaderRules>,
+    rewrite: Option<&RewriteConfig>,
+) -> Result<()> {
+    if let Some(rl) = rate_limit {
+        if rl.requests == 0 {
+            anyhow::bail!("{what}: rate_limit.requests must be at least 1");
+        }
+        parse_duration(&rl.per).map_err(|e| anyhow::anyhow!("{what}: rate_limit.per: {e}"))?;
+        if rl.burst == Some(0) {
+            anyhow::bail!("{what}: rate_limit.burst must be at least 1");
+        }
+    }
+    if let Some(h) = headers {
+        for ops in [&h.request, &h.response] {
+            for (name, value) in &ops.set {
+                if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    anyhow::bail!("{what}: headers: '{name}' is not a valid header name");
+                }
+                if http::header::HeaderValue::from_str(value).is_err() {
+                    anyhow::bail!("{what}: headers: value of '{name}' contains characters not allowed in a header");
+                }
+            }
+            for name in &ops.remove {
+                if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    anyhow::bail!("{what}: headers: '{name}' is not a valid header name");
+                }
+            }
+        }
+    }
+    if let Some(rw) = rewrite {
+        for (field, value) in [("strip_prefix", &rw.strip_prefix), ("add_prefix", &rw.add_prefix)] {
+            if let Some(v) = value {
+                if !v.starts_with('/') || v.contains(['?', '#']) {
+                    anyhow::bail!("{what}: rewrite.{field} must be a path starting with '/'");
+                }
+            }
+        }
+        if rw.strip_prefix.is_none() && rw.add_prefix.is_none() {
+            anyhow::bail!("{what}: rewrite needs strip_prefix or add_prefix");
+        }
+    }
+    Ok(())
+}
+
 /// Strict duration parser for config values: `500ms`, `10s`, `2m`, `1h`.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -1009,6 +1060,69 @@ pub struct Vhost {
     /// and `routes`. Typical on the `"*"` wildcard vhost: IP-direct access
     /// redirect, unknown-host 404, maintenance page.
     pub default_action: Option<DefaultAction>,
+
+    /// Gateway rules for the whole vhost; a route's own rules override them
+    /// field by field.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub headers: Option<HeaderRules>,
+    #[serde(default)]
+    pub rewrite: Option<RewriteConfig>,
+}
+
+/// Per-client-IP token bucket: `requests` per `per`, with `burst` tokens
+/// available after idle time (defaults to `requests`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RateLimitConfig {
+    pub requests: u32,
+    #[serde(default = "default_rate_per")]
+    pub per: String,
+    #[serde(default)]
+    pub burst: Option<u32>,
+}
+
+fn default_rate_per() -> String { "1s".into() }
+
+impl RateLimitConfig {
+    /// (tokens per second, bucket capacity). `per` is validated at load.
+    pub fn limit(&self) -> (f64, f64) {
+        let per = parse_duration(&self.per).unwrap_or(Duration::from_secs(1)).as_secs_f64();
+        let rate = self.requests as f64 / per;
+        (rate, self.burst.unwrap_or(self.requests) as f64)
+    }
+}
+
+/// Header changes on the way to the backend (`request`) and back to the
+/// client (`response`).
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct HeaderRules {
+    #[serde(default)]
+    pub request: HeaderOps,
+    #[serde(default)]
+    pub response: HeaderOps,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct HeaderOps {
+    /// Set (replace) these headers to static values.
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Remove these headers.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// Path rewriting toward the backend.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct RewriteConfig {
+    /// Remove this leading path segment when present (`/api` turns
+    /// `/api/users` into `/users`).
+    #[serde(default)]
+    pub strip_prefix: Option<String>,
+    /// Prepend this path segment.
+    #[serde(default)]
+    pub add_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1041,6 +1155,14 @@ pub struct Route {
     pub pool: String,
     /// Per-route cache config. Overrides the vhost-level cache config when set.
     pub cache: Option<VhostCacheConfig>,
+
+    /// Route-level gateway rules; each overrides the vhost's when set.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub headers: Option<HeaderRules>,
+    #[serde(default)]
+    pub rewrite: Option<RewriteConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1522,6 +1644,29 @@ mod tests {
         assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", ""), "a.example.test").contains("exactly one of"));
         assert!(e(&dns.replace("ns1.example.test:53", "ns1.example.test"), "a.example.test").contains("host:port"));
         assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", "        tsig_key: c2VjcmV0\n        tsig_algorithm: hmac-md5\n"), "a.example.test").contains("tsig_algorithm"));
+    }
+
+    fn gw(vhost_body: &str) -> Config {
+        serde_yml::from_str(&format!("{POOL}vhosts:\n  - host: api.example.test\n    pool: dns\n{vhost_body}")).expect("yaml parses")
+    }
+
+    #[test]
+    fn gateway_blocks_parse_and_validate() {
+        let cfg = gw("    rate_limit: { requests: 10, per: 1m, burst: 20 }\n    headers:\n      request: { set: { X-Env: prod }, remove: [X-Internal] }\n      response: { remove: [Server] }\n    rewrite: { strip_prefix: /api }\n");
+        cfg.validate().expect("valid");
+        let v = &cfg.vhosts[0];
+        assert_eq!(v.rate_limit.as_ref().unwrap().limit(), (10.0 / 60.0, 20.0));
+        assert_eq!(v.headers.as_ref().unwrap().request.set["X-Env"], "prod");
+        assert_eq!(v.rewrite.as_ref().unwrap().strip_prefix.as_deref(), Some("/api"));
+        assert_eq!(gw("    rate_limit: { requests: 5 }\n").vhosts[0].rate_limit.as_ref().unwrap().limit(), (5.0, 5.0));
+
+        let e = |body: &str| gw(body).validate().expect_err("invalid").to_string();
+        assert!(e("    rate_limit: { requests: 0 }\n").contains("requests must be at least 1"));
+        assert!(e("    rate_limit: { requests: 1, per: often }\n").contains("rate_limit.per"));
+        assert!(e("    headers: { request: { set: { 'Bad Name': x } } }\n").contains("not a valid header name"));
+        assert!(e("    headers: { response: { set: { X-A: \"a\\nb\" } } }\n").contains("not allowed in a header"));
+        assert!(e("    rewrite: { strip_prefix: api }\n").contains("starting with '/'"));
+        assert!(e("    rewrite: {}\n").contains("needs strip_prefix or add_prefix"));
     }
 
     #[test]

@@ -1326,6 +1326,7 @@ dependencies = [
  "clap",
  "glob",
  "hex",
+ "http",
  "instant-acme",
  "ipnet",
  "keel-control",

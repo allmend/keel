@@ -1,5 +1,26 @@
-use crate::config::{Config, DefaultAction, ForwardedHeadersConfig, VhostCacheConfig};
+use crate::config::{
+    Config, DefaultAction, ForwardedHeadersConfig, HeaderRules, RateLimitConfig, RewriteConfig,
+    VhostCacheConfig,
+};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+/// Gateway rules in effect for one matched route: the route's own value for
+/// each field, else the vhost's.
+#[derive(Debug, Default)]
+pub struct GatewayRules {
+    /// Bucket key prefix for the rate limiter: host plus path prefix.
+    pub id: String,
+    pub rate_limit: Option<RateLimitConfig>,
+    pub headers: Option<HeaderRules>,
+    pub rewrite: Option<RewriteConfig>,
+}
+
+impl GatewayRules {
+    pub fn is_empty(&self) -> bool {
+        self.rate_limit.is_none() && self.headers.is_none() && self.rewrite.is_none()
+    }
+}
 
 /// Maps an incoming (host, path) pair to a pool name.
 ///
@@ -24,6 +45,7 @@ struct Route {
     pool: String,
     /// Route-level cache config — overrides the vhost-level config when present.
     cache: Option<VhostCacheConfig>,
+    rules: Arc<GatewayRules>,
 }
 
 impl RoutingTable {
@@ -44,6 +66,12 @@ impl RoutingTable {
                         path_prefix: "/".into(),
                         pool: pool.clone(),
                         cache: None,
+                        rules: Arc::new(GatewayRules {
+                            id: format!("{}/", vhost.host),
+                            rate_limit: vhost.rate_limit.clone(),
+                            headers: vhost.headers.clone(),
+                            rewrite: vhost.rewrite.clone(),
+                        }),
                     });
                 }
             } else {
@@ -52,6 +80,12 @@ impl RoutingTable {
                         path_prefix: r.path.clone(),
                         pool: r.pool.clone(),
                         cache: r.cache.clone(),
+                        rules: Arc::new(GatewayRules {
+                            id: format!("{}{}", vhost.host, r.path),
+                            rate_limit: r.rate_limit.clone().or_else(|| vhost.rate_limit.clone()),
+                            headers: r.headers.clone().or_else(|| vhost.headers.clone()),
+                            rewrite: r.rewrite.clone().or_else(|| vhost.rewrite.clone()),
+                        }),
                     });
                 }
             }
@@ -158,11 +192,23 @@ impl RoutingTable {
     }
 
     fn match_host<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
+        self.match_route(host, path).map(|r| r.pool.as_str())
+    }
+
+    fn match_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a Route> {
         let routes = self.vhosts.get(host)?;
-        routes
-            .iter()
-            .find(|r| path.starts_with(r.path_prefix.as_str()))
-            .map(|r| r.pool.as_str())
+        routes.iter().find(|r| path.starts_with(r.path_prefix.as_str()))
+    }
+
+    /// Gateway rules for the route that `resolve` would pick. `None` when no
+    /// route matches or the matched route carries no rules.
+    pub fn gateway(&self, host: &str, path: &str) -> Option<Arc<GatewayRules>> {
+        let host = host.split(':').next().unwrap_or(host);
+        let route = self
+            .match_route(host, path)
+            .or_else(|| wildcard_of(host).and_then(|w| self.match_route(&w, path)))
+            .or_else(|| self.match_route("*", path))?;
+        (!route.rules.is_empty()).then(|| Arc::clone(&route.rules))
     }
 
     /// Returns the route-level cache config for the matching route, if any.
@@ -233,6 +279,9 @@ mod tests {
             cache: None,
             redirect_http: None,
             default_action: None,
+            rate_limit: None,
+            headers: None,
+            rewrite: None,
         }
     }
 
@@ -274,14 +323,17 @@ mod tests {
                 host: "example.com".into(),
                 pool: None,
                 routes: vec![
-                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None },
-                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
                 cache: None,
                 redirect_http: None,
                 default_action: None,
+                rate_limit: None,
+                headers: None,
+                rewrite: None,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -320,8 +372,11 @@ mod tests {
                             statuses: vec![200],
                             content_types: vec!["image/*".into()],
                         }),
+                        rate_limit: None,
+                        headers: None,
+                        rewrite: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -333,6 +388,9 @@ mod tests {
                 }),
                 redirect_http: None,
                 default_action: None,
+                rate_limit: None,
+                headers: None,
+                rewrite: None,
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -360,14 +418,20 @@ mod tests {
                         path: "/api/".into(),
                         pool: "api".into(),
                         cache: Some(VhostCacheConfig { enabled: false, ..Default::default() }),
+                        rate_limit: None,
+                        headers: None,
+                        rewrite: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
                 cache: Some(VhostCacheConfig { enabled: true, ttl: Some(60), ..Default::default() }),
                 redirect_http: None,
                 default_action: None,
+                rate_limit: None,
+                headers: None,
+                rewrite: None,
             }],
             [pool("api"), pool("web")].into(),
         );
@@ -403,5 +467,36 @@ mod tests {
         assert_eq!(table.resolve("example.com", "/"), None);
         assert_eq!(table.vhost_label("www.example.com"), Some("*.example.com"));
         assert_eq!(table.vhost_label("deep.www.example.com"), None);
+    }
+
+    #[test]
+    fn route_rules_override_vhost_rules_per_field() {
+        let mut v = vhost("api.example.com", "unused");
+        v.pool = None;
+        v.rate_limit = Some(crate::config::RateLimitConfig { requests: 10, per: "1s".into(), burst: None });
+        v.headers = Some(crate::config::HeaderRules::default());
+        v.routes = vec![
+            CfgRoute {
+                path: "/v2/".into(),
+                pool: "api".into(),
+                cache: None,
+                rate_limit: Some(crate::config::RateLimitConfig { requests: 1, per: "1s".into(), burst: None }),
+                headers: None,
+                rewrite: Some(crate::config::RewriteConfig { strip_prefix: Some("/v2".into()), add_prefix: None }),
+            },
+            CfgRoute { path: "/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+        ];
+        let cfg = make_config(vec![v, vhost("plain.example.com", "api")], HashMap::from([pool("api")]));
+        let table = RoutingTable::build(&cfg);
+        let v2 = table.gateway("api.example.com", "/v2/users").unwrap();
+        assert_eq!(v2.id, "api.example.com/v2/");
+        assert_eq!(v2.rate_limit.as_ref().unwrap().requests, 1, "route value wins");
+        assert!(v2.headers.is_some(), "vhost value fills the gap");
+        assert!(v2.rewrite.is_some());
+        let root = table.gateway("api.example.com", "/other").unwrap();
+        assert_eq!(root.rate_limit.as_ref().unwrap().requests, 10);
+        assert!(root.rewrite.is_none());
+        assert!(table.gateway("plain.example.com", "/").is_none(), "no rules, no allocation");
+        assert!(table.gateway("nobody.example.com", "/").is_none());
     }
 }

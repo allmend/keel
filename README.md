@@ -42,6 +42,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Config hot reload (SIGHUP or `keel config reload`)
 - TLS certificate hot-swap
 - Two-tier HTTP cache (memory L1 + disk L2)
+- Gateway rules per vhost or route — per-IP rate limiting, request/response header set/remove, path prefix rewriting
 - Prometheus metrics (`/metrics`)
 - NDJSON access logs, per-vhost
 - conf.d config splitting — vhosts, pools, and certificates per team file
@@ -51,7 +52,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 - keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: API gateway features (rate limiting, auth, transforms).
+In the roadmap: gateway authentication (JWT), HTTP/3.
 
 ---
 
@@ -218,6 +219,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [UDP proxying (L4)](docs/udp-proxying.md)
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
+- [API gateway](docs/gateway.md)
 - [Access logging](docs/access-logging.md)
 - [Metrics reference](docs/metrics.md)
 - [Automatic TLS / ACME](docs/acme.md)

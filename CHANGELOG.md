@@ -8,6 +8,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Gateway rules** on vhosts and routes (`docs/gateway.md`): `rate_limit`
+  (token bucket per client IP, 429 with `Retry-After`,
+  `keel_rate_limited_total`), `headers` (`set`/`remove` on request and
+  response), and `rewrite` (`strip_prefix`, `add_prefix`). A route's block
+  overrides the vhost's per field. Buckets are per worker process.
+
 ---
 
 ## [0.11.0] — 2026-09-09

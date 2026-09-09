@@ -55,6 +55,8 @@ pub struct ProxyCtx {
     uri: String,
     protocol: String,
     user_agent: Option<String>,
+    /// Gateway rules of the matched route, resolved in `request_filter`.
+    gateway: Option<Arc<crate::vhost::GatewayRules>>,
 }
 
 // Proxy implementation
@@ -67,6 +69,77 @@ pub struct KProxy {
     cache: Option<CacheHandle>,
     /// HTTP-01 challenge token directory — Some when any host is ACME-managed.
     acme_challenge_dir: Option<std::path::PathBuf>,
+    /// Per-worker token buckets for `rate_limit` rules.
+    limiter: Arc<crate::gateway::ratelimit::RateLimiter>,
+}
+
+impl KProxy {
+    /// X-Forwarded-* and RFC 7239 headers toward the backend, per the vhost's
+    /// `forwarded_headers` mode.
+    fn apply_forwarded_headers(
+        &self,
+        session: &Session,
+        upstream_request: &mut pingora::http::RequestHeader,
+        ctx: &ProxyCtx,
+    ) -> pingora::Result<()> {
+        let Some(client_ip) = ctx.client_ip else {
+            return Ok(());
+        };
+
+        let routing = self.routing.load();
+        let fwd_cfg = routing.forwarded_config(&ctx.vhost);
+        let mode = fwd_cfg.map(|c| &c.mode).unwrap_or(&ForwardedMode::Replace);
+
+        if matches!(mode, ForwardedMode::Off) {
+            upstream_request.headers.remove("x-forwarded-for");
+            upstream_request.headers.remove("x-real-ip");
+            upstream_request.headers.remove("x-forwarded-proto");
+            upstream_request.headers.remove("x-forwarded-host");
+            upstream_request.headers.remove("forwarded");
+            return Ok(());
+        }
+
+        let (real_ip, xff) = if matches!(mode, ForwardedMode::Append) {
+            let trusted = fwd_cfg.map(|c| c.trusted_proxies.as_slice()).unwrap_or(&[]);
+            if is_trusted_proxy(&client_ip, trusted) {
+                let existing = session
+                    .as_downstream()
+                    .get_header("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let real = existing
+                    .split(',')
+                    .next()
+                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
+                    .unwrap_or(client_ip);
+                let chain = if existing.is_empty() {
+                    client_ip.to_string()
+                } else {
+                    format!("{existing}, {client_ip}")
+                };
+                (real, chain)
+            } else {
+                (client_ip, client_ip.to_string())
+            }
+        } else {
+            (client_ip, client_ip.to_string())
+        };
+
+        let proto = if ctx.is_tls { "https" } else { "http" };
+        // Forward the original client-supplied Host, not the internal label.
+        let host = &ctx.host_header;
+
+        upstream_request.insert_header("x-forwarded-for", xff.as_str())?;
+        upstream_request.insert_header("x-real-ip", real_ip.to_string().as_str())?;
+        upstream_request.insert_header("x-forwarded-proto", proto)?;
+        upstream_request.insert_header("x-forwarded-host", host.as_str())?;
+        upstream_request.insert_header(
+            "forwarded",
+            format!("for={real_ip};proto={proto};host={host}").as_str(),
+        )?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -90,13 +163,14 @@ impl ProxyHttp for KProxy {
             uri: String::new(),
             protocol: String::new(),
             user_agent: None,
+            gateway: None,
         }
     }
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
 
@@ -169,6 +243,36 @@ impl ProxyHttp for KProxy {
                     .await?;
                 return Ok(true);
             }
+        }
+
+        // Gateway rules for the route this request will take. The rate limit
+        // answers here, before any backend work; header and path rules are
+        // applied in the upstream/response filters from `ctx.gateway`.
+        let req_path = session.req_header().uri.path().to_owned();
+        if let Some(rules) = routing.gateway(&host, &req_path) {
+            if let Some(rl) = &rules.rate_limit {
+                let client_ip = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
+                if let Some(ip) = client_ip {
+                    let (rate, burst) = rl.limit();
+                    let limit = crate::gateway::ratelimit::Limit { rate, burst };
+                    if let Err(wait) = self.limiter.check(&rules.id, ip, limit, Instant::now()) {
+                        let label = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
+                        crate::metrics::record_rate_limited(&label);
+                        ctx.vhost = label;
+                        ctx.host_header = host.clone();
+                        let retry = wait.as_secs_f64().ceil().max(1.0) as u64;
+                        let body = "rate limited\n";
+                        let mut resp = pingora::http::ResponseHeader::build(429, Some(3))?;
+                        resp.insert_header("retry-after", retry.to_string().as_str())?;
+                        resp.insert_header("content-type", "text/plain")?;
+                        resp.insert_header("content-length", body.len().to_string())?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session.write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true).await?;
+                        return Ok(true);
+                    }
+                }
+            }
+            ctx.gateway = Some(rules);
         }
 
         // HTTP → HTTPS redirect — plain HTTP only, TLS passes through.
@@ -289,62 +393,23 @@ impl ProxyHttp for KProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
-        let Some(client_ip) = ctx.client_ip else {
-            return Ok(());
-        };
-
-        let routing = self.routing.load();
-        let fwd_cfg = routing.forwarded_config(&ctx.vhost);
-        let mode = fwd_cfg.map(|c| &c.mode).unwrap_or(&ForwardedMode::Replace);
-
-        if matches!(mode, ForwardedMode::Off) {
-            upstream_request.headers.remove("x-forwarded-for");
-            upstream_request.headers.remove("x-real-ip");
-            upstream_request.headers.remove("x-forwarded-proto");
-            upstream_request.headers.remove("x-forwarded-host");
-            upstream_request.headers.remove("forwarded");
-            return Ok(());
-        }
-
-        let (real_ip, xff) = if matches!(mode, ForwardedMode::Append) {
-            let trusted = fwd_cfg.map(|c| c.trusted_proxies.as_slice()).unwrap_or(&[]);
-            if is_trusted_proxy(&client_ip, trusted) {
-                let existing = session
-                    .as_downstream()
-                    .get_header("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let real = existing
-                    .split(',')
-                    .next()
-                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
-                    .unwrap_or(client_ip);
-                let chain = if existing.is_empty() {
-                    client_ip.to_string()
-                } else {
-                    format!("{existing}, {client_ip}")
-                };
-                (real, chain)
-            } else {
-                (client_ip, client_ip.to_string())
+        self.apply_forwarded_headers(session, upstream_request, ctx)?;
+        if let Some(rules) = &ctx.gateway {
+            if let Some(rw) = &rules.rewrite {
+                if let Some(new_path) = crate::gateway::rewrite_path(upstream_request.uri.path(), rw) {
+                    let pq = match upstream_request.uri.query() {
+                        Some(q) => format!("{new_path}?{q}"),
+                        None => new_path,
+                    };
+                    if let Ok(uri) = pq.parse::<http::Uri>() {
+                        upstream_request.set_uri(uri);
+                    }
+                }
             }
-        } else {
-            (client_ip, client_ip.to_string())
-        };
-
-        let proto = if ctx.is_tls { "https" } else { "http" };
-        // Forward the original client-supplied Host, not the internal label.
-        let host = &ctx.host_header;
-
-        upstream_request.insert_header("x-forwarded-for", xff.as_str())?;
-        upstream_request.insert_header("x-real-ip", real_ip.to_string().as_str())?;
-        upstream_request.insert_header("x-forwarded-proto", proto)?;
-        upstream_request.insert_header("x-forwarded-host", host.as_str())?;
-        upstream_request.insert_header(
-            "forwarded",
-            format!("for={real_ip};proto={proto};host={host}").as_str(),
-        )?;
-
+            if let Some(h) = &rules.headers {
+                crate::gateway::apply_request_ops(upstream_request, &h.request);
+            }
+        }
         Ok(())
     }
 
@@ -488,15 +553,20 @@ impl ProxyHttp for KProxy {
         &self,
         session: &mut Session,
         upstream_response: &mut pingora::http::ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         use pingora::cache::CachePhase;
         let value = match session.cache.phase() {
-            CachePhase::Hit | CachePhase::Stale | CachePhase::Revalidated => "HIT",
-            CachePhase::Disabled(_) | CachePhase::Bypass => return Ok(()),
-            _ => "MISS",
+            CachePhase::Hit | CachePhase::Stale | CachePhase::Revalidated => Some("HIT"),
+            CachePhase::Disabled(_) | CachePhase::Bypass => None,
+            _ => Some("MISS"),
         };
-        let _ = upstream_response.insert_header("x-cache", value);
+        if let Some(value) = value {
+            let _ = upstream_response.insert_header("x-cache", value);
+        }
+        if let Some(h) = ctx.gateway.as_ref().and_then(|r| r.headers.as_ref()) {
+            crate::gateway::apply_response_ops(upstream_response, &h.response);
+        }
         Ok(())
     }
 
@@ -797,6 +867,28 @@ impl pingora::services::background::BackgroundService for EjectionSweeper {
     }
 }
 
+/// Drops rate-limit buckets idle for ten minutes, once a minute.
+struct LimiterSweeper {
+    limiter: Arc<crate::gateway::ratelimit::RateLimiter>,
+}
+
+#[async_trait]
+impl pingora::services::background::BackgroundService for LimiterSweeper {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = tick.tick() => {
+                    self.limiter.sweep(Instant::now(), std::time::Duration::from_secs(600));
+                }
+            }
+        }
+    }
+}
+
 /// Register one health-check service per pool that configures one, plus the
 /// passive-ejection sweeper.
 fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
@@ -968,8 +1060,16 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
-    let proxy =
-        KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
+    let limiter = Arc::new(crate::gateway::ratelimit::RateLimiter::default());
+    server.add_service(background_service("ratelimit-sweep", LimiterSweeper { limiter: Arc::clone(&limiter) }));
+    let proxy = KProxy {
+        routing,
+        pools: Arc::clone(&pools),
+        access_logger,
+        cache,
+        acme_challenge_dir,
+        limiter,
+    };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
@@ -1300,8 +1400,16 @@ pub fn run_cluster(
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
-    let proxy =
-        KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
+    let limiter = Arc::new(crate::gateway::ratelimit::RateLimiter::default());
+    server.add_service(background_service("ratelimit-sweep", LimiterSweeper { limiter: Arc::clone(&limiter) }));
+    let proxy = KProxy {
+        routing,
+        pools: Arc::clone(&pools),
+        access_logger,
+        cache,
+        acme_challenge_dir,
+        limiter,
+    };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);
 

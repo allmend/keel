@@ -31,6 +31,7 @@ glob = "0.3"
 # Async runtime (Pingora requires Tokio)
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
+http = "1"
 # SO_REUSEPORT for UDP listeners — every worker process binds the same port
 socket2 = "0.6"
 arc-swap = "1"

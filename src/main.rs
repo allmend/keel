@@ -5,6 +5,7 @@ mod cache;
 mod cluster;
 mod config;
 mod dns;
+mod gateway;
 mod control;
 mod health;
 mod l4;

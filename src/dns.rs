@@ -98,7 +98,6 @@ pub fn txt_value(rdata: &[u8]) -> String {
 
 pub const TYPE_SOA: u16 = 6;
 pub const TYPE_TXT: u16 = 16;
-pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_TSIG: u16 = 250;
 pub const CLASS_IN: u16 = 1;
 pub const CLASS_ANY: u16 = 255;
