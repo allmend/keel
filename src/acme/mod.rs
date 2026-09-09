@@ -24,6 +24,8 @@
 //! the CAs. Every worker watches the cert files and hot-swaps renewed certs
 //! into its own CertStore.
 
+pub mod rfc2136;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,7 +38,7 @@ use instant_acme::{
     NewOrder, OrderStatus, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{AcmeConfig, AcmeIssuer, Config, RenewBefore};
 use crate::tls::{acme_cert_paths, CertStore};
@@ -461,6 +463,7 @@ impl IssuerPool {
         // any node.
         let mut published: Vec<PathBuf> = Vec::new();
         let mut cluster_tokens: Vec<String> = Vec::new();
+        let mut dns_published: Option<(rfc2136::Rfc2136, String)> = None;
         let result = async {
             let mut authorizations = order.authorizations();
             let mut ready = 0usize;
@@ -470,6 +473,25 @@ impl IssuerPool {
                     AuthorizationStatus::Valid => continue,
                     AuthorizationStatus::Pending => {}
                     status => anyhow::bail!("authorization in unexpected state {status:?}"),
+                }
+                if issuer.challenge == crate::config::AcmeChallenge::Dns01 {
+                    let provider = dns_provider(issuer)?;
+                    let name = rfc2136::challenge_name(host);
+                    let mut challenge = authz
+                        .challenge(ChallengeType::Dns01)
+                        .context("CA offered no dns-01 challenge")?;
+                    let value = challenge.key_authorization().dns_value();
+                    provider.set_txt(&name, &value).await.with_context(|| format!("publish TXT {name}"))?;
+                    dns_published = Some((provider, name.clone()));
+                    // The record must be visible on the server we updated
+                    // before the CA is told to look; then the configured
+                    // propagation wait covers secondaries.
+                    wait_for_txt(dns_published.as_ref().map(|(p, _)| p).unwrap(), &name, &value).await?;
+                    let wait = crate::config::parse_duration(&provider_propagation_wait(issuer)).unwrap_or(Duration::from_secs(10));
+                    tokio::time::sleep(wait).await;
+                    ready += 1;
+                    challenge.set_ready().await.context("set challenge ready")?;
+                    continue;
                 }
                 let mut challenge = authz
                     .challenge(ChallengeType::Http01)
@@ -492,7 +514,7 @@ impl IssuerPool {
                 challenge.set_ready().await.context("set challenge ready")?;
             }
             drop(authorizations);
-            info!(host, tokens = ready, "acme: http-01 challenges published");
+            info!(host, tokens = ready, challenge = ?issuer.challenge, "acme: challenges published");
 
             let status = order.poll_ready(&RetryPolicy::default()).await.context("poll order")?;
             if status != OrderStatus::Ready {
@@ -510,6 +532,11 @@ impl IssuerPool {
 
         for p in published {
             let _ = std::fs::remove_file(p);
+        }
+        if let Some((provider, name)) = dns_published.take() {
+            if let Err(e) = provider.delete_txt(&name).await {
+                warn!(host, error = %format!("{e:#}"), "acme: TXT record cleanup failed");
+            }
         }
         // Retract replicated tokens; the sync task removes the files on every
         // node. Best effort — if leadership was lost mid-order this fails and
@@ -652,6 +679,53 @@ fn needs_issuance(storage: &str, host: &str, renew: RenewBefore) -> bool {
             warn!(host, "acme: cannot read certificate validity; reissuing");
             true
         }
+    }
+}
+
+/// The issuer's DNS provider as a client, key material loaded.
+fn dns_provider(issuer: &AcmeIssuer) -> Result<rfc2136::Rfc2136> {
+    use base64::Engine;
+    let Some(crate::config::DnsProvider::Rfc2136 { server, zone, tsig_name, tsig_key, tsig_key_file, tsig_algorithm, ttl, .. }) = &issuer.dns else {
+        anyhow::bail!("dns-01 issuer has no dns provider (validated at load)");
+    };
+    let key_b64 = match (tsig_key, tsig_key_file) {
+        (Some(k), _) => k.trim().to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path).with_context(|| format!("read tsig_key_file {path}"))?.trim().to_owned(),
+        (None, None) => anyhow::bail!("dns provider has no TSIG key (validated at load)"),
+    };
+    let key = base64::engine::general_purpose::STANDARD.decode(&key_b64).context("tsig_key is not base64")?;
+    let algorithm = rfc2136::TsigAlgorithm::parse(tsig_algorithm).context("unsupported tsig_algorithm")?;
+    Ok(rfc2136::Rfc2136 {
+        server: server.clone(),
+        zone: zone.clone(),
+        key_name: tsig_name.clone(),
+        key,
+        algorithm,
+        ttl: *ttl,
+    })
+}
+
+fn provider_propagation_wait(issuer: &AcmeIssuer) -> String {
+    match &issuer.dns {
+        Some(crate::config::DnsProvider::Rfc2136 { propagation_wait, .. }) => propagation_wait.clone(),
+        None => "10s".to_owned(),
+    }
+}
+
+/// Poll the updated server until the TXT record carries `value`, for up to
+/// 30 seconds. Catches a silently ignored update before the CA does.
+async fn wait_for_txt(provider: &rfc2136::Rfc2136, name: &str, value: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match provider.query_txt(name).await {
+            Ok(values) if values.iter().any(|v| v == value) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => debug!(name, error = %e, "acme: TXT self-check query failed"),
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("TXT record {name} not visible on {} after 30s", provider.server);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

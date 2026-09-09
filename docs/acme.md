@@ -19,7 +19,7 @@ vhosts:
 
 The `acme:` block is itself optional. `tls: { acme: true }` on its own implies a `default` issuer pointing at the public production directory above, without a contact email.
 
-On startup Keel registers an ACME account, proves control of `example.com` by answering the HTTP-01 challenge on port 80, obtains the certificate, and begins serving it. No restart is required.
+On startup Keel registers an ACME account, proves control of `example.com` by answering the HTTP-01 challenge on port 80 (or, for a `dns-01` issuer, by publishing a DNS record), obtains the certificate, and begins serving it. No restart is required.
 
 HTTP → HTTPS redirect is enabled automatically for ACME vhosts, with the challenge path exempted. Set `redirect_http: false` on the vhost to opt out.
 
@@ -92,9 +92,88 @@ Failed issuance retries with exponential backoff (1 minute, doubling to a 6-hour
 
 - **Port 80 must reach Keel** for the hostname being issued. The CA fetches `http://<host>/.well-known/acme-challenge/<token>`, and Keel answers on any plain (non-TLS) listener, ahead of redirects and vhost routing.
 - **Resolvable DNS.** The CA resolves the hostname itself — public resolvers for a public CA, or whatever DNS an internal CA uses.
-- **No wildcards.** Wildcards require the DNS-01 challenge, which is planned post-v1.
+- **Wildcards need DNS-01.** An issuer with `challenge: dns-01` (below) can issue `*.example.com`; HTTP-01 cannot.
 
 ---
+
+## DNS-01 challenge
+
+An issuer with `challenge: dns-01` proves control of a name by publishing a
+TXT record at `_acme-challenge.<host>` instead of answering on port 80. It
+is the only challenge that can issue wildcard certificates, and it works
+for hosts whose port 80 does not reach Keel.
+
+Keel publishes the record with an RFC 2136 dynamic update signed with TSIG,
+sent to the zone's primary server. BIND, Knot, PowerDNS, Windows DNS, and
+most enterprise DNS accept these; no provider API is involved.
+
+```yaml
+acme:
+  issuers:
+    wild:
+      email: ops@example.com
+      challenge: dns-01
+      dns:
+        type: rfc2136
+        server: ns1.example.com:53      # the primary that accepts updates
+        zone: example.com
+        tsig_name: keel-acme
+        tsig_key_file: /etc/keel/keel-acme.key   # base64 secret; or tsig_key inline
+        tsig_algorithm: hmac-sha256     # default; also hmac-sha384, hmac-sha512
+        propagation_wait: 10s           # default
+        ttl: 60                         # default
+
+vhosts:
+  - host: "*.example.com"
+    pool: web
+    tls: { acme: wild }
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `challenge` | `http-01` | `dns-01` requires `dns` |
+| `dns.type` | required | `rfc2136` |
+| `dns.server` | required | `host:port` of the primary. Updates and the self-check query go there over TCP |
+| `dns.zone` | required | Zone named in the update. The challenge name must fall inside it |
+| `dns.tsig_name` | required | Key name from the server's key statement |
+| `dns.tsig_key` / `dns.tsig_key_file` | one required | Base64 secret, inline or in a file |
+| `dns.tsig_algorithm` | `hmac-sha256` | `hmac-sha256`, `hmac-sha384`, or `hmac-sha512` |
+| `dns.propagation_wait` | `10s` | Wait after the record is visible on the primary, for secondaries the CA may query |
+| `dns.ttl` | `60` | TTL of the TXT record |
+
+For BIND, the matching server side is a key statement and an update policy
+that allows that key to change TXT records in the zone:
+
+```
+key "keel-acme" {
+  algorithm hmac-sha256;
+  secret "<base64>";
+};
+zone "example.com" {
+  type primary;
+  file "example.com.zone";
+  update-policy { grant keel-acme zonesub TXT; };
+};
+```
+
+`tsig-keygen keel-acme` prints a key statement with a fresh secret.
+
+Issuance with DNS-01 proceeds as: the TXT record is added (any existing
+TXT at the name is replaced); Keel queries the same server until the record
+is visible, for up to 30 seconds; it waits `propagation_wait`; it tells the
+CA to validate; after the order completes, pass or fail, the record is
+deleted. A refused update is reported with the TSIG error when the server
+sends one: `BADKEY` (unknown key name), `BADSIG` (secret mismatch),
+`BADTIME` (clock skew beyond five minutes).
+
+The update response itself is not authenticated; the self-check query is
+what confirms the record exists on the server that was asked. Keel talks
+only to the configured primary. If the CA's resolvers reach a secondary,
+`propagation_wait` must cover zone transfer.
+
+In cluster mode the leader publishes the record, as it runs the order.
+Unlike HTTP-01 there is nothing to replicate: the record lives in DNS, not
+on the nodes.
 
 ## Certificates for TCP / TLS-passthrough backends
 

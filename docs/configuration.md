@@ -264,6 +264,8 @@ acme:
 | `issuers.<name>.directory` | string | `https://acme-v02.api.letsencrypt.org/directory` | ACME v2 directory URL |
 | `issuers.<name>.root_ca` | string | none | Extra trust root for the ACME API (internal or self-signed CAs) |
 | `issuers.<name>.renew_before` | string | global value | Per-issuer renewal override |
+| `issuers.<name>.challenge` | string | `http-01` | `http-01` or `dns-01`. Wildcard hosts need `dns-01` |
+| `issuers.<name>.dns` | object | none | `dns-01` provider: `type: rfc2136` with `server`, `zone`, `tsig_name`, `tsig_key` or `tsig_key_file`, `tsig_algorithm`, `propagation_wait`, `ttl`. See [ACME](acme.md#dns-01-challenge) |
 
 ---
 
@@ -284,7 +286,8 @@ certificates:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `host` | string | required | Hostname to issue for (no wildcards) |
-| `issuer` | string | `default` | Issuer name from `acme.issuers` |
+| `issuer` | string | `default` | Issuer name from `acme.issuers`. Ignored when `cert`/`key` are set |
+| `cert`, `key` | string | none | Bring-your-own PEM files instead of ACME issuance; see [TCP proxying](tcp-proxying.md) |
 
 ---
 

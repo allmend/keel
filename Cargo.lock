@@ -1320,6 +1320,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",

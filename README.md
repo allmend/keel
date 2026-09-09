@@ -31,7 +31,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - TCP (L4) proxying — `tcp_pool` listeners with `passthrough`, `terminate`, and `reencrypt` TLS modes; certificates from ACME or files, SNI selection, optional backend verification
 - UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
 - TLS termination with per-vhost certificates
-- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
+- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01 and DNS-01 (RFC 2136 + TSIG, wildcards), renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Default vhost action — redirect or static response for unknown hosts, no pool needed
 - Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
@@ -50,7 +50,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 - keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: API gateway features (rate limiting, auth, transforms), PROXY protocol parsing, DNS-01/wildcards.
+In the roadmap: API gateway features (rate limiting, auth, transforms), PROXY protocol parsing.
 
 ---
 

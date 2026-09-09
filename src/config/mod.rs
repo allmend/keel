@@ -389,9 +389,9 @@ impl Config {
                             vhost.host
                         );
                     }
-                    if vhost.host.contains('*') {
+                    if vhost.host.contains('*') && !self.issuer_uses_dns01(tls.acme.issuer_name().unwrap_or(DEFAULT_ISSUER)) {
                         anyhow::bail!(
-                            "vhost '{}': ACME HTTP-01 cannot issue wildcard certificates",
+                            "vhost '{}': wildcard certificates need an issuer with challenge: dns-01",
                             vhost.host
                         );
                     }
@@ -412,10 +412,47 @@ impl Config {
         Ok(())
     }
 
+    /// Whether the named issuer publishes DNS-01 challenges (the implicit
+    /// default issuer does not).
+    fn issuer_uses_dns01(&self, name: &str) -> bool {
+        self.acme
+            .as_ref()
+            .and_then(|a| a.issuers.get(name))
+            .map_or(false, |i| i.challenge == AcmeChallenge::Dns01)
+    }
+
     fn validate_acme(&self) -> Result<()> {
         let issuer_defined = |name: &str| {
             self.acme.as_ref().map_or(false, |a| a.issuers.contains_key(name))
         };
+
+        for (name, issuer) in self.acme.as_ref().map(|a| &a.issuers).into_iter().flatten() {
+            match (issuer.challenge, &issuer.dns) {
+                (AcmeChallenge::Dns01, None) => anyhow::bail!("acme.issuers.{name}: challenge dns-01 needs a dns provider"),
+                (AcmeChallenge::Http01, Some(_)) => anyhow::bail!("acme.issuers.{name}: dns provider needs challenge: dns-01"),
+                (AcmeChallenge::Dns01, Some(DnsProvider::Rfc2136 { server, zone, tsig_name, tsig_key, tsig_key_file, tsig_algorithm, propagation_wait, .. })) => {
+                    if server.rsplit_once(':').map_or(true, |(h, p)| h.is_empty() || p.parse::<u16>().is_err()) {
+                        anyhow::bail!("acme.issuers.{name}: dns.server must be host:port");
+                    }
+                    if zone.is_empty() || tsig_name.is_empty() {
+                        anyhow::bail!("acme.issuers.{name}: dns.zone and dns.tsig_name are required");
+                    }
+                    if tsig_key.is_some() == tsig_key_file.is_some() {
+                        anyhow::bail!("acme.issuers.{name}: set exactly one of dns.tsig_key and dns.tsig_key_file");
+                    }
+                    if crate::acme::rfc2136::TsigAlgorithm::parse(tsig_algorithm).is_none() {
+                        anyhow::bail!("acme.issuers.{name}: dns.tsig_algorithm must be hmac-sha256, hmac-sha384, or hmac-sha512");
+                    }
+                    parse_duration(propagation_wait).map_err(|e| anyhow::anyhow!("acme.issuers.{name}: dns.propagation_wait: {e}"))?;
+                }
+                (AcmeChallenge::Http01, None) => {}
+            }
+        }
+        for c in self.certificates.iter().filter(|c| c.is_acme()) {
+            if c.host.contains('*') && !self.issuer_uses_dns01(&c.issuer) {
+                anyhow::bail!("certificates '{}': wildcard certificates need an issuer with challenge: dns-01", c.host);
+            }
+        }
 
         // Issuer references must exist ("default" may be implicit).
         for vhost in &self.vhosts {
@@ -1094,7 +1131,57 @@ pub struct AcmeIssuer {
 
     /// Per-issuer renewal override; same syntax as the global `renew_before`.
     pub renew_before: Option<String>,
+
+    /// Which challenge this issuer's orders use. `dns-01` needs `dns` and
+    /// allows wildcard hosts.
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+
+    /// DNS provider for `dns-01`.
+    #[serde(default)]
+    pub dns: Option<DnsProvider>,
 }
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
+pub enum AcmeChallenge {
+    #[default]
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "dns-01")]
+    Dns01,
+}
+
+/// How DNS-01 TXT records are published.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DnsProvider {
+    /// RFC 2136 dynamic update with TSIG, to the zone's primary.
+    Rfc2136 {
+        /// `host:port` of the primary that accepts updates.
+        server: String,
+        /// Zone the challenge names belong to.
+        zone: String,
+        /// TSIG key name, as in the server's key statement.
+        tsig_name: String,
+        /// Base64 key material; or `tsig_key_file` holding it.
+        #[serde(default)]
+        tsig_key: Option<String>,
+        #[serde(default)]
+        tsig_key_file: Option<String>,
+        #[serde(default = "default_tsig_algorithm")]
+        tsig_algorithm: String,
+        /// Time to wait after the record is visible on the primary, for
+        /// secondaries the CA may query.
+        #[serde(default = "default_propagation_wait")]
+        propagation_wait: String,
+        #[serde(default = "default_dns_ttl")]
+        ttl: u32,
+    },
+}
+
+fn default_tsig_algorithm() -> String { "hmac-sha256".into() }
+fn default_propagation_wait() -> String { "10s".into() }
+fn default_dns_ttl() -> u32 { 60 }
 
 impl Default for AcmeIssuer {
     fn default() -> Self {
@@ -1103,6 +1190,8 @@ impl Default for AcmeIssuer {
             directory: default_acme_directory(),
             root_ca: None,
             renew_before: None,
+            challenge: AcmeChallenge::Http01,
+            dns: None,
         }
     }
 }
@@ -1401,6 +1490,38 @@ mod tests {
         assert!(e("", "  - host: cache.example.com\n    cert: /c.pem\n").contains("set together"));
         let cfg = parse("  - address: 0.0.0.0:80\n    tls_mode: terminate\n");
         assert!(err(&cfg).contains("tcp_pool listeners only"));
+    }
+
+    fn acme_cfg(issuer_body: &str, host: &str) -> Config {
+        serde_yml::from_str(&format!(
+            "{POOL}acme:\n  issuers:\n    internal:\n{issuer_body}vhosts:\n  - host: '{host}'\n    pool: dns\n    tls: {{ acme: internal }}\n"
+        ))
+        .expect("yaml parses")
+    }
+
+    #[test]
+    fn dns01_issuer_parses_and_allows_wildcards() {
+        let dns = "      challenge: dns-01\n      dns:\n        type: rfc2136\n        server: ns1.example.test:53\n        zone: example.test\n        tsig_name: keel-acme\n        tsig_key: c2VjcmV0\n";
+        let cfg = acme_cfg(dns, "*.example.test");
+        cfg.validate().expect("wildcard with dns-01 is valid");
+        let issuer = &cfg.acme.as_ref().unwrap().issuers["internal"];
+        assert_eq!(issuer.challenge, AcmeChallenge::Dns01);
+        match &issuer.dns {
+            Some(DnsProvider::Rfc2136 { tsig_algorithm, propagation_wait, ttl, .. }) => {
+                assert_eq!(tsig_algorithm, "hmac-sha256");
+                assert_eq!(propagation_wait, "10s");
+                assert_eq!(*ttl, 60);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let e = |body: &str, host: &str| acme_cfg(body, host).validate().expect_err("invalid").to_string();
+        assert!(e("      email: a@example.test\n", "*.example.test").contains("need an issuer with challenge: dns-01"));
+        assert!(e("      challenge: dns-01\n", "a.example.test").contains("needs a dns provider"));
+        assert!(e("      dns:\n        type: rfc2136\n        server: ns1:53\n        zone: z\n        tsig_name: k\n        tsig_key: a\n", "a.example.test").contains("needs challenge: dns-01"));
+        assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", ""), "a.example.test").contains("exactly one of"));
+        assert!(e(&dns.replace("ns1.example.test:53", "ns1.example.test"), "a.example.test").contains("host:port"));
+        assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", "        tsig_key: c2VjcmV0\n        tsig_algorithm: hmac-md5\n"), "a.example.test").contains("tsig_algorithm"));
     }
 
     #[test]

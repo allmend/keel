@@ -14,6 +14,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use super::{io_reason, unspecified, Probe, ProbeResult, Rng};
 use crate::config::{DnsRecord, DnsTransport};
+use crate::dns::{encode_name, rcode_name, skip_name};
 
 pub struct DnsProbe {
     query: String,
@@ -80,11 +81,7 @@ pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
     q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     q.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN, NS, AR
-    for label in name.split('.').filter(|l| !l.is_empty()) {
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0);
+    q.extend_from_slice(&encode_name(name));
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&1u16.to_be_bytes()); // IN
     q
@@ -137,31 +134,6 @@ pub fn parse_response(buf: &[u8], id: u16, qtype: u16) -> Result<Vec<IpAddr>, St
         }
     }
     Ok(answers)
-}
-
-/// Position after a (possibly compressed) name starting at `pos`.
-fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize, String> {
-    loop {
-        let len = *buf.get(pos).ok_or("truncated name")? as usize;
-        if len & 0xC0 == 0xC0 {
-            return Ok(pos + 2); // pointer: two bytes, ends the name
-        }
-        if len == 0 {
-            return Ok(pos + 1);
-        }
-        pos += 1 + len;
-    }
-}
-
-fn rcode_name(rcode: u16) -> String {
-    match rcode {
-        1 => "FORMERR".to_owned(),
-        2 => "SERVFAIL".to_owned(),
-        3 => "NXDOMAIN".to_owned(),
-        4 => "NOTIMP".to_owned(),
-        5 => "REFUSED".to_owned(),
-        n => n.to_string(),
-    }
 }
 
 #[cfg(test)]

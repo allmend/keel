@@ -4,6 +4,7 @@ mod backend;
 mod cache;
 mod cluster;
 mod config;
+mod dns;
 mod control;
 mod health;
 mod l4;
@@ -21,7 +22,7 @@ use tracing::info;
 const DEFAULT_SOCKET: &str = "/var/run/keel/keel.sock";
 
 #[derive(Parser)]
-#[command(name = "keel", about = "Fast, modern load balancer and reverse proxy")]
+#[command(name = "keel", version, about = "Fast, modern load balancer and reverse proxy")]
 struct Cli {
     /// Path to config file
     #[arg(short, long, default_value = "keel.yaml")]

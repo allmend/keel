@@ -8,6 +8,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **DNS-01 challenge and wildcard certificates.** An issuer with
+  `challenge: dns-01` publishes `_acme-challenge` TXT records through RFC
+  2136 dynamic updates with TSIG (`dns: { type: rfc2136, … }`), which BIND,
+  Knot, PowerDNS, and most enterprise DNS accept without a vendor API. Keel
+  confirms the record is visible on the primary before the CA is told to
+  validate and removes it afterwards. Wildcard vhosts and `certificates:`
+  entries are accepted on such issuers.
+- **Wildcard vhosts.** `host: "*.example.com"` now matches one label below
+  it (`api.example.com`, not `a.b.example.com`) for routing, cache rules,
+  access-log labels, and certificate selection by SNI, in the order exact →
+  wildcard → `"*"`. Previously such a host only matched the literal string.
+- **`keel --version` and `keelctl --version`.**
+
 ---
 
 ## [0.9.0] — 2026-09-09
