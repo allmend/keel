@@ -60,7 +60,9 @@ Metrics expose backend addresses, pool and vhost names, and traffic volumes. Acc
 
 ## Remote control requires mTLS
 
-The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the node's control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
+The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
+
+In cluster mode the control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is held in memory; on each node the key is written to `ca_dir/ca.key` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
 
 The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but does not replace mTLS.
 
@@ -86,7 +88,8 @@ Workers drop from root to `keel.user` / `keel.group` and exit rather than contin
 - Each worker drops supplementary groups (`setgroups([])`), then gid, then uid, in that order, and exits if any step fails while running as root.
 - After the drop, the worker confirms it is no longer root and exits if it somehow still is.
 - A process already running unprivileged (typical in dev) skips the drop.
-- Cluster mode is a single process without a master. Started as root on Linux, it binds its listeners (and ICMP sockets) itself, drops to `keel.user`, and then starts the data plane, the Raft peer listener, and the control plane unprivileged. The cluster port and the control-CA and ACME directories must therefore be usable by `keel.user`.
+- Before dropping, the root process creates the directories Keel writes to afterwards — the control-socket directory, the control CA directory, and the ACME storage — and assigns them to `keel.user`, so a root-owned default such as `/var/lib/keel` in the container image does not break them.
+- Cluster mode is a single process without a master. Started as root on Linux, it binds its listeners (and ICMP sockets) itself, drops to `keel.user`, and then starts the data plane, the Raft peer listener, and the control plane unprivileged.
 
 ---
 

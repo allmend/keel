@@ -49,22 +49,34 @@ impl BoundListeners {
     }
 }
 
-/// Make the control-socket directory exist and belong to the worker user.
-/// Workers create the control socket and the per-worker fd hand-off socket
-/// there after dropping privileges; a root-owned directory (the container
-/// image default) would make both fail. Only called as root.
+/// Make every directory Keel writes to at runtime exist and belong to the
+/// worker user: the control-socket directory (control socket, fd hand-off
+/// sockets), the control CA directory, and the ACME storage. All are
+/// written after the privilege drop; a root-owned directory (the container
+/// image default) would make each of them fail. Only called as root.
 fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     use nix::unistd::{chown, Group, User};
 
-    let dir = std::path::Path::new(&cfg.keel.control_socket)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/var/run/keel"));
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("master: cannot create {}", dir.display()))?;
     let uid = User::from_name(&cfg.keel.user)?.map(|u| u.uid);
     let gid = Group::from_name(&cfg.keel.group)?.map(|g| g.gid);
-    chown(dir, uid, gid).with_context(|| format!("master: cannot chown {}", dir.display()))?;
-    info!(dir = %dir.display(), user = cfg.keel.user, "master: runtime directory ready");
+
+    let socket_dir = std::path::Path::new(&cfg.keel.control_socket)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/run/keel"));
+    let mut dirs = vec![socket_dir];
+    if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.as_ref()) {
+        dirs.push(std::path::PathBuf::from(&remote.ca_dir));
+    }
+    if let Some(acme) = cfg.acme_effective() {
+        dirs.push(std::path::PathBuf::from(&acme.storage));
+    }
+    for dir in dirs {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("master: cannot create {}", dir.display()))?;
+        chown(&dir, uid, gid).with_context(|| format!("master: cannot chown {}", dir.display()))?;
+        info!(dir = %dir.display(), user = cfg.keel.user, "master: runtime directory ready");
+    }
     Ok(())
 }
 
