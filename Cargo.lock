@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "keel"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "keel-control"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "keelctl"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
