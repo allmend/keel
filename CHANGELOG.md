@@ -25,6 +25,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `tls_handshake` and `upstream_tls`. A client that closes without TLS
   close_notify is logged as a normal end.
 
+### Fixed
+
+- **Cluster mode drops privileges.** A cluster node started as root stayed
+  root for its whole life: cluster mode bypasses the master/worker model, and
+  nothing dropped. It now binds its listeners and ICMP sockets as root,
+  drops to `keel.user`, and starts everything else unprivileged, the same
+  outcome as standalone workers.
+
 ### Changed
 
 - **`proxy_protocol: true` is a startup error.** The option was accepted and

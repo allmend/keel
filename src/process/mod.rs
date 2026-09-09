@@ -68,8 +68,32 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Bind every configured listener in the master, while still root.
-fn bind_listeners(cfg: &Config) -> Result<BoundListeners> {
+/// Single-process modes (cluster) have no master to bind for them. When
+/// started as root on Linux, bind everything in-process, drop privileges,
+/// and hand the sockets back as if a master had passed them down. Returns
+/// `None` when nothing was bound (unprivileged, or not Linux), in which
+/// case the process binds its own listeners as before.
+pub fn take_privileges_single_process(cfg: &Config) -> Result<Option<proxy::WorkerSockets>> {
+    if !(cfg!(target_os = "linux") && nix::unistd::getuid().is_root()) {
+        info!("not root (or not Linux) — running as the invoking user");
+        return Ok(None);
+    }
+    preflight_privileges(&cfg.keel.user, &cfg.keel.group)?;
+    prepare_runtime_dir(cfg)?;
+    let bound = bind_listeners(cfg, 1)?;
+    drop_privileges(&cfg.keel.user, &cfg.keel.group);
+    let sockets = bound.for_worker(0, cfg)?;
+    // The raw TCP fds in `sockets` belong to `bound`; keep them open for the
+    // life of the process.
+    std::mem::forget(bound);
+    Ok(Some(sockets))
+}
+
+/// Bind every configured listener while still root. `per_listener` UDP and
+/// ICMP sockets are opened per listener — one per worker in master mode,
+/// one in single-process mode (an unread SO_REUSEPORT socket would swallow
+/// its share of datagrams).
+fn bind_listeners(cfg: &Config, per_listener: usize) -> Result<BoundListeners> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::ToSocketAddrs;
 
@@ -77,7 +101,7 @@ fn bind_listeners(cfg: &Config) -> Result<BoundListeners> {
     let mut udp = Vec::new();
     let (mut icmp4, mut icmp6) = (Vec::new(), Vec::new());
     if crate::health::icmp::needed(cfg) {
-        for _ in 0..cfg.keel.workers {
+        for _ in 0..per_listener {
             icmp4.push(crate::health::icmp::open_socket(false).context("master: cannot open ICMPv4 socket")?);
             match crate::health::icmp::open_socket(true) {
                 Ok(s) => icmp6.push(s),
@@ -89,7 +113,7 @@ fn bind_listeners(cfg: &Config) -> Result<BoundListeners> {
     }
     for l in &cfg.listeners {
         if l.udp_pool.is_some() {
-            let socks = (0..cfg.keel.workers)
+            let socks = (0..per_listener)
                 .map(|_| crate::udp::bind_reuseport(&l.address))
                 .collect::<std::io::Result<Vec<_>>>()
                 .with_context(|| format!("master: cannot bind UDP listener {}", l.address))?;
@@ -146,7 +170,7 @@ pub fn run_master(cfg: Config) -> Result<()> {
     // unprivileged dev runs on any platform keep binding in the worker.
     let bound = if cfg!(target_os = "linux") && nix::unistd::getuid().is_root() {
         prepare_runtime_dir(&cfg)?;
-        Some(bind_listeners(&cfg)?)
+        Some(bind_listeners(&cfg, cfg.keel.workers)?)
     } else {
         info!("master: not root (or not Linux) — workers bind their own listeners");
         None

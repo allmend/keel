@@ -204,6 +204,10 @@ fn run_server(cli: Cli) -> Result<()> {
 }
 
 fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
+    // Cluster mode is one process: bind as root, then drop, before anything
+    // else (cluster port, CA files, Raft) is set up.
+    let sockets = process::take_privileges_single_process(&cfg)?;
+
     let cluster_cfg = cfg.cluster.as_ref();
     let cluster_addr = cluster_cfg
         .map(|c| c.addr.clone())
@@ -226,7 +230,7 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
     };
 
     let (handle, svc) = cluster::new_cluster(opts);
-    proxy::run_cluster(&cfg, handle, svc)
+    proxy::run_cluster(&cfg, handle, svc, sockets)
 }
 
 fn derive_node_id(addr: &str) -> u64 {

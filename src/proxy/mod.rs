@@ -1170,11 +1170,17 @@ pub fn run_cluster(
     cfg: &Config,
     cluster: crate::cluster::ClusterHandle,
     cluster_svc: crate::cluster::ClusterService,
+    inherited: Option<WorkerSockets>,
 ) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
+    let mut inherited = inherited;
 
-    let mut server = new_server(cfg, None);
+    let mut server = new_server(cfg, inherited.as_ref());
+    send_inherited_fds(inherited.as_ref());
     server.bootstrap();
+    if let Some(w) = inherited.as_mut() {
+        crate::health::icmp::init(crate::health::icmp::IcmpSockets { v4: w.icmp4.take(), v6: w.icmp6.take() });
+    }
 
     let pools = match build_pools(cfg) {
         Ok(p) => Arc::new(p),
@@ -1237,7 +1243,7 @@ pub fn run_cluster(
     }
 
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
-    add_udp_services(&mut server, cfg, &pools, &access_logger, None);
+    add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };

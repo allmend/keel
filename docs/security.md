@@ -86,6 +86,7 @@ Workers drop from root to `keel.user` / `keel.group` and exit rather than contin
 - Each worker drops supplementary groups (`setgroups([])`), then gid, then uid, in that order, and exits if any step fails while running as root.
 - After the drop, the worker confirms it is no longer root and exits if it somehow still is.
 - A process already running unprivileged (typical in dev) skips the drop.
+- Cluster mode is a single process without a master. Started as root on Linux, it binds its listeners (and ICMP sockets) itself, drops to `keel.user`, and then starts the data plane, the Raft peer listener, and the control plane unprivileged. The cluster port and the control-CA and ACME directories must therefore be usable by `keel.user`.
 
 ---
 
