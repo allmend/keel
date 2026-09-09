@@ -32,6 +32,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
   ejected for 30s, then re-admitted; the last available backend of a pool
   is never ejected. Shown as `ejected` in `keel status`; metrics
   `keel_backend_ejected`, `keel_backend_ejections_total`.
+
 ### Changed
 
 - **`health_check` is validated strictly.** A field that does not belong to
