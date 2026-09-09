@@ -8,6 +8,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **JWT authentication** (`auth.jwt` on vhosts and routes): HS256/384/512
+  with a shared secret or RS256/384/512 and ES256/384 with a public key
+  PEM; `exp` required, `nbf`, `issuer`, and `audience` checked; 401 with a
+  `WWW-Authenticate` challenge naming the reason; verified claims copied to
+  request headers (`claim_headers`) after stripping client-supplied values.
+  `keel_auth_failures_total{vhost,reason}`.
+
 ---
 
 ## [0.12.0] — 2026-09-09

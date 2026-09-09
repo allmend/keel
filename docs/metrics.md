@@ -46,6 +46,7 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 | `keel_backend_ejections_total` | counter | `pool`, `backend` | Passive ejections |
 | `keel_proxy_protocol_errors_total` | counter | `listener` | Connections or datagrams on a `proxy_protocol` listener rejected for a missing or malformed header |
 | `keel_rate_limited_total` | counter | `vhost` | Requests answered 429 by a `rate_limit` rule |
+| `keel_auth_failures_total` | counter | `vhost`, `reason` | Requests answered 401 by an `auth` rule. Reasons: `missing`, `malformed`, `algorithm`, `signature`, `expired`, `not_yet_valid`, `issuer`, `audience` |
 
 ## TCP (L4) metrics
 

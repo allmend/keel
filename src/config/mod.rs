@@ -368,9 +368,9 @@ impl Config {
                     }
                 }
             }
-            validate_gateway(&format!("vhost '{}'", vhost.host), vhost.rate_limit.as_ref(), vhost.headers.as_ref(), vhost.rewrite.as_ref())?;
+            validate_gateway(&format!("vhost '{}'", vhost.host), vhost.rate_limit.as_ref(), vhost.headers.as_ref(), vhost.rewrite.as_ref(), vhost.auth.as_ref())?;
             for route in &vhost.routes {
-                validate_gateway(&format!("vhost '{}' route '{}'", vhost.host, route.path), route.rate_limit.as_ref(), route.headers.as_ref(), route.rewrite.as_ref())?;
+                validate_gateway(&format!("vhost '{}' route '{}'", vhost.host, route.path), route.rate_limit.as_ref(), route.headers.as_ref(), route.rewrite.as_ref(), route.auth.as_ref())?;
             }
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
@@ -903,7 +903,35 @@ fn validate_gateway(
     rate_limit: Option<&RateLimitConfig>,
     headers: Option<&HeaderRules>,
     rewrite: Option<&RewriteConfig>,
+    auth: Option<&AuthConfig>,
 ) -> Result<()> {
+    if let Some(a) = auth {
+        let j = &a.jwt;
+        let sources = [j.secret.is_some(), j.secret_file.is_some(), j.public_key.is_some()].iter().filter(|b| **b).count();
+        if sources != 1 {
+            anyhow::bail!("{what}: auth.jwt needs exactly one of secret, secret_file, public_key");
+        }
+        if let Some(s) = &j.secret {
+            use base64::Engine;
+            if base64::engine::general_purpose::STANDARD.decode(s.trim()).is_err() {
+                anyhow::bail!("{what}: auth.jwt.secret is not base64");
+            }
+        }
+        for (field, path) in [("secret_file", &j.secret_file), ("public_key", &j.public_key)] {
+            if let Some(p) = path {
+                std::fs::metadata(p).map_err(|e| anyhow::anyhow!("{what}: auth.jwt.{field} '{p}': {e}"))?;
+            }
+        }
+        if http::header::HeaderName::from_bytes(j.header.as_bytes()).is_err() {
+            anyhow::bail!("{what}: auth.jwt.header is not a valid header name");
+        }
+        parse_duration(&j.leeway).map_err(|e| anyhow::anyhow!("{what}: auth.jwt.leeway: {e}"))?;
+        for (claim, header) in &j.claim_headers {
+            if claim.is_empty() || http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                anyhow::bail!("{what}: auth.jwt.claim_headers: '{header}' is not a valid header name for claim '{claim}'");
+            }
+        }
+    }
     if let Some(rl) = rate_limit {
         if rl.requests == 0 {
             anyhow::bail!("{what}: rate_limit.requests must be at least 1");
@@ -1069,6 +1097,65 @@ pub struct Vhost {
     pub headers: Option<HeaderRules>,
     #[serde(default)]
     pub rewrite: Option<RewriteConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+}
+
+/// Authentication before a request may reach the backend.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AuthConfig {
+    pub jwt: JwtConfig,
+}
+
+/// Self-contained JWT validation: the key is configured, nothing is fetched.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct JwtConfig {
+    /// Base64 shared secret for HS256/384/512 — or `secret_file` holding it.
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub secret_file: Option<String>,
+    /// PEM public key (SPKI) for RS256/384/512 or ES256/384.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// Required `iss` claim value.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Value the `aud` claim must equal or contain.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Header carrying `Bearer <token>`.
+    #[serde(default = "default_jwt_header")]
+    pub header: String,
+    /// Clock skew tolerated on `exp` and `nbf`.
+    #[serde(default = "default_jwt_leeway")]
+    pub leeway: String,
+    /// claim name → request header to carry it to the backend.
+    #[serde(default)]
+    pub claim_headers: std::collections::BTreeMap<String, String>,
+}
+
+fn default_jwt_header() -> String { "Authorization".into() }
+fn default_jwt_leeway() -> String { "30s".into() }
+
+impl JwtConfig {
+    /// Decoded shared secret, from `secret` or `secret_file`; `None` when a
+    /// public key is configured instead.
+    pub fn secret_material(&self) -> Result<Option<Vec<u8>>> {
+        use base64::Engine;
+        let b64 = match (&self.secret, &self.secret_file) {
+            (Some(s), _) => s.trim().to_owned(),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read secret_file {path}: {e}"))?
+                .trim()
+                .to_owned(),
+            (None, None) => return Ok(None),
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|_| anyhow::anyhow!("jwt secret is not base64"))?;
+        Ok(Some(bytes))
+    }
 }
 
 /// Per-client-IP token bucket: `requests` per `per`, with `burst` tokens
@@ -1163,6 +1250,8 @@ pub struct Route {
     pub headers: Option<HeaderRules>,
     #[serde(default)]
     pub rewrite: Option<RewriteConfig>,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1667,6 +1756,18 @@ mod tests {
         assert!(e("    headers: { response: { set: { X-A: \"a\\nb\" } } }\n").contains("not allowed in a header"));
         assert!(e("    rewrite: { strip_prefix: api }\n").contains("starting with '/'"));
         assert!(e("    rewrite: {}\n").contains("needs strip_prefix or add_prefix"));
+
+        let cfg = gw("    auth:\n      jwt: { secret: c2VjcmV0, issuer: https://i.test, claim_headers: { sub: X-Auth-Subject } }\n");
+        cfg.validate().expect("valid jwt");
+        let j = &cfg.vhosts[0].auth.as_ref().unwrap().jwt;
+        assert_eq!(j.header, "Authorization");
+        assert_eq!(j.leeway, "30s");
+        assert_eq!(j.secret_material().unwrap().unwrap(), b"secret");
+        assert!(e("    auth:\n      jwt: {}\n").contains("exactly one of"));
+        assert!(e("    auth:\n      jwt: { secret: a, public_key: /k.pem }\n").contains("exactly one of"));
+        assert!(e("    auth:\n      jwt: { secret: '***' }\n").contains("not base64"));
+        assert!(e("    auth:\n      jwt: { secret: c2VjcmV0, claim_headers: { sub: 'bad name' } }\n").contains("claim_headers"));
+        assert!(e("    auth:\n      jwt: { public_key: /nonexistent/jwt.pem }\n").contains("auth.jwt.public_key"));
     }
 
     #[test]

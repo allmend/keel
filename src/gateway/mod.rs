@@ -7,6 +7,7 @@
 //! obtain up to N times the configured rate across the process group; see
 //! docs/gateway.md.
 
+pub mod jwt;
 pub mod ratelimit;
 
 use crate::config::{HeaderOps, RewriteConfig};

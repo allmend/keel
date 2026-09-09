@@ -236,6 +236,7 @@ vhosts:
 | `rate_limit` | object | none | Per-client-IP token bucket: `requests`, `per` (default `1s`), `burst` (default `requests`). Also per route. See [API gateway](gateway.md) |
 | `headers` | object | none | `request` and `response` blocks, each with `set` (map) and `remove` (list). Also per route |
 | `rewrite` | object | none | `strip_prefix`, `add_prefix` applied to the backend path. Also per route |
+| `auth.jwt` | object | none | JWT validation: one of `secret`, `secret_file`, `public_key`; optional `issuer`, `audience`, `header`, `leeway`, `claim_headers`. Also per route. See [API gateway](gateway.md#authentication-jwt) |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
 

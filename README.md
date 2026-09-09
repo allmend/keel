@@ -42,7 +42,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Config hot reload (SIGHUP or `keel config reload`)
 - TLS certificate hot-swap
 - Two-tier HTTP cache (memory L1 + disk L2)
-- Gateway rules per vhost or route — per-IP rate limiting, request/response header set/remove, path prefix rewriting
+- Gateway rules per vhost or route — per-IP rate limiting, JWT authentication (HS/RS/ES, claims to headers), request/response header set/remove, path prefix rewriting
 - Prometheus metrics (`/metrics`)
 - NDJSON access logs, per-vhost
 - conf.d config splitting — vhosts, pools, and certificates per team file
@@ -52,7 +52,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 - keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: gateway authentication (JWT), HTTP/3.
+In the roadmap: HTTP/3.
 
 ---
 

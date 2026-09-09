@@ -1,6 +1,6 @@
 use crate::config::{
-    Config, DefaultAction, ForwardedHeadersConfig, HeaderRules, RateLimitConfig, RewriteConfig,
-    VhostCacheConfig,
+    AuthConfig, Config, DefaultAction, ForwardedHeadersConfig, HeaderRules, RateLimitConfig,
+    RewriteConfig, VhostCacheConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,11 +14,27 @@ pub struct GatewayRules {
     pub rate_limit: Option<RateLimitConfig>,
     pub headers: Option<HeaderRules>,
     pub rewrite: Option<RewriteConfig>,
+    pub auth: Option<AuthConfig>,
+    /// Built once from `auth.jwt`; `None` when there is no auth rule.
+    pub jwt: Option<Arc<crate::gateway::jwt::JwtVerifier>>,
 }
 
 impl GatewayRules {
     pub fn is_empty(&self) -> bool {
-        self.rate_limit.is_none() && self.headers.is_none() && self.rewrite.is_none()
+        self.rate_limit.is_none() && self.headers.is_none() && self.rewrite.is_none() && self.auth.is_none()
+    }
+
+    fn with_verifier(mut self) -> Self {
+        // Key files were validated to exist at load; a read failure here is
+        // logged and the rule refuses every request rather than passing them.
+        self.jwt = self.auth.as_ref().map(|a| match crate::gateway::jwt::JwtVerifier::from_config(&a.jwt) {
+            Ok(v) => Arc::new(v),
+            Err(e) => {
+                tracing::error!(rule = self.id, error = %e, "jwt: cannot load key — requests on this rule are refused");
+                Arc::new(crate::gateway::jwt::JwtVerifier::refusing())
+            }
+        });
+        self
     }
 }
 
@@ -71,7 +87,9 @@ impl RoutingTable {
                             rate_limit: vhost.rate_limit.clone(),
                             headers: vhost.headers.clone(),
                             rewrite: vhost.rewrite.clone(),
-                        }),
+                            auth: vhost.auth.clone(),
+                            jwt: None,
+                        }.with_verifier()),
                     });
                 }
             } else {
@@ -85,7 +103,9 @@ impl RoutingTable {
                             rate_limit: r.rate_limit.clone().or_else(|| vhost.rate_limit.clone()),
                             headers: r.headers.clone().or_else(|| vhost.headers.clone()),
                             rewrite: r.rewrite.clone().or_else(|| vhost.rewrite.clone()),
-                        }),
+                            auth: r.auth.clone().or_else(|| vhost.auth.clone()),
+                            jwt: None,
+                        }.with_verifier()),
                     });
                 }
             }
@@ -282,6 +302,7 @@ mod tests {
             rate_limit: None,
             headers: None,
             rewrite: None,
+            auth: None,
         }
     }
 
@@ -323,8 +344,8 @@ mod tests {
                 host: "example.com".into(),
                 pool: None,
                 routes: vec![
-                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
-                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, rate_limit: None, headers: None, rewrite: None, auth: None },
+                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None, auth: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -334,6 +355,7 @@ mod tests {
                 rate_limit: None,
                 headers: None,
                 rewrite: None,
+                auth: None,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -375,8 +397,9 @@ mod tests {
                         rate_limit: None,
                         headers: None,
                         rewrite: None,
+                        auth: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None, auth: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -391,6 +414,7 @@ mod tests {
                 rate_limit: None,
                 headers: None,
                 rewrite: None,
+                auth: None,
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -421,8 +445,9 @@ mod tests {
                         rate_limit: None,
                         headers: None,
                         rewrite: None,
+                        auth: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, rate_limit: None, headers: None, rewrite: None, auth: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -432,6 +457,7 @@ mod tests {
                 rate_limit: None,
                 headers: None,
                 rewrite: None,
+                auth: None,
             }],
             [pool("api"), pool("web")].into(),
         );
@@ -483,8 +509,9 @@ mod tests {
                 rate_limit: Some(crate::config::RateLimitConfig { requests: 1, per: "1s".into(), burst: None }),
                 headers: None,
                 rewrite: Some(crate::config::RewriteConfig { strip_prefix: Some("/v2".into()), add_prefix: None }),
+                auth: None,
             },
-            CfgRoute { path: "/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None },
+            CfgRoute { path: "/".into(), pool: "api".into(), cache: None, rate_limit: None, headers: None, rewrite: None, auth: None },
         ];
         let cfg = make_config(vec![v, vhost("plain.example.com", "api")], HashMap::from([pool("api")]));
         let table = RoutingTable::build(&cfg);

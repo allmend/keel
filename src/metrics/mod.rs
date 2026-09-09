@@ -147,6 +147,15 @@ pub static RATE_LIMITED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register keel_rate_limited_total")
 });
 
+pub static AUTH_FAILURES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_auth_failures_total",
+        "Requests answered 401 by an auth rule",
+        &["vhost", "reason"]
+    )
+    .expect("register keel_auth_failures_total")
+});
+
 pub static PROXY_PROTOCOL_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "keel_proxy_protocol_errors_total",
@@ -349,6 +358,10 @@ pub fn record_ejection(pool: &str, backend: &str, ejected: bool) {
     if ejected {
         BACKEND_EJECTIONS_TOTAL.with_label_values(&[pool, backend]).inc();
     }
+}
+
+pub fn record_auth_failure(vhost: &str, reason: &str) {
+    AUTH_FAILURES_TOTAL.with_label_values(&[vhost, reason]).inc();
 }
 
 pub fn record_rate_limited(vhost: &str) {

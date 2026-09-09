@@ -57,6 +57,8 @@ pub struct ProxyCtx {
     user_agent: Option<String>,
     /// Gateway rules of the matched route, resolved in `request_filter`.
     gateway: Option<Arc<crate::vhost::GatewayRules>>,
+    /// Verified JWT claims to forward as headers.
+    claim_headers: Vec<(String, String)>,
 }
 
 // Proxy implementation
@@ -164,6 +166,7 @@ impl ProxyHttp for KProxy {
             protocol: String::new(),
             user_agent: None,
             gateway: None,
+            claim_headers: Vec::new(),
         }
     }
 
@@ -264,6 +267,39 @@ impl ProxyHttp for KProxy {
                         let body = "rate limited\n";
                         let mut resp = pingora::http::ResponseHeader::build(429, Some(3))?;
                         resp.insert_header("retry-after", retry.to_string().as_str())?;
+                        resp.insert_header("content-type", "text/plain")?;
+                        resp.insert_header("content-length", body.len().to_string())?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session.write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true).await?;
+                        return Ok(true);
+                    }
+                }
+            }
+            if let (Some(auth), Some(verifier)) = (&rules.auth, &rules.jwt) {
+                let token = session
+                    .req_header()
+                    .headers
+                    .get(auth.jwt.header.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(crate::gateway::jwt::bearer_token);
+                let outcome = match token {
+                    None => Err(crate::gateway::jwt::Refusal::Missing),
+                    Some(t) => verifier.verify(t, crate::gateway::jwt::now_secs()),
+                };
+                match outcome {
+                    Ok(claims) => ctx.claim_headers = claims,
+                    Err(refusal) => {
+                        let label = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
+                        crate::metrics::record_auth_failure(&label, refusal.as_str());
+                        ctx.vhost = label;
+                        ctx.host_header = host.clone();
+                        let body = "unauthorized\n";
+                        let challenge = match refusal {
+                            crate::gateway::jwt::Refusal::Missing => "Bearer".to_owned(),
+                            r => format!("Bearer error=\"invalid_token\", error_description=\"{}\"", r.as_str()),
+                        };
+                        let mut resp = pingora::http::ResponseHeader::build(401, Some(3))?;
+                        resp.insert_header("www-authenticate", challenge.as_str())?;
                         resp.insert_header("content-type", "text/plain")?;
                         resp.insert_header("content-length", body.len().to_string())?;
                         session.write_response_header(Box::new(resp), false).await?;
@@ -408,6 +444,19 @@ impl ProxyHttp for KProxy {
             }
             if let Some(h) = &rules.headers {
                 crate::gateway::apply_request_ops(upstream_request, &h.request);
+            }
+            // Claim headers always replace whatever the client sent under the
+            // same name, so a backend can trust them. The token header itself
+            // is left in place: backends may want it.
+            if rules.jwt.is_some() {
+                if let Some(auth) = &rules.auth {
+                    for (_, header) in &auth.jwt.claim_headers {
+                        upstream_request.remove_header(header);
+                    }
+                }
+                for (header, value) in &ctx.claim_headers {
+                    let _ = upstream_request.insert_header(header.clone(), value.as_str());
+                }
             }
         }
         Ok(())
