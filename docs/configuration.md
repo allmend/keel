@@ -63,8 +63,8 @@ listeners:
     proxy_protocol: true
   - address: 0.0.0.0:5432            # L4 — raw TCP spliced to a pool
     tcp_pool: postgres
-  - address: 0.0.0.0:53              # L4 — UDP datagrams forwarded to a pool
-    udp_pool: dns
+  - address: 0.0.0.0:53              # L4 — UDP datagrams forwarded to the named pool
+    udp_pool: resolvers
 ```
 
 | Field | Type | Default | Notes |
