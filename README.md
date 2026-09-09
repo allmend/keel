@@ -89,8 +89,8 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ### Container image
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.12.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.12.0
+docker pull ghcr.io/allmend/keel:0.13.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.13.0
 ```
 
 ### Prebuilt binaries
@@ -231,7 +231,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is at v0.12.0, alpha quality. Core proxy, TLS + ACME, clustering, caching, TCP and UDP (L4) proxying, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.13.0, alpha quality. Core proxy, TLS + ACME, clustering, caching, TCP and UDP (L4) proxying, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 
