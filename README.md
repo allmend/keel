@@ -5,23 +5,20 @@
   </picture>
 </p>
 
-> **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not recommended for production yet. Feedback welcome.
+<p align="center"><sub>Made in Sweden 🇸🇪 with Claude &amp; Love</sub></p>
 
----
+<p align="center">
+  <a href="https://github.com/allmend/keel/releases"><img src="https://img.shields.io/github/v/release/allmend/keel?sort=semver&label=release&color=6366f1" alt="Release"></a>
+  <a href="https://github.com/allmend/keel/actions"><img src="https://img.shields.io/github/actions/workflow/status/allmend/keel/release.yml?label=build" alt="Build"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
+  <img src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white" alt="Rust">
+</p>
 
-## What is Keel?
+> ⚠️ **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not production-ready yet — feedback welcome.
 
-A fast, modern, self-hosted load balancer, reverse proxy, and API gateway written in Rust.
+Keel is a fast, modern, self-hosted load balancer, reverse proxy, and API gateway written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, runtime pool management, automatic TLS, true config hot-swap — from a single static binary.
 
-- **Live backend drain** — gracefully remove a backend without dropping connections
-- **Runtime pool management** — no reload required to change backend state
-- **Automatic TLS** — ACME v2 (any compatible CA), issuance to renewal, no restarts
-- **Balanced workers** — async multithreaded (Tokio), CPU balanced across cores
-- **True config hot-swap** — SIGHUP reloads config and TLS certs without restart
-- **Clustering built in** — Raft consensus, mTLS peer mesh, distributed drain, replicated certificates
-- **Written in Rust** — memory safe, single static binary, minimal attack surface
-
-Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allmend/keel)
+Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
 ---
 
@@ -33,7 +30,7 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Load balancing — round robin, weighted, consistent hash, least-conn
 - TCP (L4) passthrough proxying — `tcp_pool` listeners, end-to-end TLS between client and backend
 - TLS termination with per-vhost certificates
-- **ACME / automatic TLS** — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
+- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Default vhost action — redirect or static response for unknown hosts, no pool needed
 - Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
@@ -49,35 +46,29 @@ Self-hostable · Apache 2.0 · [github.com/allmend/keel](https://github.com/allm
 - Distributed config push via `keel config push`
 - Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
-- **keelctl** — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
+- keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
 In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, UDP load balancing, PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
-## Quick Start
+## Tech stack
 
-### Container / prebuilt binaries
+Rust · [Pingora](https://github.com/cloudflare/pingora) · Tokio · rustls + OpenSSL · [openraft](https://github.com/databendlabs/openraft) · Prometheus
 
-Run the container:
+Single static binary. Async multithreaded, CPU balanced across cores. Minimal attack surface.
 
-```bash
-docker pull ghcr.io/allmend/keel:0.5.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.5.0
-```
+---
 
-Or download a Linux binary (x86_64 or arm64) from the
-[releases page](https://github.com/allmend/keel/releases) — each release
-includes the binary, an example config, and `SHA256SUMS`.
+## Quick start
 
-### Docker Compose (recommended for trying it out)
+The fastest way to try Keel — proxy `:8080` across three test backends with Docker Compose:
 
 ```bash
 git clone https://github.com/allmend/keel
 cd keel
 docker compose up --build
 
-# Keel is now proxying :8080 → three test backends
 curl http://localhost:8080          # round-robins across backend1/2/3
 curl http://localhost:9090/metrics  # Prometheus metrics
 
@@ -86,6 +77,23 @@ docker compose exec keel keel status
 docker compose exec keel keel backend list --pool web
 docker compose exec keel keel backend drain backend1:80 --wait
 ```
+
+---
+
+## Install
+
+### Container image
+
+```bash
+docker pull ghcr.io/allmend/keel:0.5.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.5.0
+```
+
+### Prebuilt binaries
+
+Download a Linux binary (x86_64 or arm64) from the
+[releases page](https://github.com/allmend/keel/releases) — each release
+includes the binary, an example config, and `SHA256SUMS`.
 
 ### Build from source
 
@@ -104,7 +112,11 @@ cargo build --release
 ./target/release/keel --config keel.yaml
 ```
 
-### Minimal config
+---
+
+## Configuration
+
+Minimal config — listen on port 80, proxy to two backends:
 
 ```yaml
 # keel.yaml
@@ -152,14 +164,14 @@ side), renewal tuning, and certificates for TCP/passthrough backends.
 ```bash
 keel status                              # node status + pool overview
 keel backend list --pool web             # list backends and connection counts
-keel backend drain 10.0.0.1:8080 --wait # drain a backend, stream live status
+keel backend drain 10.0.0.1:8080 --wait  # drain a backend, stream live status
 keel config reload                       # reload config from disk (same as SIGHUP)
 keel config push keel.yaml               # push config to entire cluster via Raft
 keel cluster status                      # cluster membership and Raft roles
 keel cluster stepdown                    # gracefully leave the cluster (--force to override quorum guard)
 ```
 
-The same commands work remotely with **keelctl** over mTLS — create credentials
+The same commands work remotely with keelctl over mTLS — create credentials
 once on the node, then control the node or cluster from a workstation or CI:
 
 ```bash
@@ -213,6 +225,12 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 ## Status
 
 Keel is at v0.5.0, alpha quality. Core proxy, TLS + ACME, clustering, and caching are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. Branch off `main`, use [Conventional Commits](https://www.conventionalcommits.org), and keep `main` releasable.
 
 ---
 
