@@ -10,7 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.6.0] — 2026-09-09
+## [0.7.0] — 2026-09-09
 
 ### Added
 
@@ -32,6 +32,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
   ejected for 30s, then re-admitted; the last available backend of a pool
   is never ejected. Shown as `ejected` in `keel status`; metrics
   `keel_backend_ejected`, `keel_backend_ejections_total`.
+### Changed
+
+- **`health_check` is validated strictly.** A field that does not belong to
+  the chosen `type` (for example `path` on `tcp`), an unknown `type`, a
+  malformed duration, or a zero threshold is a startup error. Previously
+  such fields were ignored and malformed durations fell back to defaults.
+
+---
+
+## [0.6.0] — 2026-09-09
+
+### Added
+
 - **UDP (L4) load balancing** — `udp_pool` on a listener forwards datagrams
   to an ordinary pool. One flow per client `ip:port`, pinned to a backend
   until idle for `keel.udp_flow_timeout_seconds` (default 30). Flows share
@@ -47,13 +60,6 @@ Versioning: [Semantic Versioning](https://semver.org/).
   backend), and `keel_tcp_errors_total` (per pool and reason).
 - **Metrics reference** — `docs/metrics.md` lists every exposed metric with
   labels, types, and example queries.
-
-### Changed
-
-- **`health_check` is validated strictly.** A field that does not belong to
-  the chosen `type` (for example `path` on `tcp`), an unknown `type`, a
-  malformed duration, or a zero threshold is a startup error. Previously
-  such fields were ignored and malformed durations fell back to defaults.
 
 ### Fixed
 
@@ -363,7 +369,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/allmend/keel/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/allmend/keel/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/allmend/keel/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/allmend/keel/compare/v0.3.0...v0.4.0
