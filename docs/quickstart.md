@@ -48,6 +48,7 @@ Check that the request reaches your backend and returns a response.
 
 - [Configuration reference](configuration.md) — full schema for all sections
 - [Virtual hosts](virtual-hosts.md) — host-based routing, TLS, path routing
+- [Automatic TLS (ACME)](acme.md) — Let's Encrypt / ACME v2 certificates and renewal
 - [Load balancing](load-balancing.md) — algorithms, health checks, backend drain
 - [TCP proxying](tcp-proxying.md) — L4 passthrough for databases and TLS-on-connect services
 - [Caching](caching.md) — memory and disk cache
@@ -55,3 +56,5 @@ Check that the request reaches your backend and returns a response.
 - [CLI reference](cli.md) — `keel` subcommands
 - [Remote control](keelctl.md) — keelctl over mTLS from a workstation or CI
 - [Access logging](access-logging.md) — NDJSON request logs
+- [Metrics](metrics.md) — Prometheus metrics reference
+- [Security](security.md) — security properties and operator checklist
