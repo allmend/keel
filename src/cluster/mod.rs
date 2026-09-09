@@ -132,6 +132,8 @@ pub struct ClusterHandle {
     pub certs_rx: watch::Receiver<crate::cluster::types::CertMap>,
     /// Current replicated HTTP-01 challenge map; updated on commit and snapshot.
     pub challenges_rx: watch::Receiver<crate::cluster::types::ChallengeMap>,
+    /// The cluster-wide control CA, once committed; updated on commit and snapshot.
+    pub control_ca_rx: watch::Receiver<crate::cluster::types::ControlCaPair>,
     /// mTLS client config for peer RPCs (set together with `raft`). Used by the
     /// control plane to forward commands (e.g. stepdown) to the leader.
     pub client_tls: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
@@ -511,6 +513,7 @@ pub struct ClusterService {
     config_tx: Arc<watch::Sender<Option<String>>>,
     certs_tx: Arc<watch::Sender<crate::cluster::types::CertMap>>,
     challenges_tx: Arc<watch::Sender<crate::cluster::types::ChallengeMap>>,
+    control_ca_tx: Arc<watch::Sender<crate::cluster::types::ControlCaPair>>,
 }
 
 #[async_trait]
@@ -566,6 +569,7 @@ impl ClusterService {
         sm.set_config_tx(Arc::clone(&self.config_tx));
         sm.set_certs_tx(Arc::clone(&self.certs_tx));
         sm.set_challenges_tx(Arc::clone(&self.challenges_tx));
+        sm.set_control_ca_tx(Arc::clone(&self.control_ca_tx));
 
         let log_store = LogStore::default();
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
@@ -699,16 +703,26 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let (challenges_tx, challenges_rx) =
         watch::channel(crate::cluster::types::ChallengeMap::new());
     let challenges_tx = Arc::new(challenges_tx);
+    let (control_ca_tx, control_ca_rx) = watch::channel(None);
+    let control_ca_tx = Arc::new(control_ca_tx);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
         config_rx,
         certs_rx,
         challenges_rx,
+        control_ca_rx,
         client_tls: Arc::clone(&tls_slot),
     };
-    let service =
-        ClusterService { opts, raft_slot, tls_slot, config_tx, certs_tx, challenges_tx };
+    let service = ClusterService {
+        opts,
+        raft_slot,
+        tls_slot,
+        config_tx,
+        certs_tx,
+        challenges_tx,
+        control_ca_tx,
+    };
 
     (handle, service)
 }
@@ -750,6 +764,14 @@ pub async fn push_challenge(
         .await
         .map_err(|e| anyhow::anyhow!("challenge push failed: {e:?}"))?;
     Ok(resp.log_id.index)
+}
+
+/// Commit the control CA so every node serves and issues from the same one.
+pub async fn push_control_ca(raft: &ClusterRaft, cert_pem: String, key_pem: String) -> Result<()> {
+    raft.client_write(ClientRequest::SetControlCa { cert_pem, key_pem })
+        .await
+        .map_err(|e| anyhow::anyhow!("control CA push failed: {e:?}"))?;
+    Ok(())
 }
 
 /// Retract a challenge token after its order completes (pass or fail).

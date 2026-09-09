@@ -25,6 +25,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `tls_handshake` and `upstream_tls`. A client that closes without TLS
   close_notify is logged as a normal end.
 
+### Added
+
+- **Control CA replicated through Raft.** The leader publishes its control
+  CA; every node, including late joiners, installs it into `ca_dir` and
+  re-keys its remote listener without restart. One keelconfig works against
+  every node and `keel credentials create` works on any node.
+
 ### Fixed
 
 - **Cluster mode drops privileges.** A cluster node started as root stayed

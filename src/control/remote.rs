@@ -4,11 +4,17 @@
 //! log. `control.remote.allow` optionally restricts accepted source CIDRs;
 //! source IPs are unreliable behind NAT / kube-proxy, so the restriction
 //! narrows exposure but never replaces mTLS.
+//!
+//! In cluster mode the control CA is replicated through the Raft log: the
+//! leader publishes its CA once, every node writes it into its own `ca_dir`
+//! and re-keys its listener, so one keelconfig authenticates to all nodes
+//! and `keel credentials create` works on any of them.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use ipnet::IpNet;
 use rustls_pemfile::{certs, private_key};
@@ -47,9 +53,18 @@ impl RemoteControlServer {
             .collect::<Result<_>>()?;
 
         let ca = ControlCa::load_or_generate(&self.cfg.ca_dir)?;
-        let (server_cert, server_key) = ca.issue_server()?;
-        let tls = build_server_tls(&server_cert, &server_key, &ca.ca_cert_pem)?;
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        // Swapped when the cluster's CA replaces the local one; each accept
+        // reads the current config.
+        let tls = Arc::new(ArcSwap::from(server_tls_for(&ca)?));
+        if let Some(cluster) = &self.cluster {
+            tokio::spawn(sync_control_ca(
+                cluster.clone(),
+                self.cfg.ca_dir.clone(),
+                Arc::clone(&tls),
+                (ca.ca_cert_pem.clone(), ca.ca_key_pem.clone()),
+                shutdown.clone(),
+            ));
+        }
 
         let listener = TcpListener::bind(&self.cfg.address)
             .await
@@ -67,7 +82,7 @@ impl RemoteControlServer {
                         warn!(peer = %peer, "control: connection rejected by allow list");
                         continue;
                     }
-                    let acceptor = acceptor.clone();
+                    let acceptor = tokio_rustls::TlsAcceptor::from(tls.load_full());
                     let pools = Arc::clone(&self.pools);
                     let started_at = self.started_at;
                     let cluster = self.cluster.clone();
@@ -93,6 +108,71 @@ impl RemoteControlServer {
             }
         }
         Ok(())
+    }
+}
+
+/// Server TLS for the listener: a fresh server certificate from `ca`, and
+/// `ca` as the only trusted client issuer.
+fn server_tls_for(ca: &ControlCa) -> Result<Arc<rustls::ServerConfig>> {
+    let (server_cert, server_key) = ca.issue_server()?;
+    build_server_tls(&server_cert, &server_key, &ca.ca_cert_pem)
+}
+
+/// Keep this node's control CA equal to the cluster's. The leader publishes
+/// its local CA when the log holds none; every node adopts what the log
+/// holds, replacing its local files and re-keying the listener. Raft is the
+/// source of truth once a CA is committed: two nodes that started with
+/// different local CAs converge on the leader's.
+async fn sync_control_ca(
+    cluster: crate::cluster::ClusterHandle,
+    ca_dir: String,
+    tls: Arc<ArcSwap<rustls::ServerConfig>>,
+    mut local: (String, String),
+    mut shutdown: pingora::server::ShutdownWatch,
+) {
+    let mut rx = cluster.control_ca_rx.clone();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    loop {
+        let replicated = rx.borrow_and_update().clone();
+        match replicated {
+            Some((cert_pem, key_pem)) if cert_pem != local.0 => {
+                match ControlCa::install(&ca_dir, &cert_pem, &key_pem).and_then(|ca| server_tls_for(&ca)) {
+                    Ok(cfg) => {
+                        tls.store(cfg);
+                        info!(
+                            ca_dir,
+                            "control: adopted the cluster control CA; credentials issued by \
+                             this node's previous CA no longer authenticate"
+                        );
+                        local = (cert_pem, key_pem);
+                    }
+                    Err(e) => error!(error = %format!("{e:#}"), "control: cannot install cluster control CA"),
+                }
+            }
+            Some(_) => {}
+            None => {
+                // Nothing committed yet: only the leader publishes, so the
+                // cluster converges on one CA instead of racing.
+                if let Some(raft) = cluster.raft().await {
+                    let m = raft.metrics().borrow().clone();
+                    if m.current_leader == Some(m.id) {
+                        match crate::cluster::push_control_ca(&raft, local.0.clone(), local.1.clone()).await {
+                            Ok(()) => info!("control: published this node's control CA to the cluster"),
+                            Err(e) => warn!(error = %e, "control: could not publish control CA"),
+                        }
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() { return; }
+            }
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+        }
     }
 }
 

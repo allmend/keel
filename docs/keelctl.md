@@ -84,17 +84,27 @@ cluster state (`config push`, `stepdown`) are forwarded to the leader
 internally, so the endpoint does not need to be the leader and keeps working
 across failovers.
 
-Each node's control CA lives in its own `ca_dir`, so a keelconfig
-authenticates to the nodes that share that CA. To use one keelconfig for the
-whole cluster, place the same `ca.crt`/`ca.key` in every node's `ca_dir`
-(config management, mounted secret). Automatic control-CA replication via
-Raft is planned.
+The control CA is cluster-wide. When a cluster forms, the leader commits
+its control CA (certificate and key) to the Raft log; every node, including
+one that joins later, writes it into its own `ca_dir` and re-keys its remote
+listener. One keelconfig therefore authenticates to every node, and
+`keel credentials create` produces a valid keelconfig on any node.
+
+A node that starts with a different local CA (for example a node previously
+run standalone) adopts the cluster's and logs that it did; credentials
+issued by its old CA stop working. Create credentials once the cluster is
+up rather than on a node before it joins, for the same reason.
 
 ## Revocation
 
 There is no per-certificate revocation. To invalidate issued credentials,
 delete `ca_dir` and restart Keel — a new CA is generated, all previously
 issued keelconfigs stop working, and each operator needs a new one.
+
+In cluster mode the CA in the Raft log would repopulate a deleted `ca_dir`
+on the next start, and the log is in memory. Rotation therefore means:
+stop every node, delete `ca_dir` on every node, start the cluster again.
+The new leader generates and publishes a fresh CA.
 
 ## Audit log
 

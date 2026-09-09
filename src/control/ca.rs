@@ -19,6 +19,8 @@ pub const SERVER_NAME: &str = "keel-control";
 pub struct ControlCa {
     issuer: Issuer<'static, KeyPair>,
     pub ca_cert_pem: String,
+    /// Kept so cluster mode can replicate the CA through the Raft log.
+    pub ca_key_pem: String,
 }
 
 impl ControlCa {
@@ -33,10 +35,7 @@ impl ControlCa {
                 .with_context(|| format!("read {}", cert_path.display()))?;
             let key_pem = std::fs::read_to_string(&key_path)
                 .with_context(|| format!("read {}", key_path.display()))?;
-            let key = KeyPair::from_pem(&key_pem).context("parse control CA key")?;
-            let issuer = Issuer::from_ca_cert_pem(&cert_pem, key)
-                .map_err(|e| anyhow::anyhow!("parse control CA cert: {e}"))?;
-            return Ok(Self { issuer, ca_cert_pem: cert_pem });
+            return Self::from_pems(cert_pem, key_pem);
         }
 
         use std::os::unix::fs::PermissionsExt;
@@ -50,12 +49,32 @@ impl ControlCa {
         let cert = params.self_signed(&key)?;
         let cert_pem = cert.pem();
 
-        write_file(&key_path, key.serialize_pem().as_bytes(), 0o600)?;
+        let key_pem = key.serialize_pem();
+        write_file(&key_path, key_pem.as_bytes(), 0o600)?;
         write_file(&cert_path, cert_pem.as_bytes(), 0o644)?;
         tracing::info!(dir, "control: control CA generated");
 
         let issuer = Issuer::new(params, key);
-        Ok(Self { issuer, ca_cert_pem: cert_pem })
+        Ok(Self { issuer, ca_cert_pem: cert_pem, ca_key_pem: key_pem })
+    }
+
+    /// Write a CA received from the cluster into `dir`, replacing whatever
+    /// was there, and load it. Same permissions as a generated one.
+    pub fn install(dir: &str, cert_pem: &str, key_pem: &str) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {dir}"))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let ca = Self::from_pems(cert_pem.to_owned(), key_pem.to_owned())?;
+        write_file(&Path::new(dir).join("ca.key"), key_pem.as_bytes(), 0o600)?;
+        write_file(&Path::new(dir).join("ca.crt"), cert_pem.as_bytes(), 0o644)?;
+        Ok(ca)
+    }
+
+    fn from_pems(cert_pem: String, key_pem: String) -> Result<Self> {
+        let key = KeyPair::from_pem(&key_pem).context("parse control CA key")?;
+        let issuer = Issuer::from_ca_cert_pem(&cert_pem, key)
+            .map_err(|e| anyhow::anyhow!("parse control CA cert: {e}"))?;
+        Ok(Self { issuer, ca_cert_pem: cert_pem, ca_key_pem: key_pem })
     }
 
     /// Issue the remote listener's server certificate (in memory only).
@@ -96,4 +115,28 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_then_install_round_trips_through_files() {
+        let dir = std::env::temp_dir().join(format!("keel-ca-{}", std::process::id()));
+        let a = dir.join("a").to_string_lossy().into_owned();
+        let b = dir.join("b").to_string_lossy().into_owned();
+        let generated = ControlCa::load_or_generate(&a).unwrap();
+        let loaded = ControlCa::load_or_generate(&a).unwrap();
+        assert_eq!(generated.ca_cert_pem, loaded.ca_cert_pem, "second load reuses the files");
+
+        // A follower installs the replicated pair and can issue with it.
+        let installed = ControlCa::install(&b, &generated.ca_cert_pem, &generated.ca_key_pem).unwrap();
+        assert_eq!(installed.ca_cert_pem, generated.ca_cert_pem);
+        assert_eq!(std::fs::read_to_string(dir.join("b/ca.key")).unwrap(), generated.ca_key_pem);
+        installed.issue_client("operator").unwrap();
+        // Reloading from the installed files gives the same CA again.
+        assert_eq!(ControlCa::load_or_generate(&b).unwrap().ca_cert_pem, generated.ca_cert_pem);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

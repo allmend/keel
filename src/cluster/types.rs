@@ -32,6 +32,9 @@ pub enum ClientRequest {
     SetChallenge { token: String, key_auth: String },
     /// Retract a challenge token once its order has completed.
     RemoveChallenge { token: String },
+    /// Replicate the control CA (cert + key) so one keelconfig authenticates
+    /// to every node and `keel credentials create` works on any of them.
+    SetControlCa { cert_pem: String, key_pem: String },
 }
 
 /// host → (cert PEM, key PEM). Replicated ACME certificates.
@@ -40,6 +43,9 @@ pub type CertMap = BTreeMap<String, (String, String)>;
 /// token → key authorization. Live HTTP-01 challenges, replicated so any node
 /// can serve them.
 pub type ChallengeMap = BTreeMap<String, String>;
+
+/// (cert PEM, key PEM) of the cluster-wide control CA, once one is committed.
+pub type ControlCaPair = Option<(String, String)>;
 
 /// Response from the state machine after applying a log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,4 +73,7 @@ pub struct ClusterState {
     /// Live HTTP-01 challenge tokens replicated cluster-wide.
     #[serde(default)]
     pub challenges: ChallengeMap,
+    /// The control CA shared by every node's remote control listener.
+    #[serde(default)]
+    pub control_ca: ControlCaPair,
 }
