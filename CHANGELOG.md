@@ -8,6 +8,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] — 2026-09-09
+
+### Added
+
+- **TCP TLS termination and re-encryption** — `tls_mode: terminate |
+  reencrypt` on `tcp_pool` listeners. Keel serves a certificate from its
+  store (a `certificates:` entry or a vhost with `tls`), selected by SNI with
+  `tls_host` as the fallback for clients that send none; `reencrypt` opens a
+  new TLS connection to the backend, verified only with `tls_verify: true`
+  (system roots plus `tls_ca`). `certificates:` entries accept `cert`/`key`
+  paths for bring-your-own certificates. TCP access log entries gain
+  `tls`, `tls_sni`, `tls_version`, `tls_cipher`; new error values
+  `tls_handshake` and `upstream_tls`. A client that closes without TLS
+  close_notify is logged as a normal end.
+
 ### Changed
 
 - **`proxy_protocol: true` is a startup error.** The option was accepted and
@@ -377,7 +394,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/allmend/keel/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/allmend/keel/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/allmend/keel/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/allmend/keel/compare/v0.4.0...v0.5.0

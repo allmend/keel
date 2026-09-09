@@ -28,7 +28,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Virtual host routing (SNI + Host header)
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
-- TCP (L4) passthrough proxying — `tcp_pool` listeners, end-to-end TLS between client and backend
+- TCP (L4) proxying — `tcp_pool` listeners with `passthrough`, `terminate`, and `reencrypt` TLS modes; certificates from ACME or files, SNI selection, optional backend verification
 - UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
 - TLS termination with per-vhost certificates
 - ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
@@ -50,7 +50,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 - keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, PROXY protocol parsing, DNS-01/wildcards.
+In the roadmap: API gateway features (rate limiting, auth, transforms), PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
@@ -87,8 +87,8 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ### Container image
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.7.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.7.0
+docker pull ghcr.io/allmend/keel:0.8.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.8.0
 ```
 
 ### Prebuilt binaries
@@ -228,7 +228,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is at v0.7.0, alpha quality. Core proxy, TLS + ACME, clustering, caching, TCP and UDP (L4) proxying, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.8.0, alpha quality. Core proxy, TLS + ACME, clustering, caching, TCP and UDP (L4) proxying, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 
