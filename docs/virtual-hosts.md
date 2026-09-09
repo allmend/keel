@@ -11,13 +11,16 @@ vhosts:
   - host: api.example.com    # exact match
     pool: api
 
-  - host: "*"                # wildcard — matches anything not matched above
+  - host: "*.example.com"    # one label below example.com: www, app, …
+    pool: sites
+
+  - host: "*"                # catch-all — anything not matched above
     pool: default
 ```
 
 Port numbers in the `Host` header are stripped before matching. A request with `Host: api.example.com:8080` matches `host: api.example.com`.
 
-The `*` wildcard matches any host that doesn't match an earlier vhost. Only a bare `*` is supported; partial wildcards like `*.example.com` are not.
+Resolution order is exact host, then the one-label wildcard, then the bare `*`. `*.example.com` covers `www.example.com` but not `a.b.example.com` and not `example.com` itself, the same rule certificates use. The same order selects the certificate by SNI on TLS listeners, so a wildcard vhost with `tls: { acme: <dns-01 issuer> }` serves its wildcard certificate to every name it routes (see [ACME](acme.md#dns-01-challenge)). Access logs and metrics label such requests with the configured wildcard name, never with the raw host header.
 
 ---
 

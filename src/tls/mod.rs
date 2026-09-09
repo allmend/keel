@@ -301,11 +301,14 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
-/// Exact SNI match, then the `"*"` entry. Shared by both resolvers so the
-/// listener kinds never disagree about which certificate a name gets.
+/// Exact SNI match, then its one-label wildcard (`*.example.com`), then the
+/// `"*"` entry. Shared by both resolvers so the listener kinds never
+/// disagree about which certificate a name gets; the same order routing uses.
 fn lookup<'a>(map: &'a CertMap, sni: Option<&str>) -> Option<&'a CertPair> {
     let sni = sni.unwrap_or("*");
-    map.get(sni).or_else(|| map.get("*"))
+    map.get(sni)
+        .or_else(|| crate::vhost::wildcard_of(sni).and_then(|w| map.get(&w)))
+        .or_else(|| map.get("*"))
 }
 
 // SNI cert resolver (OpenSSL, Pingora listeners)
@@ -420,6 +423,17 @@ mod tests {
         let ck = pair.rustls.expect("rustls key");
         assert_eq!(ck.cert.len(), 1);
         assert_eq!(ck.cert[0].as_ref(), pair.cert.to_der().unwrap().as_slice());
+    }
+
+    #[test]
+    fn resolves_one_label_wildcard_certificates() {
+        let (store, leaves) = store_with(&["*.example.com"]);
+        let r = store.rustls_resolver();
+        let leaf = |sni: Option<&str>| r.resolve_name(sni).map(|k| k.cert[0].to_vec());
+        assert_eq!(leaf(Some("www.example.com")), Some(leaves["*.example.com"].clone()));
+        assert_eq!(leaf(Some("*.example.com")), Some(leaves["*.example.com"].clone()));
+        assert_eq!(leaf(Some("deep.www.example.com")), None);
+        assert_eq!(leaf(Some("example.com")), None);
     }
 
     #[test]

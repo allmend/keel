@@ -95,9 +95,12 @@ impl RoutingTable {
     }
 
     /// Returns the pool name for the given host and path, or `None` if no match.
+    /// Order: exact host, then its one-label wildcard (`*.example.com` for
+    /// `api.example.com`), then the catch-all `"*"`.
     pub fn resolve<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
         let host = host.split(':').next().unwrap_or(host);
         self.match_host(host, path)
+            .or_else(|| wildcard_of(host).and_then(|w| self.match_host(&w, path)))
             .or_else(|| self.match_host("*", path))
     }
 
@@ -106,7 +109,9 @@ impl RoutingTable {
     pub fn cache_config(&self, host: &str, path: &str) -> Option<&VhostCacheConfig> {
         let host = host.split(':').next().unwrap_or(host);
 
+        let wildcard = wildcard_of(host);
         let route_cache = self.route_cache(host, path)
+            .or_else(|| wildcard.as_deref().and_then(|w| self.route_cache(w, path)))
             .or_else(|| self.route_cache("*", path));
 
         if let Some(cc) = route_cache {
@@ -114,7 +119,11 @@ impl RoutingTable {
         }
 
         // Fall back to vhost-level config.
-        let vhost_cache = self.cache.get(host).or_else(|| self.cache.get("*"))?;
+        let vhost_cache = self
+            .cache
+            .get(host)
+            .or_else(|| wildcard.as_deref().and_then(|w| self.cache.get(w)))
+            .or_else(|| self.cache.get("*"))?;
         if vhost_cache.enabled { Some(vhost_cache) } else { None }
     }
 
@@ -126,6 +135,8 @@ impl RoutingTable {
     pub fn vhost_label(&self, host: &str) -> Option<&str> {
         let host = host.split(':').next().unwrap_or(host);
         if let Some((key, _)) = self.vhosts.get_key_value(host) {
+            Some(key.as_str())
+        } else if let Some((key, _)) = wildcard_of(host).and_then(|w| self.vhosts.get_key_value(w.as_str())) {
             Some(key.as_str())
         } else if self.vhosts.contains_key("*") {
             Some("*")
@@ -162,6 +173,17 @@ impl RoutingTable {
             .find(|r| path.starts_with(r.path_prefix.as_str()))
             .and_then(|r| r.cache.as_ref())
     }
+}
+
+/// The wildcard vhost name that would cover `host`: `*.example.com` for
+/// `api.example.com`. One label only, as in certificates — `a.b.example.com`
+/// is not covered by `*.example.com`, and a bare `example.com` has none.
+pub fn wildcard_of(host: &str) -> Option<String> {
+    let (first, rest) = host.split_once('.')?;
+    if first.is_empty() || rest.is_empty() || !rest.contains('.') {
+        return None;
+    }
+    Some(format!("*.{rest}"))
 }
 
 #[cfg(test)]
@@ -356,5 +378,30 @@ mod tests {
 
         // / still uses vhost default
         assert!(t.cache_config("example.com", "/").is_some());
+    }
+
+    #[test]
+    fn wildcard_names() {
+        assert_eq!(wildcard_of("api.example.com").as_deref(), Some("*.example.com"));
+        assert_eq!(wildcard_of("a.b.example.com").as_deref(), Some("*.b.example.com"));
+        assert_eq!(wildcard_of("example.com"), None);
+        assert_eq!(wildcard_of("localhost"), None);
+        assert_eq!(wildcard_of(".example.com"), None);
+    }
+
+    #[test]
+    fn wildcard_vhost_routes_one_label_below_it() {
+        let cfg = make_config(
+            vec![vhost("*.example.com", "wild"), vhost("api.example.com", "api")],
+            HashMap::from([pool("wild"), pool("api")]),
+        );
+        let table = RoutingTable::build(&cfg);
+        assert_eq!(table.resolve("api.example.com", "/"), Some("api"), "exact beats wildcard");
+        assert_eq!(table.resolve("www.example.com", "/"), Some("wild"));
+        assert_eq!(table.resolve("www.example.com:443", "/"), Some("wild"));
+        assert_eq!(table.resolve("deep.www.example.com", "/"), None, "one label only");
+        assert_eq!(table.resolve("example.com", "/"), None);
+        assert_eq!(table.vhost_label("www.example.com"), Some("*.example.com"));
+        assert_eq!(table.vhost_label("deep.www.example.com"), None);
     }
 }
