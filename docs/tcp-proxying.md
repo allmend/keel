@@ -52,7 +52,7 @@ pools:
 |---|---|
 | `tcp_pool` | Pool to splice to. Must exist in `pools`. Makes the listener L4-only: vhosts and routes are ignored |
 | `tls` | Rejected together with `tcp_pool` — passthrough never terminates |
-| `proxy_protocol` | Accepted in config; PROXY protocol parsing is a separate roadmap item |
+| `proxy_protocol` | Reserved; `true` is a startup error until parsing is implemented |
 
 Config validation fails at startup for an unknown `tcp_pool` or a
 `tcp_pool` + `tls: true` combination.

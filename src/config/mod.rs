@@ -251,6 +251,13 @@ impl Config {
             anyhow::bail!("keel.udp_flow_timeout_seconds must be at least 1");
         }
         for l in &self.listeners {
+            if l.proxy_protocol {
+                anyhow::bail!(
+                    "listener '{}': proxy_protocol is not implemented yet — remove it \
+                     (Keel would read the load balancer's address as the client's)",
+                    l.address
+                );
+            }
             if let Some(pool) = &l.tcp_pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("listener '{}' references unknown tcp_pool '{pool}'", l.address);
@@ -530,6 +537,9 @@ pub struct Listener {
     #[serde(default)]
     pub tls: bool,
 
+    /// Reserved for inbound PROXY protocol v1/v2. Parsing is not implemented,
+    /// so `true` is rejected at load rather than silently ignored — a
+    /// listener behind an NLB would otherwise log and forward the NLB's IP.
     #[serde(default)]
     pub proxy_protocol: bool,
 
@@ -1273,6 +1283,13 @@ mod tests {
         assert!(parse_duration("10").is_err());
         assert!(parse_duration("fast").is_err());
         assert!(parse_duration("0s").is_err());
+    }
+
+    #[test]
+    fn proxy_protocol_is_rejected_until_implemented() {
+        let cfg = parse("  - address: 0.0.0.0:80\n    proxy_protocol: true\n");
+        assert!(err(&cfg).contains("proxy_protocol is not implemented"));
+        parse("  - address: 0.0.0.0:80\n    proxy_protocol: false\n").validate().expect("valid");
     }
 
     #[test]

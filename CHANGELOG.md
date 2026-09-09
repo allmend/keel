@@ -8,6 +8,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`proxy_protocol: true` is a startup error.** The option was accepted and
+  ignored; a listener behind a load balancer sending PROXY Protocol logged
+  and forwarded the load balancer's address as the client's. The field stays
+  reserved for the implementation.
+
 ---
 
 ## [0.7.0] — 2026-09-09

@@ -118,20 +118,9 @@ Forwarded header configuration defaults to `mode: replace` if the `forwarded_hea
 
 ## PROXY Protocol
 
-When Keel sits behind a cloud load balancer or fronting proxy that uses PROXY Protocol to convey the real client IP at the TCP level, enable PROXY Protocol on the listener:
+PROXY Protocol parsing is not implemented. The listener field `proxy_protocol` is reserved for it, and setting it to `true` is a startup error rather than a silent no-op: a listener behind a load balancer that sends PROXY Protocol would otherwise record and forward the load balancer's address as the client's.
 
-```yaml
-listeners:
-  - address: 0.0.0.0:80
-    proxy_protocol: true
-  - address: 0.0.0.0:443
-    tls: true
-    proxy_protocol: true
-```
-
-With PROXY Protocol enabled, Keel reads the real client IP from the PROXY Protocol header before processing HTTP. The real client IP is then used in forwarded headers sent to backends.
-
-Do not enable `proxy_protocol` on a listener unless the upstream load balancer is configured to send PROXY Protocol. Enabling it on a plain HTTP listener will cause connection failures.
+Until it lands, a load balancer in front of Keel should be configured not to send PROXY Protocol, and the real client address is not available to Keel on those connections. Forwarded headers then carry the load balancer's address.
 
 ---
 

@@ -44,7 +44,7 @@ pools:
 | `udp_pool` | Name of the pool to forward to; must exist in `pools`. The value is a pool name, not a protocol: datagrams of any UDP protocol are forwarded unchanged. Makes the listener UDP-only: vhosts and routes are ignored |
 | `tls` | Rejected together with `udp_pool` — datagrams are never terminated |
 | `tcp_pool` | Rejected on the same listener entry. To serve both protocols on one port, add two listener entries with the same `address` (see the DNS example) |
-| `proxy_protocol` | Ignored for UDP |
+| `proxy_protocol` | Reserved; `true` is a startup error until parsing is implemented |
 
 | `keel` field | Default | Notes |
 |---|---|---|
