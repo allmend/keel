@@ -51,10 +51,10 @@ cluster:
   secret: mysecret
 ```
 
-A non-empty secret is **mandatory** — Keel refuses to start cluster mode without
+A non-empty secret is required — Keel refuses to start cluster mode without
 one, because the join listener would otherwise hand a cluster identity to any peer
 that can reach the port. Use a high-entropy token, e.g. `openssl rand -hex 32`.
-A weak secret is brute-forceable offline if an attacker captures a join exchange.
+A weak secret can be brute-forced offline from a captured join exchange.
 
 On bootstrap, Keel generates a cluster CA and issues a node certificate. All inter-node communication uses mTLS with this CA.
 
@@ -72,13 +72,13 @@ The joining node contacts the address given to `--join`, authenticates with the 
 
 A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
 
-If the join target is not reachable yet — the normal case when all nodes are started together by a service manager or orchestrator — the joiner retries with exponential backoff (1s doubling up to 30s) indefinitely, logging each attempt. Errors that retrying cannot fix are fatal and **terminate the process** so your supervisor notices: a wrong shared secret, a protocol mismatch, or an explicit rejection from the cluster.
+If the join target is not reachable yet — the normal case when all nodes are started together by a service manager or orchestrator — the joiner retries with exponential backoff (1s doubling up to 30s) indefinitely, logging each attempt. Errors that retrying cannot fix are fatal and terminate the process so the supervisor notices: a wrong shared secret, a protocol mismatch, or an explicit rejection from the cluster.
 
 The join exchange happens before mTLS is established, so it is encrypted with a key
 derived from the shared secret (ChaCha20-Poly1305). The secret itself is never sent
 on the wire — the join request and the response (which carries the new node's private
-key and the CA) are both AEAD-encrypted, so a passive eavesdropper on the network
-segment learns nothing and a peer without the secret cannot decrypt or forge them.
+key and the CA) are both AEAD-encrypted. A passive eavesdropper on the network
+segment cannot read them, and a peer without the secret cannot decrypt or forge them.
 
 The `--join` address is only used once at startup. After a node has joined the cluster, it reconnects to peers on restart using the addresses stored in Raft state.
 
@@ -186,7 +186,7 @@ What happens:
 
 2. **Membership change via Raft.** The removal is committed to the Raft log, so every remaining node accepts the stepdown before the command returns. If the node is a follower, the request is transparently forwarded to the leader over the mTLS peer channel.
 
-3. **Leadership handover.** If the node stepping down *is* the leader, it commits its own removal and steps down once the change is accepted; the remaining voters elect a new leader. Traffic is unaffected throughout.
+3. **Leadership handover.** If the node stepping down is the leader, it commits its own removal and steps down once the change is accepted; the remaining voters elect a new leader. Traffic is unaffected throughout.
 
 On success:
 

@@ -6,9 +6,9 @@ This page describes the security properties of Keel's proxy and cluster code: wh
 
 ## Encrypted cluster join
 
-The join handshake between a new node and the bootstrap node runs over plain TCP, before any mTLS identity exists. Its response carries the cluster CA certificate and the new node's freshly issued private key — material that must never travel in cleartext.
+The join handshake between a new node and the bootstrap node runs over plain TCP, before any mTLS identity exists. Its response carries the cluster CA certificate and the new node's freshly issued private key, which must not travel in cleartext.
 
-Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. The key is derived from the shared secret (`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh random nonce. The secret is never sent on the wire, not even encrypted — successful decryption on the receiving side is itself proof that the peer holds it. A peer without the secret can neither read a captured exchange nor forge a join request or response.
+Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. The key is derived from the shared secret (`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh random nonce. The secret itself is never sent on the wire; successful decryption on the receiving side proves the peer holds it. A peer without the secret cannot read a captured exchange or forge a join request or response.
 
 A captured exchange can still be brute-forced offline against a low-entropy secret, so use a high-entropy token:
 
@@ -24,7 +24,7 @@ See [Cluster](cluster.md) for the full join flow.
 
 Keel refuses to start `--cluster` mode, bootstrap or join, without a non-empty secret from `--secret` or `cluster.secret` in `keel.yaml`.
 
-Without this requirement, the join listener would hand a CA-signed mTLS identity to any peer that can reach the cluster port — a full cluster takeover from a single TCP connection.
+Without it, the join listener would issue a CA-signed mTLS identity to any peer that can reach the cluster port, granting that peer full cluster membership.
 
 ---
 
@@ -39,30 +39,30 @@ The cluster port uses a length-prefixed wire protocol. Every length-prefixed rea
 
 ---
 
-## Host header is not a filesystem or metrics key
+## Host header bounded before use
 
 Requests are mapped to a bounded, operator-configured vhost label before anything is logged or recorded: the exact configured host, `"*"` if only a wildcard vhost matches, or `"unmatched"`. The raw client-supplied `Host` header never reaches the filesystem or the metrics registry, and the access logger sanitizes the label to filesystem-safe characters as a second line of defense.
 
-This closes three attacks from a single crafted header: path traversal in access-log filenames (`Host: ../../etc/cron.d/x`), file-descriptor and inode exhaustion through unbounded log file creation, and metric cardinality explosion.
+This bounds three things that would otherwise be driven by a crafted header: access-log filenames (no path traversal, e.g. `Host: ../../etc/cron.d/x`), the number of log files created (no file-descriptor or inode exhaustion), and metric label cardinality.
 
 The original `Host` value is still forwarded upstream in `X-Forwarded-Host`, so backends see what the client sent. Only Keel's internal keys are bounded.
 
 ---
 
-## Metrics endpoint locked down
+## Metrics endpoint
 
-Metrics reveal backend addresses, pool and vhost names, and traffic volumes — effectively a network map of the infrastructure.
+Metrics expose backend addresses, pool and vhost names, and traffic volumes. Access is restricted by default to limit what this reveals about the infrastructure.
 
-- The default bind is `127.0.0.1:9090`. Remote scraping requires setting `metrics.address: 0.0.0.0:9090` explicitly and firewalling the port, or running a local scrape agent against loopback.
+- The default bind is `127.0.0.1:9090`. To scrape from another host, set `metrics.address: 0.0.0.0:9090` and firewall the port, or run a local scrape agent against loopback.
 - Only `GET /metrics` is served. Any other method or path returns `404`.
 
 ---
 
 ## Remote control requires mTLS
 
-The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the node's control CA — a connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
+The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the node's control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
 
-The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but never replaces mTLS.
+The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but does not replace mTLS.
 
 Every remote command is audit-logged with the client certificate's CN and source address. To invalidate all issued credentials, delete `control.remote.ca_dir` and restart — a new CA is generated and every existing keelconfig stops working.
 
@@ -70,7 +70,7 @@ Every remote command is audit-logged with the client certificate's CN and source
 
 ## Control socket permissions
 
-Anyone who can open the control socket controls the proxy — draining backends, reloading config, pushing config to the whole cluster.
+Anyone who can open the control socket controls the proxy: draining backends, reloading config, pushing config to the whole cluster.
 
 The socket directory is created `0750` before the socket is bound, and the socket itself is set to `0660` (owner and group only). If those permissions cannot be applied, Keel refuses to serve the control socket rather than run it open.
 
@@ -95,7 +95,7 @@ Every TLS listener sets a TLS 1.2 floor and rejects TLS 1.0/1.1 handshakes. This
 
 ## Corrupt Raft snapshots surface as errors
 
-A Raft snapshot that fails to deserialize is returned as a storage error and surfaces to the operator. It is never silently replaced with an empty state — a corrupt or tampered snapshot cannot wipe the replicated config and drain map unnoticed.
+A Raft snapshot that fails to deserialize is returned as a storage error and surfaces to the operator. It is not silently replaced with an empty state, so a corrupt or tampered snapshot cannot wipe the replicated config and drain map unnoticed.
 
 ---
 

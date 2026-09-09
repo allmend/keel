@@ -1,9 +1,9 @@
 # Remote Control (keelctl)
 
-`keelctl` controls a running Keel node or cluster from anywhere: an operator
-workstation, a CI job, a bastion. It speaks the same control protocol as the
-local `keel` subcommands, over TCP with mandatory mTLS. Binaries ship for
-Linux, macOS, and FreeBSD.
+`keelctl` controls a running Keel node or cluster from an operator
+workstation, a CI job, or a bastion host. It speaks the same control protocol
+as the local `keel` subcommands, over TCP with mandatory mTLS. Binaries ship
+for Linux, macOS, and FreeBSD.
 
 ## Security
 

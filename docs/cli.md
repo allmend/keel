@@ -2,7 +2,7 @@
 
 The `keel` binary serves two roles: running the proxy and acting as a CLI client to a running instance. Mode is determined by subcommand.
 
-Every client command on this page also works remotely via **keelctl** over mTLS, with identical output — see [Remote control](keelctl.md).
+Every client command on this page also works remotely via keelctl over mTLS, with identical output — see [Remote control](keelctl.md).
 
 ## Server flags
 

@@ -2,33 +2,31 @@
 
 A listener with `tcp_pool` proxies raw TCP to a backend pool. Routing is
 listener → pool: L4 has no Host header, so vhosts and routes do not apply.
-The pool itself is an ordinary pool — algorithms, weights, health checks,
-drain, and connection counting behave exactly as for HTTP.
+The pool is an ordinary pool — algorithms, weights, health checks, drain, and
+connection counting behave the same as for HTTP.
 
 ## TLS handling — three modes
 
 | | Client ↔ Keel | Keel ↔ backend | Certificate lives at | Status |
 |---|---|---|---|---|
-| **passthrough** | opaque bytes (TLS end-to-end if used) | same stream, untouched | the backend | **implemented** |
-| **terminate** | TLS, terminated by Keel | plaintext TCP | Keel | planned |
-| **reencrypt** | TLS, terminated by Keel | new TLS connection | Keel (client side), backend (upstream side) | planned |
+| passthrough | opaque bytes (TLS end-to-end if used) | same stream, untouched | the backend | implemented |
+| terminate | TLS, terminated by Keel | plaintext TCP | Keel | planned |
+| reencrypt | TLS, terminated by Keel | new TLS connection | Keel (client side), backend (upstream side) | planned |
 
-**Passthrough is the only implemented mode**, and it is the default and the
-right choice for databases. Keel splices bytes without inspecting the stream:
-if the client and backend speak TLS, the handshake, certificate, and
-verification are theirs — Keel never holds a key. Because there is only one
-mode, the listener has no mode field yet; one arrives together with
-`terminate`.
+Passthrough is the only implemented mode. It is the default and is suited to
+databases. Keel splices bytes without inspecting the stream: if the client and
+backend speak TLS, the handshake, certificate, and verification are between
+them, and Keel holds no key. Because there is only one mode, the listener has
+no mode field yet; one arrives with `terminate`.
 
-Which mode a protocol *can* use is determined by where its TLS handshake
-starts:
+Which mode a protocol can use depends on where its TLS handshake starts:
 
-- **TLS-on-connect** protocols (Redis `tls-port`, LDAPS, MQTT-over-TLS) put
-  the handshake at byte zero. Passthrough works today; `terminate` will work
-  for them when it lands.
-- **STARTTLS-style** protocols (PostgreSQL, SMTP) begin in plaintext and
-  upgrade mid-stream. A protocol-agnostic proxy cannot terminate these —
-  passthrough is the only mode that will ever apply.
+- TLS-on-connect protocols (Redis `tls-port`, LDAPS, MQTT-over-TLS) put the
+  handshake at byte zero. Passthrough works today; `terminate` will work for
+  them when it lands.
+- STARTTLS-style protocols (PostgreSQL, SMTP) begin in plaintext and upgrade
+  mid-stream. A protocol-agnostic proxy cannot terminate these — passthrough
+  is the only mode that applies.
 
 ## Configuration
 
@@ -76,15 +74,15 @@ listeners:
 psql "host=db.example.com port=5432 sslmode=verify-full"
 ```
 
-`sslmode=verify-full` works exactly as it would against the database
+`sslmode=verify-full` works the same as it would against the database
 directly — the client sees the backend's certificate, not Keel's.
 
 The backend certificates can be provisioned by Keel itself: the
 [`certificates:` section](acme.md#certificates-for-tcp--tls-passthrough-backends)
 makes Keel answer the ACME HTTP-01 challenge for `db.example.com` on port 80
 and write `db.example.com.crt`/`.key` to disk for the database servers to
-load. The result is publicly valid backend certificates with zero manual
-renewal, behind a passthrough proxy that never touches them.
+load. This produces publicly valid backend certificates that renew
+automatically, while the proxy itself never terminates their TLS.
 
 ## Example: Redis
 
@@ -111,16 +109,16 @@ pools:
 
 Clients configure their own TLS (`redis-cli --tls --cacert …`) and verify
 the backend's certificate through Keel unchanged. When `terminate` mode
-lands, Redis is the kind of service that can move to it — TLS at byte zero
-means Keel *could* hold the certificate instead; today both examples run
-passthrough and differ in balancing, not TLS handling.
+lands, Redis is a candidate for it — TLS at byte zero means Keel can hold the
+certificate instead. Today both examples run passthrough and differ in
+balancing, not TLS handling.
 
 Plain TCP without any TLS proxies the same way — `tcp_pool` makes no
-assumption that the stream contains TLS at all.
+assumption that the stream contains TLS.
 
 ## Session affinity
 
-With `algorithm: consistent_hash`, the hash key is the client `IP:port` — a
+With `algorithm: consistent_hash`, the hash key is the client `IP:port`, so a
 client keeps reaching the same backend while the pool composition is stable.
 Round robin, random, and least-connections apply per connection.
 
@@ -156,12 +154,11 @@ Metrics (see the [metrics reference](metrics.md) for the full list):
 
 ## Behavior notes
 
-- **No healthy backend** — the connection is closed immediately; the log
-  entry records `"error": "no_backend"` and `keel_tcp_errors_total`
-  increments.
-- **Graceful shutdown closes L4 connections.** There is no request boundary
-  to wait for at L4, so on shutdown the splice is closed. Use backend drain
-  for zero-impact maintenance.
-- **No TLS fields in logs or metrics** for passthrough: the stream is opaque,
-  so Keel cannot know whether TLS was negotiated inside it. SNI, cipher, and
+- No healthy backend — the connection is closed immediately; the log entry
+  records `"error": "no_backend"` and `keel_tcp_errors_total` increments.
+- Graceful shutdown closes L4 connections. There is no request boundary to
+  wait for at L4, so on shutdown the splice is closed. Use backend drain for
+  zero-impact maintenance.
+- No TLS fields in logs or metrics for passthrough: the stream is opaque, so
+  Keel cannot know whether TLS was negotiated inside it. SNI, cipher, and
   version fields arrive with the TLS-aware modes.

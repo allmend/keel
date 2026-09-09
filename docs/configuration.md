@@ -89,10 +89,10 @@ metrics:
 
 Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. Every exposed metric is listed in the [metrics reference](metrics.md).
 
-> **Security:** metrics reveal backend addresses, pool/vhost names, and traffic
+> **Security:** metrics expose backend addresses, pool/vhost names, and traffic
 > volumes. The default binds to `127.0.0.1` so they are not world-readable. To
-> scrape from another host, set `address: 0.0.0.0:9090` **and** restrict the port
-> with firewall rules — or keep the default and run a local scrape agent that
+> scrape from another host, set `address: 0.0.0.0:9090` and restrict the port
+> with firewall rules, or keep the default and run a local scrape agent that
 > reads `127.0.0.1:9090`.
 
 ---

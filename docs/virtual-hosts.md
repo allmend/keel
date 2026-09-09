@@ -168,7 +168,7 @@ The wildcard host (`host: "*"`) supports `redirect_http: true` to redirect all u
 
 ## Default action
 
-A vhost with `default_action` answers requests directly — no backend pool involved. It takes a redirect **or** a static status, and excludes `pool` and `routes` on the same vhost:
+A vhost with `default_action` answers requests directly — no backend pool involved. It takes a redirect or a static status, and excludes `pool` and `routes` on the same vhost:
 
 ```yaml
 vhosts:
