@@ -126,6 +126,17 @@ Keel answers the challenge for `db.example.com` and writes:
 
 Point the backend at these files, or copy them out. Renewals rewrite the files atomically, so have the backend watch them or reload periodically.
 
+The same entries serve TCP listeners with `tls_mode: terminate` or `reencrypt` ([TCP proxying](tcp-proxying.md)): the listener's `tls_host` names the entry, and Keel serves the issued certificate itself, renewing it in place. An entry can also point at files Keel does not issue:
+
+```yaml
+certificates:
+  - host: ldap.example.com
+    cert: /etc/keel/certs/ldap.example.com.crt
+    key: /etc/keel/certs/ldap.example.com.key
+```
+
+Such an entry is not ACME-managed; `issuer` is ignored on it, and the files are re-read on SIGHUP.
+
 ---
 
 ## Storage layout

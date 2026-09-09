@@ -270,6 +270,43 @@ impl Config {
                     );
                 }
             }
+            if l.tcp_pool.is_none() && (l.tls_mode != TlsMode::Passthrough || l.tls_host.is_some()) {
+                anyhow::bail!("listener '{}': tls_mode and tls_host apply to tcp_pool listeners only", l.address);
+            }
+            if l.tcp_pool.is_some() {
+                match l.tls_mode {
+                    TlsMode::Passthrough => {
+                        if l.tls_host.is_some() || l.tls_verify || l.tls_ca.is_some() {
+                            anyhow::bail!(
+                                "listener '{}': tls_host, tls_verify, and tls_ca need tls_mode terminate or reencrypt",
+                                l.address
+                            );
+                        }
+                    }
+                    TlsMode::Terminate | TlsMode::Reencrypt => {
+                        let Some(host) = &l.tls_host else {
+                            anyhow::bail!(
+                                "listener '{}': tls_mode {:?} needs tls_host (a certificates: entry or a vhost with tls)",
+                                l.address, l.tls_mode
+                            );
+                        };
+                        let known = self.certificates.iter().any(|c| &c.host == host)
+                            || self.vhosts.iter().any(|v| &v.host == host && v.tls.is_some());
+                        if !known {
+                            anyhow::bail!(
+                                "listener '{}': tls_host '{host}' matches no certificates: entry or vhost with tls",
+                                l.address
+                            );
+                        }
+                        if l.tls_mode == TlsMode::Terminate && (l.tls_verify || l.tls_ca.is_some()) {
+                            anyhow::bail!("listener '{}': tls_verify and tls_ca apply to tls_mode reencrypt only", l.address);
+                        }
+                        if l.tls_ca.is_some() && !l.tls_verify {
+                            anyhow::bail!("listener '{}': tls_ca needs tls_verify: true", l.address);
+                        }
+                    }
+                }
+            }
             if let Some(pool) = &l.udp_pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("listener '{}' references unknown udp_pool '{pool}'", l.address);
@@ -366,6 +403,11 @@ impl Config {
                 }
             }
         }
+        for c in &self.certificates {
+            if c.cert.is_some() != c.key.is_some() {
+                anyhow::bail!("certificates '{}': cert and key must be set together", c.host);
+            }
+        }
         self.validate_acme()?;
         Ok(())
     }
@@ -387,7 +429,7 @@ impl Config {
                 );
             }
         }
-        for cert in &self.certificates {
+        for cert in self.certificates.iter().filter(|c| c.is_acme()) {
             if !issuer_defined(&cert.issuer) && cert.issuer != DEFAULT_ISSUER {
                 anyhow::bail!(
                     "certificates '{}': references issuer '{}', which is not defined under acme.issuers",
@@ -423,7 +465,7 @@ impl Config {
                 claims.push((v.host.as_str(), name));
             }
         }
-        for c in &self.certificates {
+        for c in self.certificates.iter().filter(|c| c.is_acme()) {
             claims.push((c.host.as_str(), c.issuer.as_str()));
         }
         for (host, issuer) in claims {
@@ -470,7 +512,7 @@ impl Config {
                 }
             }
         }
-        for c in &self.certificates {
+        for c in self.certificates.iter().filter(|c| c.is_acme()) {
             if seen.insert(c.host.as_str()) {
                 out.push((c.host.as_str(), c.issuer.as_str(), false));
             }
@@ -555,6 +597,38 @@ pub struct Listener {
     /// `tcp_pool`.
     #[serde(default)]
     pub udp_pool: Option<String>,
+
+    /// TLS handling on a `tcp_pool` listener.
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+
+    /// Certificate served by a terminating listener: the host of a
+    /// `certificates:` entry or of a vhost with `tls`. Used when the client
+    /// sends no SNI or an SNI with no certificate of its own.
+    #[serde(default)]
+    pub tls_host: Option<String>,
+
+    /// reencrypt: verify the backend certificate against the system trust
+    /// store plus `tls_ca`. Off by default — wire encryption, not backend
+    /// authentication.
+    #[serde(default)]
+    pub tls_verify: bool,
+
+    /// reencrypt with `tls_verify`: PEM bundle of additional trusted CAs.
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    /// Bytes spliced untouched; TLS, if any, is end to end.
+    #[default]
+    Passthrough,
+    /// Keel terminates TLS, plaintext to the backend.
+    Terminate,
+    /// Keel terminates TLS and opens a new TLS connection to the backend.
+    Reencrypt,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1042,9 +1116,23 @@ impl Default for AcmeIssuer {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CertificateRequest {
     pub host: String,
-    /// Issuer name from `acme.issuers`. Defaults to "default".
+    /// Issuer name from `acme.issuers`. Defaults to "default". Ignored when
+    /// `cert`/`key` are set.
     #[serde(default = "default_issuer_name")]
     pub issuer: String,
+
+    /// Bring-your-own certificate: PEM paths instead of ACME issuance.
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl CertificateRequest {
+    /// Managed by ACME (as opposed to loaded from `cert`/`key` files).
+    pub fn is_acme(&self) -> bool {
+        self.cert.is_none()
+    }
 }
 
 fn default_issuer_name() -> String { DEFAULT_ISSUER.into() }
@@ -1283,6 +1371,36 @@ mod tests {
         assert!(parse_duration("10").is_err());
         assert!(parse_duration("fast").is_err());
         assert!(parse_duration("0s").is_err());
+    }
+
+    fn tcp_tls(listener_fields: &str, certificates: &str) -> Config {
+        serde_yml::from_str(&format!(
+            "{POOL}listeners:\n  - address: 0.0.0.0:6379\n    tcp_pool: dns\n{listener_fields}certificates:\n{certificates}"
+        ))
+        .expect("yaml parses")
+    }
+
+    #[test]
+    fn tcp_tls_modes_validate() {
+        let byo = "  - host: cache.example.com\n    cert: /c.pem\n    key: /k.pem\n";
+        tcp_tls("    tls_mode: terminate\n    tls_host: cache.example.com\n", byo).validate().expect("terminate ok");
+        tcp_tls("    tls_mode: reencrypt\n    tls_host: cache.example.com\n    tls_verify: true\n    tls_ca: /ca.pem\n", byo)
+            .validate()
+            .expect("reencrypt ok");
+        let cfg = tcp_tls("", byo);
+        assert_eq!(cfg.listeners[0].tls_mode, TlsMode::Passthrough);
+        assert!(!cfg.certificates[0].is_acme());
+        cfg.validate().expect("passthrough default ok");
+
+        let e = |l: &str, c: &str| tcp_tls(l, c).validate().expect_err("invalid").to_string();
+        assert!(e("    tls_mode: terminate\n", byo).contains("needs tls_host"));
+        assert!(e("    tls_mode: terminate\n    tls_host: other.example.com\n", byo).contains("matches no certificates"));
+        assert!(e("    tls_host: cache.example.com\n", byo).contains("need tls_mode terminate or reencrypt"));
+        assert!(e("    tls_mode: terminate\n    tls_host: cache.example.com\n    tls_verify: true\n", byo).contains("reencrypt only"));
+        assert!(e("    tls_mode: reencrypt\n    tls_host: cache.example.com\n    tls_ca: /ca.pem\n", byo).contains("needs tls_verify"));
+        assert!(e("", "  - host: cache.example.com\n    cert: /c.pem\n").contains("set together"));
+        let cfg = parse("  - address: 0.0.0.0:80\n    tls_mode: terminate\n");
+        assert!(err(&cfg).contains("tcp_pool listeners only"));
     }
 
     #[test]

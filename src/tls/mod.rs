@@ -84,6 +84,14 @@ impl CertStore {
         CertStore { inner: Arc::new(ArcSwap::from_pointee(map)) }
     }
 
+    /// A store holding one in-memory certificate, for tests of TLS listeners.
+    #[cfg(test)]
+    pub fn with_test_cert(host: &str, cert_pem: &str, key_pem: &str) -> Self {
+        let mut map = HashMap::new();
+        map.insert(host.to_owned(), CertPair::from_pem(cert_pem.as_bytes(), key_pem.as_bytes(), host).unwrap());
+        CertStore::from_map(map)
+    }
+
     /// Build a boxed `TlsAcceptCallbacks` that reads from this store on every handshake.
     pub fn make_callbacks(&self) -> TlsAcceptCallbacks {
         Box::new(SniCertResolver { certs: Arc::clone(&self.inner) })
@@ -99,15 +107,38 @@ impl CertStore {
     /// A rustls `ServerConfig` backed by this store. `alpn` lists the
     /// protocols to offer (for example `["h3"]` or `["http/1.1"]`); empty
     /// offers none. TLS 1.2 is the floor, as on the Pingora listeners.
-    #[allow(dead_code)] // consumed by the TCP terminate mode and HTTP/3 listeners
+    #[allow(dead_code)] // the HTTP/3 listener will use SNI-only resolution
     pub fn rustls_server_config(&self, alpn: &[&str]) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+        self.build_server_config(alpn, self.rustls_resolver())
+    }
+
+    /// Like `rustls_server_config`, but a client that sends no SNI, or one
+    /// with no certificate of its own, is served `default_host`'s. TCP
+    /// clients (redis-cli, older libpq) often send no SNI at all.
+    pub fn rustls_server_config_with_default(
+        &self,
+        alpn: &[&str],
+        default_host: &str,
+    ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+        let resolver = Arc::new(DefaultingResolver {
+            inner: self.rustls_resolver(),
+            default_host: default_host.to_owned(),
+        });
+        self.build_server_config(alpn, resolver)
+    }
+
+    fn build_server_config(
+        &self,
+        alpn: &[&str],
+        resolver: Arc<dyn ResolvesServerCert>,
+    ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
             &rustls::version::TLS12,
             &rustls::version::TLS13,
         ])
         .with_no_client_auth()
-        .with_cert_resolver(self.rustls_resolver());
+        .with_cert_resolver(resolver);
         cfg.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
         Ok(Arc::new(cfg))
     }
@@ -160,7 +191,114 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
         map.insert(vhost.host.clone(), pair);
     }
 
+    // `certificates:` entries — ACME-issued files or bring-your-own — so
+    // terminating TCP listeners can serve them by host name.
+    for c in &cfg.certificates {
+        let (cert_path, key_path) = match (&c.cert, &c.key) {
+            (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            _ => {
+                let Some(acme) = acme.as_ref() else { continue };
+                let (cert, key) = acme_cert_paths(&acme.storage, &c.host);
+                if !std::path::Path::new(&cert).exists() {
+                    info!(host = c.host, "TLS: ACME certificate not yet issued; TLS listeners for it wait until issuance");
+                    continue;
+                }
+                (cert, key)
+            }
+        };
+        if map.contains_key(&c.host) {
+            continue; // the vhost entry already covers this host
+        }
+        let cert_bytes = std::fs::read(&cert_path)
+            .map_err(|e| anyhow::anyhow!("cannot read cert '{cert_path}': {e}"))?;
+        let key_bytes = std::fs::read(&key_path)
+            .map_err(|e| anyhow::anyhow!("cannot read key '{key_path}': {e}"))?;
+        let pair = CertPair::from_pem(&cert_bytes, &key_bytes, &cert_path)?;
+        info!(host = c.host, cert = cert_path, "TLS: certificate loaded");
+        map.insert(c.host.clone(), pair);
+    }
+
     Ok(map)
+}
+
+/// Client configuration that accepts any backend certificate: wire
+/// encryption without backend authentication (NLB behaviour), the default
+/// for re-encrypting TCP listeners and for TLS health probes.
+pub fn insecure_client_config() -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth(),
+    )
+}
+
+/// Client configuration that verifies backend certificates against the
+/// system trust store plus an optional PEM bundle of extra CAs.
+pub fn verifying_client_config(extra_ca_pem: Option<&[u8]>) -> anyhow::Result<Arc<rustls::ClientConfig>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for e in &native.errors {
+        warn!(error = %e, "TLS: system trust store entry skipped");
+    }
+    roots.add_parsable_certificates(native.certs);
+    if let Some(pem) = extra_ca_pem {
+        let extra: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut &pem[..]).collect::<Result<_, _>>()?;
+        if extra.is_empty() {
+            anyhow::bail!("tls_ca contains no certificates");
+        }
+        roots.add_parsable_certificates(extra);
+    }
+    Ok(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+/// Accepts any certificate. Used where the point is encryption and liveness,
+/// not identity: re-encryption without `tls_verify`, and health probes.
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Exact SNI match, then the `"*"` entry. Shared by both resolvers so the
@@ -233,6 +371,22 @@ impl RustlsCertResolver {
 impl ResolvesServerCert for RustlsCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         self.resolve_name(client_hello.server_name())
+    }
+}
+
+/// SNI first, then a listener-specific default host (see
+/// `rustls_server_config_with_default`).
+#[derive(Debug)]
+struct DefaultingResolver {
+    inner: Arc<RustlsCertResolver>,
+    default_host: String,
+}
+
+impl ResolvesServerCert for DefaultingResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.inner
+            .resolve_name(client_hello.server_name())
+            .or_else(|| self.inner.resolve_name(Some(&self.default_host)))
     }
 }
 
@@ -315,26 +469,8 @@ mod tests {
     /// certificate, and a swapped certificate is served on the next handshake.
     #[tokio::test]
     async fn serves_sni_certificates_over_a_real_handshake() {
-        use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-        use rustls::pki_types::{ServerName, UnixTime};
+        use rustls::pki_types::ServerName;
         use tokio::net::TcpListener;
-
-        #[derive(Debug)]
-        struct NoVerify;
-        impl ServerCertVerifier for NoVerify {
-            fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
-            }
-        }
 
         let (store, leaves) = store_with(&["api.example.com", "*"]);
         let server_cfg = store.rustls_server_config(&["http/1.1"]).unwrap();
@@ -351,12 +487,7 @@ mod tests {
             }
         });
 
-        let client_cfg = Arc::new(
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth(),
-        );
+        let client_cfg = insecure_client_config();
         let leaf_for = |sni: &'static str| {
             let cfg = Arc::clone(&client_cfg);
             async move {

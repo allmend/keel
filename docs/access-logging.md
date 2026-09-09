@@ -125,32 +125,40 @@ jq 'select(.uri | startswith("/api/v2/"))' /var/log/keel/access_api.example.com.
 
 ## TCP log format
 
-TCP passthrough listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection** to `access_tcp_<pool>.log` — L4 has no vhost or request concept, so routing and file naming are pool-based:
+TCP listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection** to `access_tcp_<pool>.log` — L4 has no vhost or request concept, so routing and file naming are pool-based:
 
 ```json
 {
   "timestamp":    "2026-07-06T12:52:00.812Z",
-  "type":         "tcp",
+  "type":         "tls",
   "client_addr":  "203.0.113.42:57811",
-  "listener":     "0.0.0.0:5432",
-  "pool":         "postgres",
-  "backend_addr": "10.0.0.11:5432",
+  "listener":     "0.0.0.0:6379",
+  "pool":         "redis",
+  "backend_addr": "10.0.0.21:6379",
   "bytes_in":     6420,
   "bytes_out":    182034,
   "duration_ms":  84210.5,
+  "tls":          true,
+  "tls_sni":      "cache.example.com",
+  "tls_version":  "TLSv1.3",
+  "tls_cipher":   "TLS13_AES_256_GCM_SHA384",
   "error":        null
 }
 ```
 
 | Field | Notes |
 |---|---|
-| `type` | Always `"tcp"` |
+| `type` | `"tcp"` for passthrough, `"tls"` when Keel terminated TLS (`tls_mode` terminate or reencrypt) |
 | `listener` | Local address that accepted the connection |
-| `bytes_in` / `bytes_out` | Bytes from/to the client over the connection lifetime |
+| `bytes_in` / `bytes_out` | Application bytes from/to the client over the connection lifetime (after TLS in the terminating modes) |
 | `duration_ms` | Full connection lifetime, accept to close |
-| `error` | `null`, `no_backend`, `upstream_connect`, `io`, or `shutdown` |
+| `tls` | `true` when Keel terminated TLS |
+| `tls_sni` | SNI the client sent; `null` when none, or in passthrough |
+| `tls_version` | `TLSv1.2` or `TLSv1.3`; `null` in passthrough |
+| `tls_cipher` | Cipher suite as named by rustls, for example `TLS13_AES_256_GCM_SHA384`; `null` in passthrough |
+| `error` | `null`, `no_backend`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, or `shutdown` |
 
-No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no meaning at L4. No TLS fields in passthrough mode: the stream is opaque to Keel.
+No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no meaning at L4. In passthrough mode the stream is opaque to Keel, so the TLS fields stay null even when the client and backend negotiate TLS inside it.
 
 ---
 

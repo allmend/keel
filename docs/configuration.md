@@ -61,6 +61,10 @@ listeners:
     tls: true
   - address: 0.0.0.0:5432            # L4 — raw TCP spliced to a pool
     tcp_pool: postgres
+  - address: 0.0.0.0:6379            # L4 — TLS terminated by Keel, plaintext to the pool
+    tcp_pool: redis
+    tls_mode: terminate
+    tls_host: cache.example.com
   - address: 0.0.0.0:53              # L4 — UDP datagrams forwarded to the named pool
     udp_pool: resolvers
 ```
@@ -72,6 +76,10 @@ listeners:
 | `proxy_protocol` | bool | `false` | Reserved. Parsing is not implemented; `true` is a startup error |
 | `tcp_pool` | string | none | Makes the listener L4: raw TCP is spliced to this pool (passthrough — the stream is never inspected). Vhosts and routes do not apply, and `tls` is rejected on the same listener. See [TCP proxying](tcp-proxying.md) |
 | `udp_pool` | string | none | Makes the listener UDP: datagrams are forwarded to this pool, one flow per client `ip:port` until idle for `keel.udp_flow_timeout_seconds`. Vhosts and routes do not apply; `tls` and `tcp_pool` are rejected on the same listener. See [UDP proxying](udp-proxying.md) |
+| `tls_mode` | string | `passthrough` | `tcp_pool` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-handling--three-modes) |
+| `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificates:` entry or a vhost with `tls`, served when the client's SNI has no certificate of its own |
+| `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's configured hostname |
+| `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs |
 
 A `tcp_pool` or `udp_pool` listener references an ordinary entry in `pools` — health checks, weights, algorithms, and drain behave the same as for HTTP. Validation fails at startup for an unknown pool name, a `tcp_pool` or `udp_pool` + `tls` combination, or `tcp_pool` and `udp_pool` on the same listener entry (use two entries with the same `address` to serve both protocols on one port).
 

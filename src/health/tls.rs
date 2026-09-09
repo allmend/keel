@@ -12,9 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 
 use super::{io_reason, Probe, ProbeResult};
@@ -27,12 +25,7 @@ pub struct TlsProbe {
 
 impl TlsProbe {
     pub fn new(sni: Option<String>, min_days_valid: Option<u32>) -> Self {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
-        TlsProbe { config: Arc::new(config), sni, min_days_valid }
+        TlsProbe { config: crate::tls::insecure_client_config(), sni, min_days_valid }
     }
 }
 
@@ -72,51 +65,10 @@ pub fn check_expiry(der: &[u8], min_days: u32) -> ProbeResult {
     Ok(())
 }
 
-/// Accepts any certificate: the probe checks liveness and expiry, not trust.
-#[derive(Debug)]
-struct NoVerify;
-
-impl ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::net::TcpListener;
 
     /// Self-signed cert for localhost; `expired` dates it in the past.

@@ -964,7 +964,7 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
         server.add_service(background_service("acme", acme_svc));
     }
 
-    add_l4_services(&mut server, cfg, &pools, &access_logger);
+    add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
     let proxy =
@@ -1028,21 +1028,66 @@ fn add_remote_control(
     ));
 }
 
-/// Register one L4 passthrough service per `tcp_pool` listener.
+/// Register one L4 service per `tcp_pool` listener, with the TLS material its
+/// `tls_mode` needs.
 fn add_l4_services(
     server: &mut Server,
     cfg: &Config,
     pools: &Arc<crate::backend::PoolRegistry>,
     access_logger: &Arc<AccessLogger>,
+    cert_store: &Arc<CertStore>,
 ) {
+    use crate::config::TlsMode;
+
     for l in cfg.listeners.iter().filter(|l| l.tcp_pool.is_some()) {
         let pool = l.tcp_pool.clone().unwrap();
-        info!(address = l.address, pool, "adding TCP passthrough listener");
+        let built = (|| -> anyhow::Result<_> {
+            let server_tls = match l.tls_mode {
+                TlsMode::Passthrough => None,
+                _ => Some(cert_store.rustls_server_config_with_default(
+                    &[],
+                    l.tls_host.as_deref().expect("validated: tls_host set"),
+                )?),
+            };
+            let client_tls = match l.tls_mode {
+                TlsMode::Reencrypt if l.tls_verify => {
+                    let ca = l
+                        .tls_ca
+                        .as_ref()
+                        .map(|p| std::fs::read(p).map_err(|e| anyhow::anyhow!("cannot read tls_ca '{p}': {e}")))
+                        .transpose()?;
+                    Some(crate::tls::verifying_client_config(ca.as_deref())?)
+                }
+                TlsMode::Reencrypt => Some(crate::tls::insecure_client_config()),
+                _ => None,
+            };
+            // Configured hostnames per resolved backend: SNI toward the
+            // backend and, with tls_verify, the name its certificate must match.
+            let mut backend_names = HashMap::new();
+            for b in &cfg.pools[&pool].backends {
+                let resolved: SocketAddr = resolve_addr(&b.address)?.parse()?;
+                let host = b.address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&b.address);
+                backend_names.insert(resolved, host.trim_matches(|c| c == '[' || c == ']').to_owned());
+            }
+            Ok((server_tls, client_tls, backend_names))
+        })();
+        let (server_tls, client_tls, backend_names) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                error!(address = l.address, error = %e, "tcp: cannot build TLS listener");
+                std::process::exit(1);
+            }
+        };
+        info!(address = l.address, pool, mode = ?l.tls_mode, "adding TCP listener");
         let app = crate::l4::TcpProxyApp {
             listener: l.address.clone(),
             pool,
             pools: Arc::clone(pools),
             access_logger: Arc::clone(access_logger),
+            mode: l.tls_mode,
+            server_tls,
+            client_tls,
+            backend_names,
         };
         let mut svc = pingora::services::listening::Service::new(
             format!("tcp-{}", l.address),
@@ -1191,7 +1236,7 @@ pub fn run_cluster(
         server.add_service(background_service("acme", acme_svc));
     }
 
-    add_l4_services(&mut server, cfg, &pools, &access_logger);
+    add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, None);
 
     let proxy =

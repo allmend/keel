@@ -26,9 +26,8 @@ pub struct AccessLogEntry {
 }
 
 /// One entry per L4 TCP connection. No method/uri/status/vhost — those are
-/// HTTP concepts with no meaning at L4; routing is pool-based. No TLS fields
-/// in passthrough mode: the stream is opaque, so Keel cannot know whether the
-/// client and backend negotiated TLS inside it.
+/// HTTP concepts with no meaning at L4; routing is pool-based. In passthrough
+/// mode the stream is opaque, so the TLS fields stay null.
 #[derive(Serialize)]
 pub struct TcpLogEntry {
     pub timestamp: String,
@@ -40,6 +39,12 @@ pub struct TcpLogEntry {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub duration_ms: f64,
+    /// Keel terminated TLS on this connection (`tls_mode` terminate or
+    /// reencrypt); the `tls_*` fields are then filled from the handshake.
+    pub tls: bool,
+    pub tls_sni: Option<String>,
+    pub tls_version: Option<String>,
+    pub tls_cipher: Option<String>,
     pub error: Option<String>,
 }
 
