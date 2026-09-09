@@ -8,6 +8,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **PROXY Protocol** (`proxy_protocol: true` on a listener): v1 and v2
+  headers are read ahead of everything else and the address they carry
+  becomes the client address for forwarded headers, access logs, hashing,
+  and passive health. Plain HTTP, `tcp_pool` (all TLS modes), and `udp_pool`
+  (per datagram) listeners. Connections and datagrams without a valid header
+  are rejected and counted in `keel_proxy_protocol_errors_total`. Not
+  available on `tls: true` HTTP listeners, where Pingora's handshake runs
+  before Keel sees the bytes.
+
 ---
 
 ## [0.10.0] — 2026-09-09

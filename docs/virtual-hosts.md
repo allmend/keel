@@ -121,9 +121,17 @@ Forwarded header configuration defaults to `mode: replace` if the `forwarded_hea
 
 ## PROXY Protocol
 
-PROXY Protocol parsing is not implemented. The listener field `proxy_protocol` is reserved for it, and setting it to `true` is a startup error rather than a silent no-op: a listener behind a load balancer that sends PROXY Protocol would otherwise record and forward the load balancer's address as the client's.
+A load balancer that terminates the client's TCP connection in front of Keel (AWS NLB, HAProxy, another Keel) can prepend a PROXY Protocol header naming the original client. With `proxy_protocol: true` on a listener, Keel reads that header before anything else and uses the address it carries as the client's: in forwarded headers, access logs, the consistent-hash key, and passive health.
 
-Until it lands, a load balancer in front of Keel should be configured not to send PROXY Protocol, and the real client address is not available to Keel on those connections. Forwarded headers then carry the load balancer's address.
+```yaml
+listeners:
+  - address: 0.0.0.0:80
+    proxy_protocol: true
+```
+
+Versions 1 (text) and 2 (binary) are accepted. A `LOCAL` (v2) or `UNKNOWN` (v1) header, which load balancers send for their own health checks, leaves the socket's own peer as the client. A connection that does not start with a valid header is closed without a response and counted in `keel_proxy_protocol_errors_total`; there is no fallback, since a fallback would let any client claim any address. Enable the option only on listeners that are reached exclusively through a load balancer sending the header.
+
+The option works on plain HTTP listeners, on `tcp_pool` listeners in every `tls_mode` (the header precedes the TLS handshake, which Keel performs itself there), and on `udp_pool` listeners, where each datagram carries a v2 header as an NLB sends them. It is not available on `tls: true` HTTP listeners: Pingora completes the TLS handshake before Keel sees the connection, so the header cannot be read there. Terminate TLS on the load balancer, or use a `tcp_pool` listener with `tls_mode: terminate` in front of an HTTP listener, for that case.
 
 ---
 

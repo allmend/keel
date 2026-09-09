@@ -11,6 +11,7 @@ mod l4;
 mod metrics;
 mod process;
 mod proxy;
+mod proxy_protocol;
 mod tls;
 mod udp;
 mod vhost;

@@ -44,7 +44,7 @@ pools:
 | `udp_pool` | Name of the pool to forward to; must exist in `pools`. The value is a pool name, not a protocol: datagrams of any UDP protocol are forwarded unchanged. Makes the listener UDP-only: vhosts and routes are ignored |
 | `tls` | Rejected together with `udp_pool` — datagrams are never terminated |
 | `tcp_pool` | Rejected on the same listener entry. To serve both protocols on one port, add two listener entries with the same `address` (see the DNS example) |
-| `proxy_protocol` | Reserved; `true` is a startup error until parsing is implemented |
+| `proxy_protocol` | Every datagram starts with a PROXY Protocol v2 header (as an NLB sends for UDP); the flow's client is the address it names. Datagrams without one are dropped |
 
 | `keel` field | Default | Notes |
 |---|---|---|

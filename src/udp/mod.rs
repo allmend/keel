@@ -55,6 +55,9 @@ pub struct UdpProxyService {
     /// Socket bound by the root master before the privilege drop. `None`
     /// (unprivileged dev runs) means the service binds its own.
     pub socket: Option<std::net::UdpSocket>,
+    /// Every datagram starts with a PROXY protocol v2 header (as an NLB
+    /// sends for UDP); the client is the address it names.
+    pub proxy_protocol: bool,
 }
 
 /// Per-flow accounting, shared between the receive loop (client → backend)
@@ -148,6 +151,7 @@ impl UdpProxyService {
         &self,
         downstream: &Arc<UdpSocket>,
         client: SocketAddr,
+        reply_to: SocketAddr,
         now: Instant,
     ) -> Option<Flow> {
         // The client address doubles as the consistent-hash key, as for TCP.
@@ -185,7 +189,7 @@ impl UdpProxyService {
         let reply_task = tokio::spawn(reply_loop(
             Arc::clone(&upstream),
             Arc::clone(downstream),
-            client,
+            reply_to,
             Arc::clone(&stats),
             counters.clone(),
             self.pool.clone(),
@@ -197,11 +201,16 @@ impl UdpProxyService {
     }
 
     /// Forward one datagram, opening a flow for an unknown client first.
+    /// `client` keys the flow and is what logs and hashing see; `reply_to` is
+    /// the socket peer replies go to. They differ behind a load balancer
+    /// sending PROXY protocol headers: the client is in the header, the
+    /// balancer is the peer.
     async fn handle_datagram(
         &self,
         downstream: &Arc<UdpSocket>,
         flows: &mut HashMap<SocketAddr, Flow>,
         client: SocketAddr,
+        reply_to: SocketAddr,
         data: &[u8],
     ) {
         let now = Instant::now();
@@ -214,7 +223,7 @@ impl UdpProxyService {
             }
         }
         if !flows.contains_key(&client) {
-            let Some(flow) = self.open_flow(downstream, client, now).await else { return };
+            let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };
             flows.insert(client, flow);
         }
 
@@ -323,7 +332,23 @@ impl BackgroundService for UdpProxyService {
                 }
                 received = downstream.recv_from(&mut buf) => {
                     match received {
-                        Ok((n, client)) => self.handle_datagram(&downstream, &mut flows, client, &buf[..n]).await,
+                        Ok((n, peer)) => {
+                            let client = peer;
+                            let (client, data) = if self.proxy_protocol {
+                                match crate::proxy_protocol::parse(&buf[..n]) {
+                                    Ok(h) => (h.addresses.map(|(src, _)| src).unwrap_or(client), &buf[h.consumed..n]),
+                                    Err(e) => {
+                                        debug!(pool = self.pool, listener = self.listener, error = ?e, "udp: PROXY header rejected");
+                                        crate::metrics::record_proxy_protocol_error(&self.listener);
+                                        crate::metrics::record_udp_error(&self.pool, "proxy_protocol");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                (client, &buf[..n])
+                            };
+                            self.handle_datagram(&downstream, &mut flows, client, peer, data).await
+                        }
                         // Transient (e.g. ICMP surfaced on some platforms); the
                         // listener socket itself is not affected.
                         Err(e) => debug!(address = self.listener, error = %e, "udp: receive failed"),
@@ -340,7 +365,7 @@ impl BackgroundService for UdpProxyService {
 async fn reply_loop(
     upstream: Arc<UdpSocket>,
     downstream: Arc<UdpSocket>,
-    client: SocketAddr,
+    reply_to: SocketAddr,
     stats: Arc<FlowStats>,
     counters: UdpFlowCounters,
     pool: String,
@@ -374,14 +399,14 @@ async fn reply_loop(
                 return;
             }
         };
-        match downstream.send_to(&buf[..n], client).await {
+        match downstream.send_to(&buf[..n], reply_to).await {
             Ok(sent) => {
                 stats.record_out(Instant::now(), sent);
                 counters.packet_out(sent);
                 pools.report_success(&pool, backend);
             }
             Err(e) => {
-                debug!(pool, client = %client, error = %e, "udp: reply send failed");
+                debug!(pool, reply_to = %reply_to, error = %e, "udp: reply send failed");
                 crate::metrics::record_udp_error(&pool, "downstream_send");
                 stats.fail("downstream_send");
                 return;

@@ -61,7 +61,7 @@ pools:
 | `tls_verify` | `reencrypt` only, default `false`: verify the backend certificate against the system trust store (plus `tls_ca`) and the backend's configured hostname |
 | `tls_ca` | `reencrypt` with `tls_verify`: PEM bundle of additional trusted CAs, for backends with an internal CA |
 | `tls` | Rejected together with `tcp_pool` — that field is HTTP termination; use `tls_mode` |
-| `proxy_protocol` | Reserved; `true` is a startup error until parsing is implemented |
+| `proxy_protocol` | Expect a PROXY Protocol header (v1 or v2) before the stream, in any `tls_mode`; the client address comes from it. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 
 Config validation fails at startup for an unknown `tcp_pool`, a
 `tcp_pool` + `tls: true` combination, `terminate`/`reencrypt` without a

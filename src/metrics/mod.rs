@@ -138,6 +138,15 @@ pub static BACKEND_EJECTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register keel_backend_ejections_total")
 });
 
+pub static PROXY_PROTOCOL_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_proxy_protocol_errors_total",
+        "Connections or datagrams on a proxy_protocol listener rejected for a missing or malformed PROXY header",
+        &["listener"]
+    )
+    .expect("register keel_proxy_protocol_errors_total")
+});
+
 // TCP (L4) metrics
 
 pub static TCP_CONNECTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -331,6 +340,10 @@ pub fn record_ejection(pool: &str, backend: &str, ejected: bool) {
     if ejected {
         BACKEND_EJECTIONS_TOTAL.with_label_values(&[pool, backend]).inc();
     }
+}
+
+pub fn record_proxy_protocol_error(listener: &str) {
+    PROXY_PROTOCOL_ERRORS.with_label_values(&[listener]).inc();
 }
 
 pub fn set_drain_state(pool: &str, backend: &str, state: u8) {

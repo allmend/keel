@@ -59,6 +59,7 @@ pub struct ProxyCtx {
 
 // Proxy implementation
 
+#[derive(Clone)]
 pub struct KProxy {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
@@ -969,12 +970,13 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
 
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
+    add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg
         .listeners
         .iter()
-        .filter(|l| !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
         .collect();
     let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 
@@ -1026,6 +1028,57 @@ fn add_remote_control(
             cluster,
         },
     ));
+}
+
+/// HTTP listener that expects a PROXY protocol header first. The header is
+/// consumed and the stream's socket digest replaced, so Pingora's HTTP stack
+/// — client address, forwarded headers, access log — sees the original
+/// client. Connections without a valid header are closed.
+struct ProxyProtocolApp {
+    inner: Arc<pingora::proxy::HttpProxy<KProxy>>,
+    listener: String,
+}
+
+#[async_trait]
+impl pingora::apps::ServerApp for ProxyProtocolApp {
+    async fn process_new(
+        self: &Arc<Self>,
+        mut stream: pingora::protocols::Stream,
+        shutdown: &pingora::server::ShutdownWatch,
+    ) -> Option<pingora::protocols::Stream> {
+        match crate::proxy_protocol::read_from_stream(&mut stream).await {
+            Ok(Some((src, _))) => {
+                let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
+                let _ = digest.peer_addr.set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
+                stream.set_socket_digest(digest);
+            }
+            Ok(None) => {} // LOCAL / UNKNOWN: the socket peer is the client
+            Err(e) => {
+                tracing::debug!(listener = self.listener, error = ?e, "proxy_protocol: connection rejected");
+                crate::metrics::record_proxy_protocol_error(&self.listener);
+                return None;
+            }
+        }
+        pingora::apps::ServerApp::process_new(&self.inner, stream, shutdown).await
+    }
+}
+
+/// One service per plain HTTP listener with `proxy_protocol: true`.
+fn add_proxy_protocol_services(server: &mut Server, cfg: &Config, proxy: KProxy) {
+    for l in cfg
+        .listeners
+        .iter()
+        .filter(|l| l.proxy_protocol && !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+    {
+        info!(address = l.address, "adding listener (PROXY protocol)");
+        let app = ProxyProtocolApp {
+            inner: Arc::new(pingora::proxy::HttpProxy::new(proxy.clone(), server.configuration.clone())),
+            listener: l.address.clone(),
+        };
+        let mut svc = pingora::services::listening::Service::new(format!("proxy-pp-{}", l.address), app);
+        svc.add_tcp(&l.address);
+        server.add_service(svc);
+    }
 }
 
 /// Register one L4 service per `tcp_pool` listener, with the TLS material its
@@ -1088,6 +1141,7 @@ fn add_l4_services(
             server_tls,
             client_tls,
             backend_names,
+            proxy_protocol: l.proxy_protocol,
         };
         let mut svc = pingora::services::listening::Service::new(
             format!("tcp-{}", l.address),
@@ -1120,6 +1174,7 @@ fn add_udp_services(
             access_logger: Arc::clone(access_logger),
             flow_timeout: std::time::Duration::from_secs(cfg.keel.udp_flow_timeout_seconds),
             socket,
+            proxy_protocol: l.proxy_protocol,
         };
         server.add_service(background_service(&format!("udp-{}", l.address), svc));
     }
@@ -1247,12 +1302,13 @@ pub fn run_cluster(
 
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
+    add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg
         .listeners
         .iter()
-        .filter(|l| !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
         .collect();
     let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 

@@ -156,7 +156,7 @@ TCP listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection
 | `tls_sni` | SNI the client sent; `null` when none, or in passthrough |
 | `tls_version` | `TLSv1.2` or `TLSv1.3`; `null` in passthrough |
 | `tls_cipher` | Cipher suite as named by rustls, for example `TLS13_AES_256_GCM_SHA384`; `null` in passthrough |
-| `error` | `null`, `no_backend`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, or `shutdown` |
+| `error` | `null`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, or `shutdown` |
 
 No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no meaning at L4. In passthrough mode the stream is opaque to Keel, so the TLS fields stay null even when the client and backend negotiate TLS inside it.
 

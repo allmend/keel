@@ -73,7 +73,7 @@ listeners:
 |---|---|---|---|
 | `address` | string | required | `host:port` |
 | `tls` | bool | `false` | TLS termination; certs configured per-vhost |
-| `proxy_protocol` | bool | `false` | Reserved. Parsing is not implemented; `true` is a startup error |
+| `proxy_protocol` | bool | `false` | Expect a PROXY Protocol v1/v2 header from the upstream load balancer and take the client address from it. Plain HTTP, `tcp_pool`, and `udp_pool` listeners; rejected with `tls: true`. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 | `tcp_pool` | string | none | Makes the listener L4: raw TCP is spliced to this pool (passthrough — the stream is never inspected). Vhosts and routes do not apply, and `tls` is rejected on the same listener. See [TCP proxying](tcp-proxying.md) |
 | `udp_pool` | string | none | Makes the listener UDP: datagrams are forwarded to this pool, one flow per client `ip:port` until idle for `keel.udp_flow_timeout_seconds`. Vhosts and routes do not apply; `tls` and `tcp_pool` are rejected on the same listener. See [UDP proxying](udp-proxying.md) |
 | `tls_mode` | string | `passthrough` | `tcp_pool` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-handling--three-modes) |

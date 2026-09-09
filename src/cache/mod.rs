@@ -9,6 +9,7 @@ use disk::DiskStore;
 use tiered::TieredStore;
 
 /// Returned by [init] — holds `'static` pointers required by Pingora.
+#[derive(Clone, Copy)]
 pub struct CacheHandle {
     pub storage: &'static (dyn Storage + Sync),
     pub eviction: &'static Manager<16>,

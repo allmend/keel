@@ -52,6 +52,8 @@ pub struct TcpProxyApp {
     /// Configured hostname per resolved backend, used as SNI and, with
     /// `tls_verify`, as the name the backend certificate must match.
     pub backend_names: HashMap<SocketAddr, String>,
+    /// Expect a PROXY protocol header before anything else on the stream.
+    pub proxy_protocol: bool,
 }
 
 /// What one connection did, for accounting and the access log.
@@ -250,9 +252,27 @@ impl ServerApp for TcpProxyApp {
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let started = std::time::Instant::now();
-        let client_addr = session
+        let mut session = session;
+        let mut client_addr = session
             .get_socket_digest()
             .and_then(|d| d.peer_addr().map(|a| a.to_string()));
+
+        // The header comes before TLS on the wire, so it is read here, ahead
+        // of any termination in `splice`.
+        if self.proxy_protocol {
+            match crate::proxy_protocol::read_from_stream(&mut session).await {
+                Ok(Some((src, _))) => client_addr = Some(src.to_string()),
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(pool = self.pool, listener = self.listener, error = ?e, "tcp: PROXY header rejected");
+                    crate::metrics::record_proxy_protocol_error(&self.listener);
+                    crate::metrics::record_tcp_error(&self.pool, "proxy_protocol");
+                    let out = Outcome { error: Some("proxy_protocol"), ..Default::default() };
+                    self.log(client_addr, None, &out, started);
+                    return None;
+                }
+            }
+        }
 
         // Client address doubles as the consistent-hash key (session affinity).
         let key = client_addr.clone().unwrap_or_default();
@@ -343,6 +363,7 @@ mod tests {
             server_tls,
             client_tls,
             backend_names,
+            proxy_protocol: false,
         })
     }
 
