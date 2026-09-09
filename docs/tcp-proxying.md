@@ -99,7 +99,8 @@ pools:
   redis:
     algorithm: least_connections
     health_check:
-      type: tcp
+      type: tls             # TLS-on-connect: the handshake itself is the check
+      min_days_valid: 14    # and the certificate must not be about to expire
       interval: 5s
       timeout: 1s
     backends:

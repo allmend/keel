@@ -29,7 +29,8 @@ pools:
   dns:
     algorithm: round_robin
     health_check:
-      type: tcp                 # probes port 53/tcp — there is no UDP probe
+      type: dns                 # a real query; see health-checks.md
+      query: example.com
       interval: 10s
       timeout: 2s
     backends:
@@ -53,13 +54,14 @@ Config validation fails at startup for an unknown `udp_pool`, a
 `udp_pool` + `tls: true` combination, `udp_pool` and `tcp_pool` on the same
 listener, or a zero timeout.
 
-Health checks are TCP or HTTP; there is no UDP probe. For services that
-also listen on TCP at the same port (DNS, syslog with TCP transport), a
-`type: tcp` check on that port marks a dead host unhealthy. A pool without
-a health check keeps selecting a backend that no longer answers; the flow
-then ends with `upstream_recv` (see below) and the client's next datagram
-re-selects — for round robin this reaches a different backend, for
-consistent hashing the same one.
+Health checks for UDP pools: `dns` and `ntp` ask the service itself; `udp`
+sends an empty datagram and marks a backend down only on ICMP
+port-unreachable, so it proves a closed port but not a working service. See
+[Health checks](health-checks.md). A pool without a health check keeps
+selecting a backend that no longer answers; the flow then ends with
+`upstream_recv` (see below) and the client's next datagram re-selects — for
+round robin this reaches a different backend, for consistent hashing the
+same one.
 
 ## Example: DNS
 
@@ -81,7 +83,8 @@ pools:
   dns:
     algorithm: round_robin
     health_check:
-      type: tcp
+      type: dns
+      query: example.org
       interval: 5s
       timeout: 1s
     backends:
@@ -116,6 +119,8 @@ listeners:
 pools:
   syslog:
     algorithm: consistent_hash   # one sender keeps reaching the same collector
+    health_check:
+      type: udp                  # syslog has no reply to check; detect closed ports only
     backends:
       - address: 10.0.0.21:514
       - address: 10.0.0.22:514

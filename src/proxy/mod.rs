@@ -499,6 +499,36 @@ impl ProxyHttp for KProxy {
         Ok(())
     }
 
+    /// Passive detection: the upstream connection failed before any byte was
+    /// exchanged — unambiguously the backend's fault.
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        e: Box<Error>,
+    ) -> Box<Error> {
+        if let Some(addr) = ctx.backend {
+            self.pools.report_failure(&ctx.pool, addr, "connect");
+        }
+        e
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        _digest: Option<&pingora::protocols::Digest>,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        if let Some(addr) = ctx.backend {
+            self.pools.report_success(&ctx.pool, addr);
+        }
+        Ok(())
+    }
+
     async fn logging(
         &self,
         session: &mut Session,
@@ -650,6 +680,9 @@ pub struct WorkerSockets {
     pub tcp: Vec<(String, std::os::fd::RawFd)>,
     /// config address → this worker's socket of the SO_REUSEPORT group.
     pub udp: HashMap<String, std::net::UdpSocket>,
+    /// ICMP datagram sockets for `icmp` health checks (master-opened).
+    pub icmp4: Option<std::net::UdpSocket>,
+    pub icmp6: Option<std::net::UdpSocket>,
     /// Private unix socket path used to pass the TCP fds to Pingora.
     pub upgrade_sock: String,
 }
@@ -667,12 +700,23 @@ fn resolve_addr(addr: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no address resolved for '{addr}'"))
 }
 
-// Builds all pools from config, registering health-check background services on the server.
-fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry> {
+// Builds all pools from config. Health checks are registered separately
+// (`add_health_services`) once the registry exists.
+fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
     let mut pools: HashMap<String, Pool> = HashMap::new();
     let mut drain: HashMap<String, crate::backend::BackendEntry> = HashMap::new();
+    let mut passive: HashMap<String, crate::backend::PassiveRule> = HashMap::new();
 
     for (name, pool_cfg) in &cfg.pools {
+        if pool_cfg.passive.enabled {
+            passive.insert(
+                name.clone(),
+                crate::backend::PassiveRule {
+                    failures: pool_cfg.passive.failures,
+                    eject_for: health::parse_duration(&pool_cfg.passive.eject_for),
+                },
+            );
+        }
         // Resolve hostnames to IPs once at startup so Pingora gets SocketAddrs
         // and the drain map keys stay consistent with what the load balancer uses.
         let resolved: Vec<String> = pool_cfg.backends.iter()
@@ -690,19 +734,13 @@ fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry
 
         let pool = match pool_cfg.algorithm {
             LbAlgorithm::RoundRobin => {
-                Pool::RoundRobin(build_with_hc::<pingora::lb::selection::RoundRobin>(
-                    name, &addrs, &weights, pool_cfg, server,
-                )?)
+                Pool::RoundRobin(build_pool_lb::<pingora::lb::selection::RoundRobin>(name, &addrs, &weights)?)
             }
             LbAlgorithm::Random => {
-                Pool::Random(build_with_hc::<pingora::lb::selection::Random>(
-                    name, &addrs, &weights, pool_cfg, server,
-                )?)
+                Pool::Random(build_pool_lb::<pingora::lb::selection::Random>(name, &addrs, &weights)?)
             }
             LbAlgorithm::ConsistentHash => {
-                Pool::ConsistentHash(build_with_hc::<pingora::lb::selection::Consistent>(
-                    name, &addrs, &weights, pool_cfg, server,
-                )?)
+                Pool::ConsistentHash(build_pool_lb::<pingora::lb::selection::Consistent>(name, &addrs, &weights)?)
             }
             LbAlgorithm::LeastConnections => {
                 Pool::LeastConn(Arc::new(
@@ -715,38 +753,68 @@ fn build_pools(cfg: &Config, server: &mut Server) -> anyhow::Result<PoolRegistry
         pools.insert(name.clone(), pool);
     }
 
-    Ok(PoolRegistry::new(pools, drain))
+    Ok(PoolRegistry::new(pools, drain, passive))
 }
 
-// Build a typed `LoadBalancer`, optionally attach a health check and register
-// a background service, then return an `Arc` to the lb.
-fn build_with_hc<S>(
+// Build a typed `LoadBalancer` behind an `Arc`. No Pingora health check is
+// attached: Keel runs its own (see `health`), so the balancer needs no
+// background service and `select_with` sees every backend as healthy.
+fn build_pool_lb<S>(
     name: &str,
     addrs: &[&str],
     weights: &[usize],
-    pool_cfg: &crate::config::Pool,
-    server: &mut Server,
 ) -> anyhow::Result<Arc<pingora::lb::LoadBalancer<S>>>
 where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
 {
-    let mut lb = build_lb::<S>(addrs, weights)
-        .map_err(|e| anyhow::anyhow!("pool '{name}': {e}"))?;
+    let lb = build_lb::<S>(addrs, weights).map_err(|e| anyhow::anyhow!("pool '{name}': {e}"))?;
+    Ok(Arc::new(lb))
+}
 
-    if let Some(hc_cfg) = &pool_cfg.health_check {
-        let hc = health::build(hc_cfg, addrs.first().copied().unwrap_or(""), name);
-        lb.set_health_check(hc);
-        lb.health_check_frequency = Some(health::parse_duration(&hc_cfg.interval));
-        lb.parallel_health_check = true;
+/// Clears expired passive ejections once a second so the re-admission is
+/// logged and `keel_backend_ejected` drops (selection ignores expired
+/// ejections on its own).
+struct EjectionSweeper {
+    pools: Arc<PoolRegistry>,
+}
 
-        let bg = background_service(&format!("hc:{name}"), lb);
-        let arc = bg.task();
-        server.add_service(bg);
-        info!(pool = name, "health check enabled");
-        Ok(arc)
-    } else {
-        Ok(Arc::new(lb))
+#[async_trait]
+impl pingora::services::background::BackgroundService for EjectionSweeper {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = tick.tick() => {
+                    self.pools.sweep_ejections();
+                }
+            }
+        }
+    }
+}
+
+/// Register one health-check service per pool that configures one, plus the
+/// passive-ejection sweeper.
+fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
+    if cfg.pools.values().any(|p| p.passive.enabled) {
+        server.add_service(background_service("passive-sweep", EjectionSweeper { pools: Arc::clone(pools) }));
+    }
+    for (name, pool_cfg) in &cfg.pools {
+        let Some(hc) = &pool_cfg.health_check else { continue };
+        let addrs: Vec<String> =
+            pools.backends_for_pool(name).into_iter().map(|b| b.address).collect();
+        match health::HealthService::build(hc, name, &addrs, Arc::clone(pools)) {
+            Ok(svc) => {
+                server.add_service(background_service(&format!("hc:{name}"), svc));
+            }
+            Err(e) => {
+                error!(pool = name, error = %e, "health: cannot build check");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -841,14 +909,18 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
     let mut server = new_server(cfg, inherited.as_ref());
     send_inherited_fds(inherited.as_ref());
     server.bootstrap();
+    if let Some(w) = inherited.as_mut() {
+        crate::health::icmp::init(crate::health::icmp::IcmpSockets { v4: w.icmp4.take(), v6: w.icmp6.take() });
+    }
 
-    let pools = match build_pools(cfg, &mut server) {
+    let pools = match build_pools(cfg) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             error!(error = %e, "failed to build pool registry");
             std::process::exit(1);
         }
     };
+    add_health_services(&mut server, cfg, &pools);
 
     let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
         error!(error = %e, "failed to load TLS certificates");
@@ -1059,13 +1131,14 @@ pub fn run_cluster(
     let mut server = new_server(cfg, None);
     server.bootstrap();
 
-    let pools = match build_pools(cfg, &mut server) {
+    let pools = match build_pools(cfg) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             error!(error = %e, "failed to build pool registry");
             std::process::exit(1);
         }
     };
+    add_health_services(&mut server, cfg, &pools);
 
     let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
         error!(error = %e, "failed to load TLS certificates");

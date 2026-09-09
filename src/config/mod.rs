@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
     let raw = fs::read_to_string(path)
@@ -188,6 +189,55 @@ impl Config {
         for (name, pool) in &self.pools {
             if pool.backends.is_empty() {
                 anyhow::bail!("pool '{name}' has no backends");
+            }
+            if pool.passive.failures == 0 {
+                anyhow::bail!("pool '{name}': passive.failures must be at least 1");
+            }
+            parse_duration(&pool.passive.eject_for)
+                .map_err(|e| anyhow::anyhow!("pool '{name}': passive.eject_for: {e}"))?;
+            if let Some(hc) = &pool.health_check {
+                parse_duration(&hc.interval)
+                    .map_err(|e| anyhow::anyhow!("pool '{name}': health_check.interval: {e}"))?;
+                parse_duration(&hc.timeout)
+                    .map_err(|e| anyhow::anyhow!("pool '{name}': health_check.timeout: {e}"))?;
+                if hc.healthy_threshold == 0 || hc.unhealthy_threshold == 0 {
+                    anyhow::bail!("pool '{name}': health_check thresholds must be at least 1");
+                }
+                if hc.port == Some(0) {
+                    anyhow::bail!("pool '{name}': health_check.port must be 1-65535");
+                }
+                match &hc.probe {
+                    ProbeConfig::Http { path, expect_status, .. } => {
+                        if !path.starts_with('/') {
+                            anyhow::bail!("pool '{name}': health_check.path must start with '/'");
+                        }
+                        if let Some(s) = expect_status.iter().find(|s| !(100..=599).contains(*s)) {
+                            anyhow::bail!("pool '{name}': health_check.expect_status {s} is not an HTTP status");
+                        }
+                    }
+                    ProbeConfig::Tls { sni: Some(sni), .. } => {
+                        let labels: Vec<&str> = sni.split('.').collect();
+                        if sni.is_empty() || labels.iter().any(|l| l.is_empty() || l.len() > 63) {
+                            anyhow::bail!("pool '{name}': health_check.sni '{sni}' is not a valid host name");
+                        }
+                    }
+                    ProbeConfig::Dns { query, record, expect, .. } => {
+                        let labels: Vec<&str> = query.trim_end_matches('.').split('.').collect();
+                        if query.is_empty() || labels.iter().any(|l| l.is_empty() || l.len() > 63) || query.len() > 253 {
+                            anyhow::bail!("pool '{name}': health_check.query '{query}' is not a valid DNS name");
+                        }
+                        if let Some(e) = expect {
+                            let ip: std::net::IpAddr = e
+                                .parse()
+                                .map_err(|_| anyhow::anyhow!("pool '{name}': health_check.expect '{e}' is not an IP address"))?;
+                            let family_ok = matches!((record, ip), (DnsRecord::A, std::net::IpAddr::V4(_)) | (DnsRecord::Aaaa, std::net::IpAddr::V6(_)));
+                            if !family_ok {
+                                anyhow::bail!("pool '{name}': health_check.expect '{e}' does not match record type {record:?}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         if let Some(remote) = self.control.as_ref().and_then(|c| c.remote.as_ref()) {
@@ -521,9 +571,40 @@ pub struct Pool {
 
     pub health_check: Option<HealthCheck>,
 
+    /// Passive detection from real traffic; on by default.
+    #[serde(default)]
+    pub passive: PassiveConfig,
+
     #[serde(default)]
     pub backends: Vec<Backend>,
 }
+
+/// Outlier ejection: a backend whose real requests, connections, or UDP
+/// flows fail `failures` times in a row is taken out for `eject_for`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PassiveConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default = "default_passive_failures")]
+    pub failures: u32,
+
+    #[serde(default = "default_passive_eject_for")]
+    pub eject_for: String,
+}
+
+impl Default for PassiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failures: default_passive_failures(),
+            eject_for: default_passive_eject_for(),
+        }
+    }
+}
+
+fn default_passive_failures() -> u32 { 5 }
+fn default_passive_eject_for() -> String { "30s".into() }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -535,32 +616,182 @@ pub enum LbAlgorithm {
     ConsistentHash,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Active health check for a pool. `type` selects the probe; the fields a
+/// probe accepts are checked strictly on load (see `Deserialize` below), so
+/// a `path` on a `tcp` check is an error rather than silently ignored.
+#[derive(Debug, Clone, Serialize)]
 pub struct HealthCheck {
-    #[serde(rename = "type")]
-    pub kind: HealthCheckKind,
+    #[serde(flatten)]
+    pub probe: ProbeConfig,
 
-    #[serde(default = "default_health_path")]
-    pub path: String,
-
-    #[serde(default = "default_health_interval")]
     pub interval: String,
-
-    #[serde(default = "default_health_timeout")]
     pub timeout: String,
-
-    #[serde(default = "default_healthy_threshold")]
     pub healthy_threshold: u32,
-
-    #[serde(default = "default_unhealthy_threshold")]
     pub unhealthy_threshold: u32,
+
+    /// Probe this port instead of the backend's traffic port (admin or
+    /// health ports). Applies to every probe type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealthCheckKind {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProbeConfig {
+    /// TCP connect succeeds.
     Tcp,
-    Http,
+    /// Empty datagram sent; healthy unless ICMP port-unreachable comes back.
+    Udp,
+    /// HTTP GET; 2xx (or `expect_status`) and optionally `expect_body`.
+    Http {
+        #[serde(default = "default_health_path")]
+        path: String,
+        /// Host header and TLS SNI; defaults to the backend address.
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        tls: bool,
+        /// Acceptable status codes; empty means any 2xx.
+        #[serde(default)]
+        expect_status: Vec<u16>,
+        /// Substring that must appear in the response body.
+        #[serde(default)]
+        expect_body: Option<String>,
+    },
+    /// One DNS query; healthy on NOERROR, optionally with `expect` among the answers.
+    Dns {
+        /// Name to resolve.
+        query: String,
+        #[serde(default)]
+        record: DnsRecord,
+        #[serde(default)]
+        transport: DnsTransport,
+        /// Address that must appear in the answer section.
+        #[serde(default)]
+        expect: Option<String>,
+    },
+    /// NTP client request; healthy on a server reply with non-zero stratum.
+    Ntp,
+    /// ICMP echo to the backend host; proves the host, not the service.
+    Icmp,
+    /// TLS handshake completes; optionally the certificate stays valid for
+    /// at least `min_days_valid` days. The chain is not verified.
+    Tls {
+        /// SNI to send; default: the backend IP (no SNI).
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        min_days_valid: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DnsRecord {
+    #[default]
+    A,
+    Aaaa,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsTransport {
+    #[default]
+    Udp,
+    Tcp,
+}
+
+/// Every probe type name, for error messages.
+pub const PROBE_TYPES: &[&str] = &["tcp", "udp", "http", "dns", "ntp", "icmp", "tls"];
+
+const HEALTH_COMMON_FIELDS: &[&str] =
+    &["type", "interval", "timeout", "healthy_threshold", "unhealthy_threshold", "port"];
+
+/// Fields a probe type accepts besides the common ones; `None` = unknown type.
+fn probe_fields(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "tcp" | "udp" | "ntp" | "icmp" => &[],
+        "http" => &["path", "host", "tls", "expect_status", "expect_body"],
+        "dns" => &["query", "record", "transport", "expect"],
+        "tls" => &["sni", "min_days_valid"],
+        _ => return None,
+    })
+}
+
+/// Shape serde parses; `HealthCheck` wraps it after the strict key check.
+#[derive(Deserialize)]
+struct RawHealthCheck {
+    #[serde(flatten)]
+    probe: ProbeConfig,
+    #[serde(default = "default_health_interval")]
+    interval: String,
+    #[serde(default = "default_health_timeout")]
+    timeout: String,
+    #[serde(default = "default_healthy_threshold")]
+    healthy_threshold: u32,
+    #[serde(default = "default_unhealthy_threshold")]
+    unhealthy_threshold: u32,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+impl<'de> Deserialize<'de> for HealthCheck {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_yml::Value::deserialize(d)?;
+        let map = value
+            .as_mapping()
+            .ok_or_else(|| D::Error::custom("health_check must be a mapping"))?;
+        let kind = map
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| D::Error::custom("health_check.type is required"))?
+            .to_owned();
+        let extra = probe_fields(&kind).ok_or_else(|| {
+            D::Error::custom(format!(
+                "health_check.type '{kind}' is not one of: {}",
+                PROBE_TYPES.join(", ")
+            ))
+        })?;
+        for key in map.keys() {
+            let k = key.as_str();
+            if !HEALTH_COMMON_FIELDS.contains(&k) && !extra.contains(&k) {
+                return Err(D::Error::custom(format!(
+                    "health_check: field '{k}' is not valid for type '{kind}'"
+                )));
+            }
+        }
+        let raw: RawHealthCheck = serde_yml::from_value(value).map_err(D::Error::custom)?;
+        Ok(HealthCheck {
+            probe: raw.probe,
+            interval: raw.interval,
+            timeout: raw.timeout,
+            healthy_threshold: raw.healthy_threshold,
+            unhealthy_threshold: raw.unhealthy_threshold,
+            port: raw.port,
+        })
+    }
+}
+
+/// Strict duration parser for config values: `500ms`, `10s`, `2m`, `1h`.
+pub fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}' is not a duration (use e.g. 500ms, 10s, 2m)"))?;
+    let d = match unit {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n * 60),
+        "h" => Duration::from_secs(n * 3600),
+        _ => anyhow::bail!("'{s}' is not a duration (use e.g. 500ms, 10s, 2m)"),
+    };
+    if d.is_zero() {
+        anyhow::bail!("'{s}': duration must be greater than zero");
+    }
+    Ok(d)
 }
 
 fn default_health_path() -> String { "/health".into() }
@@ -924,6 +1155,124 @@ mod tests {
             "  - address: 0.0.0.0:53\n    udp_pool: dns\n  - address: 0.0.0.0:53\n    tcp_pool: dns\n",
         );
         cfg.validate().expect("valid");
+    }
+
+    fn pool_with(hc: &str) -> Config {
+        let yaml = format!("pools:\n  p:\n    health_check:\n{hc}    backends:\n      - address: 10.0.0.1:80\n");
+        serde_yml::from_str(&yaml).expect("yaml parses")
+    }
+
+    fn parse_err(hc: &str) -> String {
+        let yaml = format!("pools:\n  p:\n    health_check:\n{hc}    backends:\n      - address: 10.0.0.1:80\n");
+        serde_yml::from_str::<Config>(&yaml).expect_err("should not parse").to_string()
+    }
+
+    #[test]
+    fn health_check_tcp_and_http_keep_their_shape() {
+        let cfg = pool_with("      type: tcp\n      interval: 5s\n");
+        let hc = cfg.pools["p"].health_check.as_ref().unwrap();
+        assert!(matches!(hc.probe, ProbeConfig::Tcp));
+        assert_eq!(hc.interval, "5s");
+        assert_eq!(hc.timeout, "2s");
+        assert_eq!(hc.healthy_threshold, 2);
+        cfg.validate().expect("valid");
+
+        let cfg = pool_with("      type: http\n      path: /ready\n      expect_status: [200, 204]\n      port: 9000\n");
+        let hc = cfg.pools["p"].health_check.as_ref().unwrap();
+        match &hc.probe {
+            ProbeConfig::Http { path, expect_status, tls, .. } => {
+                assert_eq!(path, "/ready");
+                assert_eq!(expect_status, &[200, 204]);
+                assert!(!tls);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(hc.port, Some(9000));
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn health_check_rejects_fields_of_other_types() {
+        assert!(parse_err("      type: tcp\n      path: /health\n").contains("'path' is not valid for type 'tcp'"));
+        assert!(parse_err("      type: udp\n      expect_body: ok\n").contains("'expect_body' is not valid for type 'udp'"));
+        assert!(parse_err("      type: smtp\n").contains("not one of"));
+        assert!(parse_err("      interval: 5s\n").contains("type is required"));
+    }
+
+    #[test]
+    fn dns_and_ntp_probes_parse_and_validate() {
+        let cfg = pool_with("      type: dns\n      query: example.com\n      record: AAAA\n      transport: tcp\n      expect: '2001:db8::1'\n");
+        match &cfg.pools["p"].health_check.as_ref().unwrap().probe {
+            ProbeConfig::Dns { query, record, transport, expect } => {
+                assert_eq!(query, "example.com");
+                assert_eq!(*record, DnsRecord::Aaaa);
+                assert_eq!(*transport, DnsTransport::Tcp);
+                assert_eq!(expect.as_deref(), Some("2001:db8::1"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        cfg.validate().expect("valid");
+        let cfg = pool_with("      type: ntp\n");
+        assert!(matches!(cfg.pools["p"].health_check.as_ref().unwrap().probe, ProbeConfig::Ntp));
+        cfg.validate().expect("valid");
+        let cfg = pool_with("      type: icmp\n      timeout: 500ms\n");
+        assert!(matches!(cfg.pools["p"].health_check.as_ref().unwrap().probe, ProbeConfig::Icmp));
+        cfg.validate().expect("valid");
+        let cfg = pool_with("      type: tls\n      sni: db.example.com\n      min_days_valid: 14\n");
+        match &cfg.pools["p"].health_check.as_ref().unwrap().probe {
+            ProbeConfig::Tls { sni, min_days_valid } => {
+                assert_eq!(sni.as_deref(), Some("db.example.com"));
+                assert_eq!(*min_days_valid, Some(14));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        cfg.validate().expect("valid");
+        assert!(pool_with("      type: tls\n      sni: 'a..b'\n").validate().unwrap_err().to_string().contains("not a valid host name"));
+        assert!(parse_err("      type: tls\n      path: /\n").contains("'path' is not valid for type 'tls'"));
+
+        let err = |hc: &str| pool_with(hc).validate().expect_err("invalid").to_string();
+        assert!(err("      type: dns\n      query: ''\n").contains("not a valid DNS name"));
+        assert!(err("      type: dns\n      query: a..b\n").contains("not a valid DNS name"));
+        assert!(err("      type: dns\n      query: example.com\n      expect: nope\n").contains("not an IP address"));
+        assert!(err("      type: dns\n      query: example.com\n      expect: '::1'\n").contains("does not match record type"));
+        assert!(parse_err("      type: dns\n").contains("query"));
+        assert!(parse_err("      type: ntp\n      query: x\n").contains("'query' is not valid for type 'ntp'"));
+    }
+
+    #[test]
+    fn passive_defaults_and_validation() {
+        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
+        let p = &cfg.pools["p"].passive;
+        assert!(p.enabled);
+        assert_eq!(p.failures, 5);
+        assert_eq!(p.eject_for, "30s");
+        cfg.validate().expect("valid");
+
+        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    passive:\n      enabled: false\n      failures: 0\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("passive.failures"));
+        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    passive:\n      eject_for: forever\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("passive.eject_for"));
+    }
+
+    #[test]
+    fn health_check_validates_values() {
+        let err = |hc: &str| pool_with(hc).validate().expect_err("invalid").to_string();
+        assert!(err("      type: tcp\n      interval: soon\n").contains("health_check.interval"));
+        assert!(err("      type: tcp\n      timeout: 0s\n").contains("greater than zero"));
+        assert!(err("      type: tcp\n      healthy_threshold: 0\n").contains("thresholds"));
+        assert!(err("      type: http\n      path: health\n").contains("start with '/'"));
+        assert!(err("      type: http\n      expect_status: [42]\n").contains("not an HTTP status"));
+    }
+
+    #[test]
+    fn durations_parse_strictly() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert!(parse_duration("10").is_err());
+        assert!(parse_duration("fast").is_err());
+        assert!(parse_duration("0s").is_err());
     }
 
     #[test]

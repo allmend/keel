@@ -14,6 +14,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Health checks reworked** (`docs/health-checks.md`). New probes: `udp`
+  (ICMP port-unreachable detection), `dns` (one A/AAAA query over UDP or
+  TCP, healthy on NOERROR, optional expected address), `ntp` (client
+  request, kiss-o'-death detected), `icmp` (echo request over ICMP datagram
+  sockets, opened by the root master and inherited by the workers; host
+  liveness only), `tls` (handshake without chain verification, optional
+  `min_days_valid` certificate-expiry check). `http` gains `host`, `tls`,
+  `expect_status`, and `expect_body`. `port` overrides the probed port for
+  every type. Rounds are jittered ±10% and the first round runs within a
+  second of startup. `keel status` shows a health column and the reason for
+  the last failed probe. `least_connections` pools now honor health checks
+  (they were previously unchecked). Health state is owned by Keel rather than
+  Pingora's private table.
+- **Passive detection** (`pools.<name>.passive`, on by default): a backend
+  whose upstream connections or UDP replies fail 5 times in a row is
+  ejected for 30s, then re-admitted; the last available backend of a pool
+  is never ejected. Shown as `ejected` in `keel status`; metrics
+  `keel_backend_ejected`, `keel_backend_ejections_total`.
 - **UDP (L4) load balancing** — `udp_pool` on a listener forwards datagrams
   to an ordinary pool. One flow per client `ip:port`, pinned to a backend
   until idle for `keel.udp_flow_timeout_seconds` (default 30). Flows share
@@ -29,6 +47,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   backend), and `keel_tcp_errors_total` (per pool and reason).
 - **Metrics reference** — `docs/metrics.md` lists every exposed metric with
   labels, types, and example queries.
+
+### Changed
+
+- **`health_check` is validated strictly.** A field that does not belong to
+  the chosen `type` (for example `path` on `tcp`), an unknown `type`, a
+  malformed duration, or a zero threshold is a startup error. Previously
+  such fields were ignored and malformed durations fell back to defaults.
 
 ### Fixed
 

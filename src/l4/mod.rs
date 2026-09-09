@@ -81,9 +81,13 @@ impl ServerApp for TcpProxyApp {
         crate::metrics::record_tcp_connection(&self.pool, &backend.to_string());
 
         let mut upstream = match tokio::net::TcpStream::connect(backend).await {
-            Ok(s) => s,
+            Ok(s) => {
+                self.pools.report_success(&self.pool, backend);
+                s
+            }
             Err(e) => {
                 warn!(pool = self.pool, backend = %backend, error = %e, "tcp: upstream connect failed");
+                self.pools.report_failure(&self.pool, backend, "connect");
                 self.pools.release(&self.pool, backend);
                 crate::metrics::record_tcp_error(&self.pool, "upstream_connect");
                 self.log(client_addr, Some(backend.to_string()), 0, 0, started, Some("upstream_connect"));

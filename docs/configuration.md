@@ -11,7 +11,7 @@ Keel is configured via a YAML file, defaulting to `keel.yaml` in the working dir
 | `metrics` | Prometheus metrics endpoint | [below](#metrics) |
 | `access_log` | NDJSON access log output | [Access logging](access-logging.md) |
 | `cache` | Memory and disk HTTP cache | [Caching](caching.md) |
-| `pools` | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md) |
+| `pools` | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
 | `vhosts` | Virtual host routing rules | [Virtual hosts](virtual-hosts.md) |
 | `include` | Glob patterns for conf.d-style config splitting | [below](#config-splitting) |
 | `cluster` | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
@@ -172,13 +172,19 @@ pools:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `algorithm` | string | `round_robin` | `round_robin`, `random`, `least_connections`, `consistent_hash` |
-| `health_check` | object | none | Omit to disable health checks |
-| `health_check.type` | string | required | `tcp` or `http` |
-| `health_check.path` | string | `/health` | HTTP path (http type only) |
-| `health_check.interval` | string | `10s` | Check frequency |
-| `health_check.timeout` | string | `2s` | Per-check timeout |
+| `health_check` | object | none | Omit to disable health checks. Fields per probe type in [Health checks](health-checks.md) |
+| `health_check.type` | string | required | `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, `tls` |
+| `health_check.interval` | string | `10s` | Time between rounds, ±10% jitter |
+| `health_check.timeout` | string | `2s` | Per-probe timeout |
 | `health_check.healthy_threshold` | integer | `2` | Consecutive successes to mark healthy |
 | `health_check.unhealthy_threshold` | integer | `3` | Consecutive failures to mark unhealthy |
+| `health_check.port` | integer | traffic port | Probe a different port on the backend |
+| `health_check.path`, `.host`, `.tls`, `.expect_status`, `.expect_body` | | | `http` only |
+| `health_check.query`, `.record`, `.transport`, `.expect` | | | `dns` only |
+| `health_check.sni`, `.min_days_valid` | | | `tls` only |
+| `passive.enabled` | bool | `true` | Eject a backend after consecutive traffic failures. See [Health checks](health-checks.md#passive-detection) |
+| `passive.failures` | integer | `5` | Consecutive upstream connect (or UDP reply) failures that eject |
+| `passive.eject_for` | string | `30s` | Time out of rotation before re-admission |
 | `backends[].address` | string | required | `host:port` |
 | `backends[].weight` | integer | `1` | Relative weight for weighted algorithms |
 

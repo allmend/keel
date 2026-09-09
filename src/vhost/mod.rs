@@ -196,6 +196,7 @@ mod tests {
         (name.into(), Pool {
             algorithm: LbAlgorithm::RoundRobin,
             health_check: None,
+            passive: Default::default(),
             backends: vec![Backend { address: "127.0.0.1:8080".into(), weight: 1 }],
         })
     }

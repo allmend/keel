@@ -63,7 +63,10 @@ Weight defaults to `1` if omitted.
 
 ## Health checks
 
-Health checks run continuously in the background. Unhealthy backends are excluded from routing until they recover.
+A pool with a `health_check` block is probed continuously and unhealthy
+backends are excluded from selection until they recover. Probe types are
+`tcp`, `udp`, and `http`; thresholds, timeouts, a port override, and the
+status output are described in [Health checks](health-checks.md).
 
 ```yaml
 pools:
@@ -79,22 +82,9 @@ pools:
       - address: 10.0.0.1:8080
 ```
 
-| Field | Default | Notes |
-|---|---|---|
-| `type` | required | `tcp` or `http` |
-| `path` | `/health` | HTTP path; ignored for `tcp` type |
-| `interval` | `10s` | Time between checks |
-| `timeout` | `2s` | Per-check connect and response timeout |
-| `healthy_threshold` | `2` | Consecutive successes before marking healthy |
-| `unhealthy_threshold` | `3` | Consecutive failures before marking unhealthy |
-
-`type: tcp` — checks that a TCP connection can be established. Fast and protocol-agnostic. Use when the service doesn't have an HTTP health endpoint.
-
-`type: http` — sends a `GET` request to `path` and expects a 2xx response. More meaningful than TCP because it validates that the application is responding.
-
-Omit `health_check` entirely to disable health checks for a pool. All backends in that pool are always considered healthy.
-
-If all backends in a pool are unhealthy, Keel returns 502 for requests routed to that pool.
+Omit `health_check` to disable health checks for a pool. All backends in
+that pool are then always considered healthy. If all backends in a pool are
+unhealthy, Keel returns 502 for requests routed to that pool.
 
 ---
 

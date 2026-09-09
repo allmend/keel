@@ -82,6 +82,7 @@ Workers drop from root to `keel.user` / `keel.group` and exit rather than contin
 
 - The master resolves `keel.user` and `keel.group` before forking any worker, so a misconfigured name fails startup immediately instead of fork/exit looping.
 - On Linux, the master binds every listener (TCP and UDP) while still root and the workers inherit the sockets across `fork`. No worker ever holds `CAP_NET_BIND_SERVICE` or binds a port below 1024 itself.
+- The same applies to the ICMP datagram sockets used by `icmp` health checks: opened by the master (which has `CAP_NET_RAW`), inherited by the workers. Keel never opens raw sockets.
 - Each worker drops supplementary groups (`setgroups([])`), then gid, then uid, in that order, and exits if any step fails while running as root.
 - After the drop, the worker confirms it is no longer root and exits if it somehow still is.
 - A process already running unprivileged (typical in dev) skips the drop.

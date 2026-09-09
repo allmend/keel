@@ -49,7 +49,8 @@ Check that the request reaches your backend and returns a response.
 - [Configuration reference](configuration.md) — full schema for all sections
 - [Virtual hosts](virtual-hosts.md) — host-based routing, TLS, path routing
 - [Automatic TLS (ACME)](acme.md) — Let's Encrypt / ACME v2 certificates and renewal
-- [Load balancing](load-balancing.md) — algorithms, health checks, backend drain
+- [Load balancing](load-balancing.md) — algorithms, weights, backend drain
+- [Health checks](health-checks.md) — tcp, udp, and http probes, thresholds, status output
 - [TCP proxying](tcp-proxying.md) — L4 passthrough for databases and TLS-on-connect services
 - [UDP proxying](udp-proxying.md) — per-client flows for DNS, syslog, and other datagram services
 - [Caching](caching.md) — memory and disk cache

@@ -21,6 +21,10 @@ pub struct BoundListeners {
     /// One socket per worker per UDP listener, all in one SO_REUSEPORT group,
     /// so the kernel's client→socket hash keeps every flow on one worker.
     pub udp: Vec<(String, Vec<std::net::UdpSocket>)>,
+    /// One ICMP datagram socket per worker and family, when any pool uses an
+    /// `icmp` health check. Needs CAP_NET_RAW to open — the master has it.
+    pub icmp4: Vec<std::net::UdpSocket>,
+    pub icmp6: Vec<std::net::UdpSocket>,
 }
 
 impl BoundListeners {
@@ -39,7 +43,9 @@ impl BoundListeners {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/var/run/keel"));
         let upgrade_sock = dir.join(format!("upgrade-{index}.sock")).to_string_lossy().into_owned();
-        Ok(proxy::WorkerSockets { tcp, udp, upgrade_sock })
+        let icmp4 = self.icmp4.get(index).map(|s| s.try_clone()).transpose()?;
+        let icmp6 = self.icmp6.get(index).map(|s| s.try_clone()).transpose()?;
+        Ok(proxy::WorkerSockets { tcp, udp, icmp4, icmp6, upgrade_sock })
     }
 }
 
@@ -69,6 +75,18 @@ fn bind_listeners(cfg: &Config) -> Result<BoundListeners> {
 
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
+    let (mut icmp4, mut icmp6) = (Vec::new(), Vec::new());
+    if crate::health::icmp::needed(cfg) {
+        for _ in 0..cfg.keel.workers {
+            icmp4.push(crate::health::icmp::open_socket(false).context("master: cannot open ICMPv4 socket")?);
+            match crate::health::icmp::open_socket(true) {
+                Ok(s) => icmp6.push(s),
+                // IPv6 may be disabled on the host; v6 backends then pass unchecked.
+                Err(e) => warn!(error = %e, "master: cannot open ICMPv6 socket — icmp checks of IPv6 backends pass unconditionally"),
+            }
+        }
+        info!(sockets = icmp4.len(), "master: opened ICMP sockets for health checks");
+    }
     for l in &cfg.listeners {
         if l.udp_pool.is_some() {
             let socks = (0..cfg.keel.workers)
@@ -96,7 +114,7 @@ fn bind_listeners(cfg: &Config) -> Result<BoundListeners> {
         info!(address = l.address, "master: bound listener");
         tcp.push((l.address.clone(), bound));
     }
-    Ok(BoundListeners { tcp, udp })
+    Ok(BoundListeners { tcp, udp, icmp4, icmp6 })
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);

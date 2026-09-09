@@ -35,7 +35,8 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Default vhost action — redirect or static response for unknown hosts, no pool needed
 - Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
-- Health checks — TCP and HTTP
+- Health checks — `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, and `tls` probes; status/body matching, port override, failure reason in `keel status`
+- Passive detection — backends ejected after consecutive upstream failures, re-admitted on a timer; never the last one
 - Backend drain with live connection tracking
 - Config hot reload (SIGHUP or `keel config reload`)
 - TLS certificate hot-swap
@@ -211,6 +212,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [Configuration reference](docs/configuration.md)
 - [Virtual hosts](docs/virtual-hosts.md)
 - [Load balancing](docs/load-balancing.md)
+- [Health checks](docs/health-checks.md)
 - [TCP proxying (L4)](docs/tcp-proxying.md)
 - [UDP proxying (L4)](docs/udp-proxying.md)
 - [Clustering](docs/cluster.md)

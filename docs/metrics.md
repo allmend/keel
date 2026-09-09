@@ -42,6 +42,8 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 | `keel_active_connections` | gauge | `pool`, `backend` | Current active connections — HTTP and TCP combined; the same counter drain waits on |
 | `keel_backend_healthy` | gauge | `pool`, `backend` | `1` healthy, `0` unhealthy. Set on health-check transitions; pools without a `health_check` never emit it |
 | `keel_backend_drain_state` | gauge | `pool`, `backend` | `0` active, `1` draining, `2` removed |
+| `keel_backend_ejected` | gauge | `pool`, `backend` | `1` while passively ejected after consecutive traffic failures |
+| `keel_backend_ejections_total` | counter | `pool`, `backend` | Passive ejections |
 
 ## TCP (L4) metrics
 

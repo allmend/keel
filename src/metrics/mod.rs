@@ -120,6 +120,24 @@ pub static BACKEND_DRAIN_STATE: Lazy<GaugeVec> = Lazy::new(|| {
     .expect("register keel_backend_drain_state")
 });
 
+pub static BACKEND_EJECTED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "keel_backend_ejected",
+        "Backend passively ejected after consecutive traffic failures (1 = ejected)",
+        &["pool", "backend"]
+    )
+    .expect("register keel_backend_ejected")
+});
+
+pub static BACKEND_EJECTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_backend_ejections_total",
+        "Passive ejections per backend",
+        &["pool", "backend"]
+    )
+    .expect("register keel_backend_ejections_total")
+});
+
 // TCP (L4) metrics
 
 pub static TCP_CONNECTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
@@ -306,6 +324,13 @@ pub fn set_backend_healthy(pool: &str, backend: &str, healthy: bool) {
 
 pub fn set_active_connections(pool: &str, backend: &str, count: f64) {
     ACTIVE_CONNECTIONS.with_label_values(&[pool, backend]).set(count);
+}
+
+pub fn record_ejection(pool: &str, backend: &str, ejected: bool) {
+    BACKEND_EJECTED.with_label_values(&[pool, backend]).set(if ejected { 1.0 } else { 0.0 });
+    if ejected {
+        BACKEND_EJECTIONS_TOTAL.with_label_values(&[pool, backend]).inc();
+    }
 }
 
 pub fn set_drain_state(pool: &str, backend: &str, state: u8) {

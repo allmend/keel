@@ -169,7 +169,10 @@ fn print_backends(backends: &[serde_json::Value]) {
         let addr = b["address"].as_str().unwrap_or("?");
         let state = b["state"].as_str().unwrap_or("?");
         let conns = b["connections"].as_i64().unwrap_or(0);
-        println!("    {:<25}  {:<10}  {} conn", addr, state, conns);
+        // Older servers do not report health; keep their output unchanged.
+        let health = b["health"].as_str().unwrap_or("");
+        let reason = b["health_reason"].as_str().map(|r| format!("  ({r})")).unwrap_or_default();
+        println!("    {:<25}  {:<10}  {:<10}  {} conn{}", addr, state, health, conns, reason);
     }
 }
 

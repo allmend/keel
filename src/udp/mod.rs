@@ -190,6 +190,7 @@ impl UdpProxyService {
             counters.clone(),
             self.pool.clone(),
             backend,
+            Arc::clone(&self.pools),
         ));
         debug!(pool = self.pool, client = %client, backend = %backend, "udp: flow opened");
         Some(Flow { backend, upstream, stats, counters, reply_task })
@@ -335,6 +336,7 @@ impl BackgroundService for UdpProxyService {
 
 /// Backend → client half of a flow. Ends on the first socket error; the flow
 /// is then closed by the receive loop (on the next datagram or reaper pass).
+#[allow(clippy::too_many_arguments)] // one call site; a struct would only add ceremony
 async fn reply_loop(
     upstream: Arc<UdpSocket>,
     downstream: Arc<UdpSocket>,
@@ -343,6 +345,7 @@ async fn reply_loop(
     counters: UdpFlowCounters,
     pool: String,
     backend: SocketAddr,
+    pools: Arc<PoolRegistry>,
 ) {
     loop {
         // Wait for readiness before allocating: an idle flow holds no buffer,
@@ -366,6 +369,7 @@ async fn reply_loop(
                 // (ECONNREFUSED): nothing listens at the backend address.
                 debug!(pool, backend = %backend, error = %e, "udp: upstream receive failed");
                 crate::metrics::record_udp_error(&pool, "upstream_recv");
+                pools.report_failure(&pool, backend, "upstream_recv");
                 stats.fail("upstream_recv");
                 return;
             }
@@ -374,6 +378,7 @@ async fn reply_loop(
             Ok(sent) => {
                 stats.record_out(Instant::now(), sent);
                 counters.packet_out(sent);
+                pools.report_success(&pool, backend);
             }
             Err(e) => {
                 debug!(pool, client = %client, error = %e, "udp: reply send failed");

@@ -261,10 +261,19 @@ fn backend_json(b: &BackendStatus) -> serde_json::Value {
         DRAIN_REMOVED => "removed",
         _ => "unknown",
     };
+    let health = match (b.ejected, b.healthy) {
+        (true, _) => "ejected",
+        (false, None) => "unchecked",
+        (false, Some(true)) => "healthy",
+        (false, Some(false)) => "unhealthy",
+    };
+    let reason = if b.ejected { &b.eject_reason } else { &b.health_reason };
     serde_json::json!({
         "address": b.address,
         "state": state,
         "connections": b.connections,
+        "health": health,
+        "health_reason": reason,
     })
 }
 
