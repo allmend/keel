@@ -12,7 +12,9 @@ Keel is configured via a YAML file, defaulting to `keel.yaml` in the working dir
 | `access_log` | NDJSON access log output | [Access logging](access-logging.md) |
 | `cache` | Memory and disk HTTP cache | [Caching](caching.md) |
 | `pools` | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
-| `vhosts` | Virtual host routing rules | [Virtual hosts](virtual-hosts.md) |
+| `vhosts` | Virtual host routing rules, TLS, cache rules, gateway rules | [Virtual hosts](virtual-hosts.md), [API gateway](gateway.md) |
+| `acme` | ACME issuers: directory, contact, challenge type, DNS provider | [ACME](acme.md) |
+| `certificates` | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-for-tcp--tls-passthrough-backends) |
 | `include` | Glob patterns for conf.d-style config splitting | [below](#config-splitting) |
 | `cluster` | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
 | `control` | Remote control listener (keelctl, mTLS) | [Remote control](keelctl.md) |

@@ -57,7 +57,7 @@ Is keel running?
 
 ## keel status
 
-Show the status of the running instance, including uptime and backend state for all pools.
+Show the status of the running instance: uptime, and for every backend its drain state, health, open connections, and — when unhealthy or ejected — the reason. `unchecked` means the pool has no health check.
 
 ```bash
 keel status
@@ -69,9 +69,9 @@ Output:
 keel — uptime 2h 14m 30s
 
   web (3 backends)
-    10.0.0.1:8080             active      12 conn
-    10.0.0.2:8080             active       8 conn
-    10.0.0.3:8080             draining     3 conn
+    10.0.0.1:8080             active     healthy     12 conn
+    10.0.0.2:8080             active     healthy      8 conn
+    10.0.0.3:8080             draining   healthy      3 conn
 ```
 
 ---
@@ -94,9 +94,9 @@ Output:
 
 ```
 Pool: web (3 backends)
-    10.0.0.1:8080             active      12 conn
-    10.0.0.2:8080             active       8 conn
-    10.0.0.3:8080             active       5 conn
+    10.0.0.1:8080             active     healthy     12 conn
+    10.0.0.2:8080             active     healthy      8 conn
+    10.0.0.3:8080             active     healthy      5 conn
 ```
 
 ---
