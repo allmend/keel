@@ -644,6 +644,16 @@ impl pingora::services::background::BackgroundService for ReloadService {
 
 // Server startup
 
+/// Sockets a worker inherited from the root master (see process::BoundListeners).
+pub struct WorkerSockets {
+    /// (config address, listening fd) — handed to Pingora by address key.
+    pub tcp: Vec<(String, std::os::fd::RawFd)>,
+    /// config address → this worker's socket of the SO_REUSEPORT group.
+    pub udp: HashMap<String, std::net::UdpSocket>,
+    /// Private unix socket path used to pass the TCP fds to Pingora.
+    pub upgrade_sock: String,
+}
+
 // Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
 fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
@@ -779,18 +789,57 @@ fn log_cache_mode(cfg: &CacheConfig) {
 /// Build the Pingora server with Keel's shutdown timing. Pingora's default
 /// grace period is 300s — far beyond any supervisor's kill timeout, so a
 /// SIGTERM'd process would be SIGKILL'd long before exiting on its own.
-fn new_server(cfg: &Config) -> Server {
+fn new_server(cfg: &Config, inherited: Option<&WorkerSockets>) -> Server {
+    use pingora::server::configuration::Opt;
+
     let mut conf = pingora::server::configuration::ServerConf::default();
     conf.grace_period_seconds = Some(cfg.keel.grace_period_seconds);
     conf.graceful_shutdown_timeout_seconds = Some(5);
-    Server::new_with_opt_and_conf(None::<pingora::server::configuration::Opt>, conf)
+
+    // Pingora has no API for "use this already-bound listener". Its one entry
+    // point is the zero-downtime-upgrade channel: with `upgrade: true`,
+    // bootstrap() waits on `upgrade_sock` for the previous process to pass
+    // listening fds, keyed by address string. The worker plays the previous
+    // process to itself (see run()) — same process, so no cross-process
+    // timing, and the fds it passes are the ones the master bound as root.
+    let opt = match inherited.filter(|w| !w.tcp.is_empty()) {
+        Some(w) => {
+            conf.upgrade_sock = w.upgrade_sock.clone();
+            Some(Opt { upgrade: true, daemon: false, nocapture: false, test: false, conf: None })
+        }
+        None => None,
+    };
+    Server::new_with_opt_and_conf(opt, conf)
+}
+
+/// Hand inherited TCP listeners to Pingora over its upgrade channel. Must run
+/// before `server.bootstrap()`, which blocks until the fds arrive.
+fn send_inherited_fds(inherited: Option<&WorkerSockets>) {
+    let Some(w) = inherited.filter(|w| !w.tcp.is_empty()) else { return };
+    let mut fds = pingora::server::Fds::new();
+    for (addr, fd) in &w.tcp {
+        fds.add(addr.clone(), *fd);
+    }
+    let path = w.upgrade_sock.clone();
+    let count = w.tcp.len();
+    std::thread::spawn(move || {
+        // bootstrap() binds the path right after this thread starts; a short
+        // head start avoids Pingora's 1s ENOENT retry on the first connect.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        match fds.send_to_sock(path.as_str()) {
+            Ok(_) => info!(count, "worker: handed inherited listeners to pingora"),
+            Err(e) => error!(error = %e, path, "worker: failed to hand inherited listeners to pingora"),
+        }
+    });
 }
 
 // Start the Pingora proxy server. Never returns.
-pub fn run(cfg: &Config) -> ! {
+pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
+    let mut inherited = inherited;
 
-    let mut server = new_server(cfg);
+    let mut server = new_server(cfg, inherited.as_ref());
+    send_inherited_fds(inherited.as_ref());
     server.bootstrap();
 
     let pools = match build_pools(cfg, &mut server) {
@@ -844,12 +893,17 @@ pub fn run(cfg: &Config) -> ! {
     }
 
     add_l4_services(&mut server, cfg, &pools, &access_logger);
+    add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
-    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls && l.tcp_pool.is_none()).collect();
+    let plain: Vec<_> = cfg
+        .listeners
+        .iter()
+        .filter(|l| !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .collect();
     let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 
     if cfg.listeners.is_empty() {
@@ -927,6 +981,33 @@ fn add_l4_services(
     }
 }
 
+/// Register one UDP forwarding service per `udp_pool` listener. These run as
+/// background services on raw Tokio sockets — Pingora's data plane is TCP only.
+/// `inherited` holds sockets the master bound as root; without it (dev, no
+/// privilege drop) each service binds its own.
+fn add_udp_services(
+    server: &mut Server,
+    cfg: &Config,
+    pools: &Arc<crate::backend::PoolRegistry>,
+    access_logger: &Arc<AccessLogger>,
+    mut inherited: Option<&mut HashMap<String, std::net::UdpSocket>>,
+) {
+    for l in cfg.listeners.iter().filter(|l| l.udp_pool.is_some()) {
+        let pool = l.udp_pool.clone().unwrap();
+        let socket = inherited.as_mut().and_then(|m| m.remove(&l.address));
+        info!(address = l.address, pool, inherited = socket.is_some(), "adding UDP listener");
+        let svc = crate::udp::UdpProxyService {
+            listener: l.address.clone(),
+            pool,
+            pools: Arc::clone(pools),
+            access_logger: Arc::clone(access_logger),
+            flow_timeout: std::time::Duration::from_secs(cfg.keel.udp_flow_timeout_seconds),
+            socket,
+        };
+        server.add_service(background_service(&format!("udp-{}", l.address), svc));
+    }
+}
+
 // Cluster reload watcher
 
 struct ClusterReloadWatcher {
@@ -975,7 +1056,7 @@ pub fn run_cluster(
 ) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
 
-    let mut server = new_server(cfg);
+    let mut server = new_server(cfg, None);
     server.bootstrap();
 
     let pools = match build_pools(cfg, &mut server) {
@@ -1038,12 +1119,17 @@ pub fn run_cluster(
     }
 
     add_l4_services(&mut server, cfg, &pools, &access_logger);
+    add_udp_services(&mut server, cfg, &pools, &access_logger, None);
 
     let proxy =
         KProxy { routing, pools: Arc::clone(&pools), access_logger, cache, acme_challenge_dir };
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
-    let plain: Vec<_> = cfg.listeners.iter().filter(|l| !l.tls && l.tcp_pool.is_none()).collect();
+    let plain: Vec<_> = cfg
+        .listeners
+        .iter()
+        .filter(|l| !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .collect();
     let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
 
     if cfg.listeners.is_empty() {

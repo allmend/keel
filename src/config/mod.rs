@@ -197,6 +197,9 @@ impl Config {
                 })?;
             }
         }
+        if self.keel.udp_flow_timeout_seconds == 0 {
+            anyhow::bail!("keel.udp_flow_timeout_seconds must be at least 1");
+        }
         for l in &self.listeners {
             if let Some(pool) = &l.tcp_pool {
                 if !self.pools.contains_key(pool) {
@@ -206,6 +209,25 @@ impl Config {
                     anyhow::bail!(
                         "listener '{}': tcp_pool is passthrough — remove 'tls' \
                          (TLS termination for TCP pools is not implemented)",
+                        l.address
+                    );
+                }
+            }
+            if let Some(pool) = &l.udp_pool {
+                if !self.pools.contains_key(pool) {
+                    anyhow::bail!("listener '{}' references unknown udp_pool '{pool}'", l.address);
+                }
+                if l.tls {
+                    anyhow::bail!(
+                        "listener '{}': udp_pool cannot be combined with 'tls' \
+                         (UDP datagrams are forwarded as-is, never terminated)",
+                        l.address
+                    );
+                }
+                if l.tcp_pool.is_some() {
+                    anyhow::bail!(
+                        "listener '{}': udp_pool and tcp_pool are mutually exclusive — \
+                         use one listener entry per protocol",
                         l.address
                     );
                 }
@@ -419,6 +441,11 @@ pub struct KeelConfig {
     /// (docker stop default 10s, K8s terminationGracePeriodSeconds 30s).
     #[serde(default = "default_grace_period")]
     pub grace_period_seconds: u64,
+
+    /// Seconds a UDP flow (one client ip:port on a `udp_pool` listener) may
+    /// stay idle before it expires and releases its backend. Must be >= 1.
+    #[serde(default = "default_udp_flow_timeout")]
+    pub udp_flow_timeout_seconds: u64,
 }
 
 impl Default for KeelConfig {
@@ -429,11 +456,13 @@ impl Default for KeelConfig {
             group: default_group(),
             control_socket: default_control_socket(),
             grace_period_seconds: default_grace_period(),
+            udp_flow_timeout_seconds: default_udp_flow_timeout(),
         }
     }
 }
 
 fn default_grace_period() -> u64 { 10 }
+fn default_udp_flow_timeout() -> u64 { 30 }
 
 fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -459,6 +488,13 @@ pub struct Listener {
     /// Mutually exclusive with `tls` (termination) and HTTP routing.
     #[serde(default)]
     pub tcp_pool: Option<String>,
+
+    /// L4 mode: forward UDP datagrams to this pool. One flow per client
+    /// ip:port, pinned to a backend until idle for
+    /// `keel.udp_flow_timeout_seconds`. Mutually exclusive with `tls` and
+    /// `tcp_pool`.
+    #[serde(default)]
+    pub udp_pool: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -841,3 +877,59 @@ pub struct ClusterConfig {
 }
 
 fn default_cluster_addr() -> String { "0.0.0.0:7654".into() }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POOL: &str = "pools:\n  dns:\n    backends:\n      - address: 10.0.0.1:53\n";
+
+    fn parse(listeners: &str) -> Config {
+        serde_yml::from_str(&format!("{POOL}listeners:\n{listeners}")).expect("yaml parses")
+    }
+
+    fn err(cfg: &Config) -> String {
+        cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    #[test]
+    fn udp_pool_listener_is_accepted() {
+        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.listeners[0].udp_pool.as_deref(), Some("dns"));
+        assert_eq!(cfg.keel.udp_flow_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn udp_pool_must_name_an_existing_pool() {
+        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: resolvers\n");
+        assert!(err(&cfg).contains("unknown udp_pool 'resolvers'"));
+    }
+
+    #[test]
+    fn udp_pool_rejects_tls() {
+        let cfg = parse("  - address: 0.0.0.0:853\n    udp_pool: dns\n    tls: true\n");
+        assert!(err(&cfg).contains("udp_pool cannot be combined with 'tls'"));
+    }
+
+    #[test]
+    fn udp_pool_rejects_tcp_pool_on_same_listener() {
+        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n    tcp_pool: dns\n");
+        assert!(err(&cfg).contains("udp_pool and tcp_pool are mutually exclusive"));
+    }
+
+    #[test]
+    fn udp_and_tcp_on_separate_listeners_share_a_pool() {
+        let cfg = parse(
+            "  - address: 0.0.0.0:53\n    udp_pool: dns\n  - address: 0.0.0.0:53\n    tcp_pool: dns\n",
+        );
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn udp_flow_timeout_zero_is_rejected() {
+        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+        cfg.keel.udp_flow_timeout_seconds = 0;
+        assert!(err(&cfg).contains("udp_flow_timeout_seconds"));
+    }
+}

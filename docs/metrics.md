@@ -7,8 +7,8 @@ metrics; there is no cluster aggregation — use your Prometheus setup's
 federation if needed.
 
 A metric series appears after its first event: `keel_tcp_*` series exist
-once the first L4 connection arrives, `keel_requests_total` once the first
-HTTP request does, and so on.
+once the first L4 connection arrives, `keel_udp_*` once the first flow
+opens, `keel_requests_total` once the first HTTP request does, and so on.
 
 ## Labels
 
@@ -54,6 +54,21 @@ One connection is one unit — there is no request concept at L4.
 | `keel_tcp_bytes_out_total` | counter | `pool`, `backend` | Bytes sent to clients over connection lifetimes |
 | `keel_tcp_errors_total` | counter | `pool`, `reason` | Connections ending in error. Reasons: `no_backend`, `upstream_connect`, `io`, `shutdown` |
 
+## UDP (L4) metrics
+
+One flow (client `ip:port` → backend, until idle timeout) is the unit for `keel_udp_flows_total` and `keel_active_connections`; packet and byte counters update per datagram while the flow is open.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `keel_udp_flows_total` | counter | `pool`, `backend` | Flows opened |
+| `keel_udp_packets_in_total` | counter | `pool`, `backend` | Datagrams received from clients |
+| `keel_udp_packets_out_total` | counter | `pool`, `backend` | Datagrams sent to clients |
+| `keel_udp_bytes_in_total` | counter | `pool`, `backend` | Bytes received from clients |
+| `keel_udp_bytes_out_total` | counter | `pool`, `backend` | Bytes sent to clients |
+| `keel_udp_errors_total` | counter | `pool`, `reason` | Dropped datagrams and flows ended by error. Reasons: `no_backend` (per dropped datagram), `upstream_bind`, `upstream_send`, `upstream_recv` (backend not listening — ICMP unreachable), `downstream_send` |
+
+Normal flow expiry is not an error and is not counted here; `keel_udp_flows_total` minus `keel_active_connections` gives flows that have ended.
+
 ## Useful queries
 
 ```promql
@@ -71,6 +86,10 @@ keel_backend_healthy == 0
 
 # TCP throughput per pool
 sum by (pool) (rate(keel_tcp_bytes_out_total[5m]))
+
+# UDP datagram rate per backend, and flows dropped for lack of a backend
+sum by (pool, backend) (rate(keel_udp_packets_in_total[5m]))
+rate(keel_udp_errors_total{reason="no_backend"}[5m])
 
 # Backends stuck draining (connections still open)
 keel_backend_drain_state == 1 and keel_active_connections > 0

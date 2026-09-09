@@ -10,6 +10,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **UDP (L4) load balancing** — `udp_pool` on a listener forwards datagrams
+  to an ordinary pool. One flow per client `ip:port`, pinned to a backend
+  until idle for `keel.udp_flow_timeout_seconds` (default 30). Flows share
+  backend drain and `keel_active_connections` with HTTP and TCP. Metrics
+  `keel_udp_flows_total`, `keel_udp_packets_in_total` /
+  `keel_udp_packets_out_total`, `keel_udp_bytes_in_total` /
+  `keel_udp_bytes_out_total`, `keel_udp_errors_total`; one access log entry
+  per flow in `access_udp_<pool>.log`. Each worker owns one socket of an
+  `SO_REUSEPORT` group, so flows stay on one worker. See
+  `docs/udp-proxying.md`.
 - **TCP (L4) metrics**: `keel_tcp_connections_total`,
   `keel_tcp_bytes_in_total` / `keel_tcp_bytes_out_total` (per pool and
   backend), and `keel_tcp_errors_total` (per pool and reason).
@@ -18,6 +28,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Listeners are bound by the root master before the privilege drop.**
+  Workers used to bind after dropping to `keel.user`, so ports below 1024
+  only worked with `CAP_NET_BIND_SERVICE` or when started non-root, contrary
+  to the documentation. On Linux the master now binds every TCP and UDP
+  listener before forking; workers inherit the sockets and pass the TCP ones
+  to Pingora over a private Unix socket in the control-socket directory
+  (`upgrade-<index>.sock`). A replacement worker reuses the index, and
+  therefore the UDP socket, of the worker it replaces. The master also
+  creates the control-socket directory and assigns it to `keel.user`, so the
+  root-owned default in the container image no longer breaks the control
+  socket. Unprivileged runs are unchanged.
+- **Dockerfile copies the workspace crates.** The builder stage predated the
+  `keel-control` / `keelctl` workspace split and failed on the missing
+  members.
 - **`keel_backend_healthy` is now emitted.** Health-check state transitions
   set the gauge (and log the transition per pool and backend); the metric
   was registered but never updated.

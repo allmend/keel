@@ -30,6 +30,7 @@ keel:
   group: keel             # drop to this group
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
   grace_period_seconds: 10   # graceful shutdown: time for in-flight requests
+  udp_flow_timeout_seconds: 30   # idle time before a UDP flow expires
 ```
 
 | Field | Type | Default |
@@ -39,16 +40,19 @@ keel:
 | `group` | string | `keel` |
 | `control_socket` | string | `/var/run/keel/keel.sock` |
 | `grace_period_seconds` | integer | `10` |
+| `udp_flow_timeout_seconds` | integer | `30` |
 
-On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
+On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
-Changing `workers` requires a process restart. All other settings can be changed via hot reload.
+`udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. See [UDP proxying](udp-proxying.md).
+
+Changing `workers` or `udp_flow_timeout_seconds` requires a process restart. All other settings can be changed via hot reload.
 
 ---
 
 ## listeners
 
-One entry per port. Keel binds all listeners before dropping privileges.
+One entry per port. When Keel starts as root on Linux, the master binds every listener — TCP and UDP — before forking the workers, and the workers inherit the sockets after dropping to `keel.user`. Workers never need the capability to bind ports below 1024. When started unprivileged (dev), each worker binds its own listeners.
 
 ```yaml
 listeners:
@@ -59,6 +63,8 @@ listeners:
     proxy_protocol: true
   - address: 0.0.0.0:5432            # L4 — raw TCP spliced to a pool
     tcp_pool: postgres
+  - address: 0.0.0.0:53              # L4 — UDP datagrams forwarded to a pool
+    udp_pool: dns
 ```
 
 | Field | Type | Default | Notes |
@@ -67,8 +73,13 @@ listeners:
 | `tls` | bool | `false` | TLS termination; certs configured per-vhost |
 | `proxy_protocol` | bool | `false` | Accept PROXY Protocol v1/v2 from upstream LBs |
 | `tcp_pool` | string | none | Makes the listener L4: raw TCP is spliced to this pool (passthrough — the stream is never inspected). Vhosts and routes do not apply, and `tls` is rejected on the same listener. See [TCP proxying](tcp-proxying.md) |
+| `udp_pool` | string | none | Makes the listener UDP: datagrams are forwarded to this pool, one flow per client `ip:port` until idle for `keel.udp_flow_timeout_seconds`. Vhosts and routes do not apply; `tls` and `tcp_pool` are rejected on the same listener. See [UDP proxying](udp-proxying.md) |
 
-A `tcp_pool` listener references an ordinary entry in `pools` — health checks, weights, algorithms, and drain behave the same for TCP as for HTTP. Validation fails at startup for an unknown pool name or a `tcp_pool` + `tls` combination.
+A `tcp_pool` or `udp_pool` listener references an ordinary entry in `pools` — health checks, weights, algorithms, and drain behave the same as for HTTP. Validation fails at startup for an unknown pool name, a `tcp_pool` or `udp_pool` + `tls` combination, or `tcp_pool` and `udp_pool` on the same listener entry (use two entries with the same `address` to serve both protocols on one port).
+
+For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and hands each worker its own; a replacement worker takes over the socket of the one it replaces.
+
+The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in the directory of `keel.control_socket`. The master creates that directory and assigns it to `keel.user` before forking. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
 
 Changing listener ports requires a process restart. Adding new listeners via hot reload is not supported.
 

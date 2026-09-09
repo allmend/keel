@@ -81,6 +81,7 @@ The socket directory is created `0750` before the socket is bound, and the socke
 Workers drop from root to `keel.user` / `keel.group` and exit rather than continue as root if any step fails:
 
 - The master resolves `keel.user` and `keel.group` before forking any worker, so a misconfigured name fails startup immediately instead of fork/exit looping.
+- On Linux, the master binds every listener (TCP and UDP) while still root and the workers inherit the sockets across `fork`. No worker ever holds `CAP_NET_BIND_SERVICE` or binds a port below 1024 itself.
 - Each worker drops supplementary groups (`setgroups([])`), then gid, then uid, in that order, and exits if any step fails while running as root.
 - After the drop, the worker confirms it is no longer root and exits if it somehow still is.
 - A process already running unprivileged (typical in dev) skips the drop.

@@ -43,6 +43,25 @@ pub struct TcpLogEntry {
     pub error: Option<String>,
 }
 
+/// One entry per UDP flow (client `ip:port` → backend), written when the flow
+/// expires or is closed. Datagram counts have no TCP/HTTP equivalent; there
+/// are no TLS fields because UDP carries none in v1.
+#[derive(Serialize)]
+pub struct UdpLogEntry {
+    pub timestamp: String,
+    pub r#type: &'static str,
+    pub client_addr: String,
+    pub listener: String,
+    pub pool: String,
+    pub backend_addr: Option<String>,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub packets_in: u64,
+    pub packets_out: u64,
+    pub duration_ms: f64,
+    pub error: Option<String>,
+}
+
 pub struct AccessLogger {
     enabled: bool,
     dir: String,
@@ -106,6 +125,25 @@ impl AccessLogger {
         }
         // Pool names come from validated config, sanitized as a final guard.
         self.write_to(&format!("access_tcp_{}.log", sanitize_vhost(&entry.pool)), &line);
+    }
+
+    /// One file per pool: `access_udp_<pool>.log`. One entry per flow.
+    pub fn log_udp(&self, entry: &UdpLogEntry) {
+        if !self.enabled {
+            return;
+        }
+        let line = match serde_json::to_string(entry) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "udp access log serialization failed");
+                return;
+            }
+        };
+        if self.dir == "-" {
+            println!("{line}");
+            return;
+        }
+        self.write_to(&format!("access_udp_{}.log", sanitize_vhost(&entry.pool)), &line);
     }
 
     fn write_to(&self, filename: &str, line: &str) {

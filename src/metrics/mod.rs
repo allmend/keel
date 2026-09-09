@@ -3,8 +3,8 @@ use once_cell::sync::Lazy;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use prometheus::{
-    gather, register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec,
-    Encoder, GaugeVec, HistogramVec, TextEncoder,
+    gather, register_counter_vec, register_gauge_vec, register_histogram_vec, Counter,
+    CounterVec, Encoder, GaugeVec, HistogramVec, TextEncoder,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -158,6 +158,85 @@ pub static TCP_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("register keel_tcp_errors_total")
 });
 
+// UDP (L4) metrics
+
+pub static UDP_FLOWS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_flows_total",
+        "Total UDP (L4) flows opened per pool and backend",
+        &["pool", "backend"]
+    )
+    .expect("register keel_udp_flows_total")
+});
+
+pub static UDP_PACKETS_IN: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_packets_in_total",
+        "Total datagrams received from UDP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_udp_packets_in_total")
+});
+
+pub static UDP_PACKETS_OUT: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_packets_out_total",
+        "Total datagrams sent to UDP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_udp_packets_out_total")
+});
+
+pub static UDP_BYTES_IN: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_bytes_in_total",
+        "Total bytes received from UDP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_udp_bytes_in_total")
+});
+
+pub static UDP_BYTES_OUT: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_bytes_out_total",
+        "Total bytes sent to UDP (L4) clients",
+        &["pool", "backend"]
+    )
+    .expect("register keel_udp_bytes_out_total")
+});
+
+pub static UDP_ERRORS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "keel_udp_errors_total",
+        "UDP (L4) datagrams dropped or flows ended by an error",
+        &["pool", "reason"]
+    )
+    .expect("register keel_udp_errors_total")
+});
+
+/// Counter handles resolved once per flow. The per-datagram path is then a
+/// plain atomic add with no label lookup — UDP flows can carry thousands of
+/// datagrams a second, unlike a TCP connection that is accounted once.
+#[derive(Clone)]
+pub struct UdpFlowCounters {
+    packets_in: Counter,
+    bytes_in: Counter,
+    packets_out: Counter,
+    bytes_out: Counter,
+}
+
+impl UdpFlowCounters {
+    pub fn packet_in(&self, bytes: usize) {
+        self.packets_in.inc();
+        self.bytes_in.inc_by(bytes as f64);
+    }
+
+    pub fn packet_out(&self, bytes: usize) {
+        self.packets_out.inc();
+        self.bytes_out.inc_by(bytes as f64);
+    }
+}
+
 // Helper functions
 
 pub fn record_request(pool: &str, vhost: &str, status: u16, duration_secs: f64) {
@@ -199,6 +278,24 @@ pub fn add_tcp_bytes(pool: &str, backend: &str, bytes_in: u64, bytes_out: u64) {
 
 pub fn record_tcp_error(pool: &str, reason: &str) {
     TCP_ERRORS_TOTAL.with_label_values(&[pool, reason]).inc();
+}
+
+pub fn record_udp_flow(pool: &str, backend: &str) {
+    UDP_FLOWS_TOTAL.with_label_values(&[pool, backend]).inc();
+}
+
+pub fn udp_flow_counters(pool: &str, backend: &str) -> UdpFlowCounters {
+    let labels = &[pool, backend];
+    UdpFlowCounters {
+        packets_in: UDP_PACKETS_IN.with_label_values(labels),
+        bytes_in: UDP_BYTES_IN.with_label_values(labels),
+        packets_out: UDP_PACKETS_OUT.with_label_values(labels),
+        bytes_out: UDP_BYTES_OUT.with_label_values(labels),
+    }
+}
+
+pub fn record_udp_error(pool: &str, reason: &str) {
+    UDP_ERRORS_TOTAL.with_label_values(&[pool, reason]).inc();
 }
 
 pub fn set_backend_healthy(pool: &str, backend: &str, healthy: bool) {

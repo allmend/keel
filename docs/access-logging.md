@@ -154,6 +154,43 @@ No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no
 
 ---
 
+## UDP log format
+
+UDP listeners ([UDP proxying](udp-proxying.md)) write one entry per **flow** — a client `ip:port` pinned to one backend until idle for `keel.udp_flow_timeout_seconds` — to `access_udp_<pool>.log`. The entry is written when the flow ends:
+
+```json
+{
+  "timestamp":    "2026-07-06T12:52:00.812Z",
+  "type":         "udp",
+  "client_addr":  "203.0.113.42:41230",
+  "listener":     "0.0.0.0:53",
+  "pool":         "dns",
+  "backend_addr": "10.0.0.11:53",
+  "bytes_in":     64,
+  "bytes_out":    128,
+  "packets_in":   1,
+  "packets_out":  1,
+  "duration_ms":  10005.2,
+  "error":        null
+}
+```
+
+| Field | Notes |
+|---|---|
+| `type` | Always `"udp"` |
+| `listener` | Local address that received the datagrams |
+| `backend_addr` | `null` when no backend was selected (`no_backend`) |
+| `bytes_in` / `bytes_out` | Bytes from/to the client over the flow lifetime |
+| `packets_in` / `packets_out` | Datagrams from/to the client — no equivalent in TCP or HTTP entries |
+| `duration_ms` | Flow lifetime, first datagram to expiry. Includes the idle timeout, so a single request/response exchange shows roughly `udp_flow_timeout_seconds` |
+| `error` | `null` (expired after idle timeout), `no_backend`, `upstream_bind`, `upstream_send`, `upstream_recv`, `downstream_send`, or `shutdown` |
+
+`upstream_recv` is what a backend that is not listening looks like: the ICMP port-unreachable reply surfaces as a receive error on the flow's upstream socket. A `no_backend` entry is written per dropped datagram, since no flow exists to aggregate them.
+
+No TLS fields: UDP carries none in v1.
+
+---
+
 ## App logs vs access logs
 
 Access logs (NDJSON files) cover per-request data. Application logs — startup, health check transitions, config reloads, errors — are written to stderr as structured text. These two streams are intentionally separate so they can be routed to different destinations, retention policies, and alerting pipelines.

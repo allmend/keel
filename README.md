@@ -29,6 +29,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
 - TCP (L4) passthrough proxying — `tcp_pool` listeners, end-to-end TLS between client and backend
+- UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
 - TLS termination with per-vhost certificates
 - ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
@@ -48,7 +49,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection
 - keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
 
-In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, UDP load balancing, PROXY protocol parsing, DNS-01/wildcards.
+In the roadmap: API gateway features (rate limiting, auth, transforms), TCP TLS termination and re-encryption, PROXY protocol parsing, DNS-01/wildcards.
 
 ---
 
@@ -211,6 +212,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [Virtual hosts](docs/virtual-hosts.md)
 - [Load balancing](docs/load-balancing.md)
 - [TCP proxying (L4)](docs/tcp-proxying.md)
+- [UDP proxying (L4)](docs/udp-proxying.md)
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
 - [Access logging](docs/access-logging.md)

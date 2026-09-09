@@ -11,6 +11,7 @@ mod metrics;
 mod process;
 mod proxy;
 mod tls;
+mod udp;
 mod vhost;
 
 use anyhow::{Context, Result};
