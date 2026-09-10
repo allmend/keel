@@ -46,6 +46,10 @@ CLI subcommands communicate with a running Keel instance over a Unix socket. The
 keel --socket /tmp/keel.sock status
 ```
 
+The socket belongs to the master process, and every command covers the whole instance. Workers are separate processes with no shared memory, so each one holds its own drain state, connection counters and health results; the master asks all of them and merges the answers. Each worker has its own socket for that, `worker-<index>.sock`, in the same directory — an internal detail, not an operator interface. In cluster mode there are no workers to fan out to: the node is a single process and answers directly.
+
+A worker that does not answer within five seconds is left out of the merged result and logged; the command still reports what the other workers said.
+
 If Keel is not running or the socket path is wrong, the command fails with:
 
 ```
@@ -59,7 +63,7 @@ Is keel running?
 
 Show the status of the running instance: uptime, and for every backend its drain state, health and open connections. `unchecked` means the pool has no health check.
 
-A reason in parentheses is the last failed probe or the ejection cause; it stays visible on a backend that is still `healthy`, because a probe failure is recorded immediately while the state only flips after `unhealthy_threshold` failures in a row.
+Connection counts are the sum across all workers. A backend's health is the worst any worker reports — a worker that will not route to a backend is worth seeing — and its drain state the least-drained any worker reports, so a backend still receiving new connections from one worker reads `active` rather than `draining`. A reason in parentheses is the last failed probe or the ejection cause; it stays visible on a backend that is still `healthy`, because a probe failure is recorded immediately while the state only flips after `unhealthy_threshold` failures in a row.
 
 ```bash
 keel status
@@ -115,7 +119,9 @@ The `address` must match exactly how it appears in `keel.yaml` (e.g. `10.0.0.1:8
 
 Without `--wait`, the command initiates the drain and returns immediately. The backend transitions to the `Draining` state and continues to drain in the background.
 
-With `--wait`, the command blocks and streams live connection counts until the backend reaches zero active connections:
+The drain is applied in every worker, and the master re-applies it to any worker it restarts — a worker that crashes mid-drain comes back with the backend still draining instead of putting it back into rotation. Drains are held by the running master only: they are not written to `keel.yaml`, so a full restart of Keel starts every backend `active` again.
+
+With `--wait`, the command blocks and streams live connection counts until the backend reaches zero active connections, summed across all workers:
 
 ```bash
 keel backend drain 10.0.0.1:8080 --wait
@@ -136,7 +142,7 @@ In cluster mode, drain is committed via Raft and applied on all nodes. See [Clus
 
 ## keel config reload
 
-Reload configuration from disk. Equivalent to sending `SIGHUP` to the master process.
+Reload configuration from disk. Equivalent to sending `SIGHUP` to the master process — the master forwards it to every worker, so all of them reload.
 
 ```bash
 keel config reload

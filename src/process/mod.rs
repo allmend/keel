@@ -1,4 +1,4 @@
-use crate::{config::Config, proxy};
+use crate::{config::Config, control, proxy};
 use anyhow::{Context, Result};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -6,6 +6,7 @@ use nix::unistd::{fork, ForkResult, Pid};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Same backlog Pingora uses for the listeners it binds itself.
@@ -178,7 +179,7 @@ pub fn run_master(cfg: Config) -> Result<()> {
 
     // Validate that workers will be able to drop privileges before forking any,
     // so a misconfigured user/group fails fast instead of fork/exit looping.
-    preflight_privileges(&cfg.keel.user, &cfg.keel.group)?;
+    let owner = preflight_privileges(&cfg.keel.user, &cfg.keel.group)?;
 
     // Bind in the master only when there are privileges to drop: that is the
     // case where workers could not bind ports below 1024 themselves. The TCP
@@ -204,10 +205,52 @@ pub fn run_master(cfg: Config) -> Result<()> {
         pids.push((pid, i));
     }
 
+    // The master owns the instance control socket and the remote listener,
+    // and answers every command by asking all workers — a worker only knows
+    // its own connection counts, drain state and health.
+    //
+    // A current-thread runtime spawns no threads, so the fork() that replaces
+    // a dead worker still happens from a single-threaded process; and the
+    // runtime is entered only between supervision ticks, so no fork ever
+    // happens inside a runtime context (Pingora builds its own in the child).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("master: cannot start control-plane runtime")?;
+    let dispatch = control::Dispatch::workers(&cfg.keel.control_socket, n);
+    // Held for the master's lifetime: dropping the sender would make the
+    // listeners' shutdown branch fire continuously.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    runtime.block_on(async {
+        let server = control::ControlServer {
+            socket_path: cfg.keel.control_socket.clone(),
+            dispatch: Arc::clone(&dispatch),
+            owner,
+        };
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move { server.run(&mut rx).await });
+
+        if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.clone()) {
+            let server = control::remote::RemoteControlServer {
+                cfg: remote,
+                dispatch: Arc::clone(&dispatch),
+            };
+            let mut rx = shutdown_rx.clone();
+            tokio::spawn(async move { server.serve(&mut rx).await });
+        }
+    });
+
     // Supervision loop
     loop {
+        // Drives the control-plane tasks; doubles as the loop's tick. Every
+        // fork below happens after this returns, outside the runtime.
+        runtime.block_on(tick(100));
+
         if SHUTDOWN.load(Ordering::SeqCst) {
             info!("master: shutdown signal received, stopping workers");
+            let _ = shutdown_tx.send(true);
+            // Let the listeners observe it and remove their sockets.
+            runtime.block_on(tick(50));
             for (pid, _) in &pids {
                 // SIGTERM = Pingora's plain graceful exit (finish in-flight,
                 // no upgrade-socket handoff like SIGQUIT).
@@ -234,11 +277,13 @@ pub fn run_master(cfg: Config) -> Result<()> {
                     warn!(pid = dead.as_raw(), exit_code = code, "master: worker died, restarting");
                     let index = respawn(&cfg, &mut pids, dead, bound.as_ref())?;
                     info!(index, "master: replacement worker started");
+                    replay_drains(&runtime, &dispatch, index);
                 }
                 Ok(WaitStatus::Signaled(dead, sig, _)) => {
                     warn!(pid = dead.as_raw(), signal = ?sig, "master: worker killed, restarting");
                     let index = respawn(&cfg, &mut pids, dead, bound.as_ref())?;
                     info!(index, "master: replacement worker started");
+                    replay_drains(&runtime, &dispatch, index);
                 }
                 Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Continued(_)) => break,
                 Ok(_) => {}
@@ -249,9 +294,30 @@ pub fn run_master(cfg: Config) -> Result<()> {
                 }
             }
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// Sleep inside the runtime. `tokio::time::sleep` takes the timer handle from
+/// the runtime context when the future is built, so it cannot be constructed
+/// outside `block_on` — it panics with "there is no reactor running".
+async fn tick(millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
+/// Re-apply the drains this master has issued to a worker it just replaced.
+/// A fresh worker builds its pools from config, so without this a crash would
+/// silently put a draining backend back into rotation.
+fn replay_drains(
+    runtime: &tokio::runtime::Runtime,
+    dispatch: &Arc<control::Dispatch>,
+    index: usize,
+) {
+    let dispatch = Arc::clone(dispatch);
+    runtime.spawn(async move {
+        if let Some(fanout) = dispatch.fanout() {
+            fanout.replay_drains(index).await;
+        }
+    });
 }
 
 /// Replace a dead worker, reusing its index. Returns the index.
@@ -294,24 +360,28 @@ fn spawn_worker(cfg: &Config, index: usize, bound: Option<&BoundListeners>) -> R
 /// Worker entry point — starts the Pingora data plane. Never returns.
 fn run_worker(cfg: &Config, index: usize, sockets: Option<proxy::WorkerSockets>) -> ! {
     info!(index, inherited = sockets.is_some(), "worker: started");
-    proxy::run(cfg, sockets)
+    proxy::run(cfg, index, sockets)
 }
 
-/// Resolve the configured user and group up front (only meaningful as root).
-/// Returns an error if either is missing so startup fails before forking workers.
-fn preflight_privileges(user: &str, group: &str) -> Result<()> {
+/// Resolve the configured user and group up front (only meaningful as root),
+/// so a missing name fails startup instead of every forked worker.
+///
+/// Returns the worker uid/gid when running as root: the master binds the
+/// control socket before dropping anything, and hands it to that user.
+/// `None` when unprivileged — the socket already belongs to the right user.
+fn preflight_privileges(user: &str, group: &str) -> Result<Option<(u32, u32)>> {
     use nix::unistd::{getuid, Group, User};
 
     if !getuid().is_root() {
-        return Ok(());
+        return Ok(None);
     }
-    if !matches!(Group::from_name(group), Ok(Some(_))) {
+    let Ok(Some(group)) = Group::from_name(group) else {
         anyhow::bail!("group '{group}' not found — cannot drop privileges (set keel.group)");
-    }
-    if !matches!(User::from_name(user), Ok(Some(_))) {
+    };
+    let Ok(Some(user)) = User::from_name(user) else {
         anyhow::bail!("user '{user}' not found — cannot drop privileges (set keel.user)");
-    }
-    Ok(())
+    };
+    Ok(Some((user.uid.as_raw(), group.gid.as_raw())))
 }
 
 /// Drop root privileges to `user`:`group`.

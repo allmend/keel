@@ -1044,7 +1044,11 @@ fn send_inherited_fds(inherited: Option<&WorkerSockets>) {
 }
 
 // Start the Pingora proxy server. Never returns.
-pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
+//
+// `index` is the worker's position among `keel.workers`; it names the worker's
+// own control socket. The instance socket belongs to the master, which fans
+// commands out to every worker (see `control::fanout`).
+pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
     let mut inherited = inherited;
 
@@ -1146,16 +1150,20 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
 
     server.add_service(svc);
     server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
+    // Workers answer only on their own socket. The master owns
+    // `keel.control_socket` and the remote listener, and merges what the
+    // workers report — a single worker's view is a fraction of the instance.
     server.add_service(background_service(
         "control",
         ControlServer {
-            socket_path: cfg.keel.control_socket.clone(),
-            pools: Arc::clone(&pools),
-            started_at: std::time::Instant::now(),
-            cluster: None,
+            socket_path: crate::control::fanout::worker_socket_path(
+                &cfg.keel.control_socket,
+                index,
+            ),
+            dispatch: crate::control::Dispatch::local(Arc::clone(&pools), None),
+            owner: None,
         },
     ));
-    add_remote_control(&mut server, cfg, &pools, None);
 
     server.run_forever()
 }
@@ -1164,17 +1172,14 @@ pub fn run(cfg: &Config, inherited: Option<WorkerSockets>) -> ! {
 fn add_remote_control(
     server: &mut Server,
     cfg: &Config,
-    pools: &Arc<crate::backend::PoolRegistry>,
-    cluster: Option<crate::cluster::ClusterHandle>,
+    dispatch: &Arc<crate::control::Dispatch>,
 ) {
     let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.clone()) else { return };
     server.add_service(background_service(
         "control-remote",
         crate::control::remote::RemoteControlServer {
             cfg: remote,
-            pools: Arc::clone(pools),
-            started_at: std::time::Instant::now(),
-            cluster,
+            dispatch: Arc::clone(dispatch),
         },
     ));
 }
@@ -1486,14 +1491,16 @@ pub fn run_cluster(
 
     server.add_service(svc);
     server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
-    add_remote_control(&mut server, cfg, &pools, Some(cluster.clone()));
+    // Cluster mode never forks, so this process owns the instance socket and
+    // answers from its own registry.
+    let dispatch = crate::control::Dispatch::local(Arc::clone(&pools), Some(cluster));
+    add_remote_control(&mut server, cfg, &dispatch);
     server.add_service(background_service(
         "control",
         ControlServer {
             socket_path: cfg.keel.control_socket.clone(),
-            pools: Arc::clone(&pools),
-            started_at: std::time::Instant::now(),
-            cluster: Some(cluster),
+            dispatch,
+            owner: None,
         },
     ));
 

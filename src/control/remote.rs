@@ -11,7 +11,6 @@
 //! and `keel credentials create` works on any of them.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -21,29 +20,34 @@ use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::backend::PoolRegistry;
 use crate::config::RemoteControlConfig;
 use crate::control::ca::ControlCa;
+use crate::control::Dispatch;
 
 pub struct RemoteControlServer {
     pub cfg: RemoteControlConfig,
-    pub pools: Arc<PoolRegistry>,
-    pub started_at: Instant,
-    pub cluster: Option<crate::cluster::ClusterHandle>,
+    pub dispatch: Arc<Dispatch>,
 }
 
 #[async_trait]
 impl pingora::services::background::BackgroundService for RemoteControlServer {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        if let Err(e) = self.run(&mut shutdown).await {
+        self.serve(&mut shutdown).await
+    }
+}
+
+impl RemoteControlServer {
+    /// Serve until `shutdown` flips, logging a failed start. Split out of the
+    /// `BackgroundService` impl so the master can run the listener on its own
+    /// runtime, without a Pingora server.
+    pub async fn serve(&self, shutdown: &mut pingora::server::ShutdownWatch) {
+        if let Err(e) = self.run(shutdown).await {
             // Refuse to run half-open: an operator who configured remote
             // control must notice it is not serving.
             error!(error = %format!("{e:#}"), "control: remote listener failed");
         }
     }
-}
 
-impl RemoteControlServer {
     async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
         let allow: Vec<IpNet> = self
             .cfg
@@ -56,9 +60,9 @@ impl RemoteControlServer {
         // Swapped when the cluster's CA replaces the local one; each accept
         // reads the current config.
         let tls = Arc::new(ArcSwap::from(server_tls_for(&ca)?));
-        if let Some(cluster) = &self.cluster {
+        if let Some(cluster) = self.dispatch.cluster() {
             tokio::spawn(sync_control_ca(
-                cluster.clone(),
+                cluster,
                 self.cfg.ca_dir.clone(),
                 Arc::clone(&tls),
                 (ca.ca_cert_pem.clone(), ca.ca_key_pem.clone()),
@@ -83,9 +87,7 @@ impl RemoteControlServer {
                         continue;
                     }
                     let acceptor = tokio_rustls::TlsAcceptor::from(tls.load_full());
-                    let pools = Arc::clone(&self.pools);
-                    let started_at = self.started_at;
-                    let cluster = self.cluster.clone();
+                    let dispatch = Arc::clone(&self.dispatch);
                     tokio::spawn(async move {
                         let tls_stream = match acceptor.accept(stream).await {
                             Ok(s) => s,
@@ -96,10 +98,9 @@ impl RemoteControlServer {
                         };
                         let cn = client_cn(&tls_stream).unwrap_or_else(|| "unknown".into());
                         let audit = format!("{cn}@{peer}");
-                        if let Err(e) = crate::control::handle_connection(
-                            tls_stream, pools, started_at, cluster, Some(audit),
-                        )
-                        .await
+                        if let Err(e) =
+                            crate::control::handle_connection(tls_stream, dispatch, Some(audit))
+                                .await
                         {
                             error!(peer = %peer, error = %e, "control: remote connection error");
                         }

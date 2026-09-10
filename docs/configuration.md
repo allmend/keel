@@ -87,7 +87,7 @@ A `tcp_pool` or `udp_pool` listener references an ordinary entry in `pools` — 
 
 For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and hands each worker its own; a replacement worker takes over the socket of the one it replaces.
 
-The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in the directory of `keel.control_socket`. The master creates that directory and assigns it to `keel.user` before forking. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
+The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in the directory of `keel.control_socket` (the worker's own control socket, `worker-<index>.sock`, lives there too). The master creates that directory and assigns it to `keel.user` before forking. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
 
 Changing listener ports requires a process restart. Adding new listeners via hot reload is not supported.
 

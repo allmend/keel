@@ -76,6 +76,8 @@ Anyone who can open the control socket controls the proxy: draining backends, re
 
 The socket directory is created `0750` before the socket is bound, and the socket itself is set to `0660` (owner and group only). If those permissions cannot be applied, Keel refuses to serve the control socket rather than run it open.
 
+The master binds the socket while still root and then hands it to `keel.user` and `keel.group`, so reaching it requires that group rather than root. The per-worker sockets beside it (`worker-<index>.sock`) carry the same protocol and the same permissions, in the same `0750` directory.
+
 ---
 
 ## Fail-closed privilege drop

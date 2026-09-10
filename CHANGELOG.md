@@ -10,6 +10,22 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Control commands now cover the whole instance, not one worker.** Every
+  forked worker bound `keel.control_socket` and the last one to start owned
+  it, so `keel status` reported a single worker's connection counts, health
+  and uptime, `keel backend drain` left the other workers sending new traffic
+  to the backend, and `keel config reload` reloaded one worker. The master
+  now owns the control socket and the `control.remote` mTLS listener and fans
+  each command out to every worker over a per-worker socket
+  (`worker-<index>.sock`), merging the answers: connections are summed, health
+  is the worst any worker reports, drain state the least-drained. `config
+  reload` signals the master, which forwards `SIGHUP` to all workers.
+- **Drain survives a worker restart.** The master re-applies its drains to any
+  worker it replaces, instead of the replacement rebuilding its pools from
+  config and putting a draining backend back into rotation.
+- **`control.remote` with more than one worker.** Every worker tried to bind
+  the same TCP port; all but one failed with `control: remote listener failed`.
+  Only the master binds it now.
 - **A config reload drained every backend in a pool whose backends are
   configured as hostnames.** `sync_from_config` compared the raw config
   strings (`backend1:80`) against the drain table, which is keyed by the
