@@ -1,7 +1,9 @@
 keel:
   workers: 2
-  user: root
-  group: root
+  # Workers must end up unprivileged: keel refuses to serve as root after the
+  # drop. nobody/nogroup exist in the debian:bookworm-slim runtime image.
+  user: nobody
+  group: nogroup
 
 listeners:
   - address: 0.0.0.0:80

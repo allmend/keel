@@ -71,6 +71,10 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     if let Some(acme) = cfg.acme_effective() {
         dirs.push(std::path::PathBuf::from(&acme.storage));
     }
+    // Access logs are opened by the workers, after the drop.
+    if cfg.access_log.enabled && cfg.access_log.dir != "-" {
+        dirs.push(std::path::PathBuf::from(&cfg.access_log.dir));
+    }
     for dir in dirs {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("master: cannot create {}", dir.display()))?;

@@ -18,6 +18,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   answered 502 until restarted. Config addresses are now resolved the same way
   before comparing, and a pool with an address that cannot be resolved is left
   untouched rather than drained.
+- **The dev stack could not start.** `keel-dev.yaml` set `keel.user: root`,
+  which the privilege-drop sanity check rejects, so both workers exited
+  immediately on `docker compose up`. It now runs as `nobody`/`nogroup`, and
+  the master creates and chowns the access-log directory alongside the other
+  runtime directories so unprivileged workers can write to it.
 
 ---
 
