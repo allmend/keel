@@ -46,9 +46,9 @@ CLI subcommands communicate with a running Keel instance over a Unix socket. The
 keel --socket /tmp/keel.sock status
 ```
 
-The socket belongs to the master process, and every command covers the whole instance. Workers are separate processes with no shared memory, so each one holds its own drain state, connection counters and health results; the master asks all of them and merges the answers. Each worker has its own socket for that, `worker-<index>.sock`, in a `workers/` subdirectory beside the instance socket — an internal detail, not an operator interface. In cluster mode there are no workers to fan out to: the node is a single process and answers directly.
+The socket is served by the master process and every command covers the whole instance. Workers are separate processes with no shared memory, so each holds only its own drain state, connection counters and health results; the master queries all of them and merges the results. Each worker has its own socket for this, `worker-<index>.sock` in a `workers/` subdirectory beside the instance socket. In cluster mode the node is a single process and answers directly.
 
-A worker that does not answer within five seconds is left out of the merged result and logged; the command still reports what the other workers said. `keel backend drain` says so explicitly — it reports how many workers applied the drain, and warns when that is not all of them, because a worker that missed it keeps sending new connections to the backend. `--wait` never reports completion on missing data: if no worker answers it shows the count as unknown and keeps waiting.
+A worker that does not answer within five seconds is excluded from the merged result and logged; the command reports what the remaining workers returned. `keel backend drain` reports how many workers applied the drain and warns when that is fewer than all of them, since a worker that missed it continues to send new connections to the backend. `keel backend drain --wait` reports the connection count as unknown and keeps waiting when no worker answers, rather than treating it as zero.
 
 If Keel is not running or the socket path is wrong, the command fails with:
 
@@ -63,7 +63,9 @@ Is keel running?
 
 Show the status of the running instance: uptime, and for every backend its drain state, health and open connections. `unchecked` means the pool has no health check.
 
-Connection counts are the sum across all workers. A backend's health is the worst any worker reports — a worker that will not route to a backend is worth seeing — and its drain state the least-drained any worker reports, so a backend still receiving new connections from one worker reads `active` rather than `draining`. A reason in parentheses is the last failed probe or the ejection cause; it stays visible on a backend that is still `healthy`, because a probe failure is recorded immediately while the state only flips after `unhealthy_threshold` failures in a row.
+Connection counts are summed across all workers. Health is the worst state any worker reports, so a backend one worker refuses to route to is shown as degraded. Drain state is the least-drained any worker reports, so a backend that one worker still sends new connections to is shown as `active` rather than `draining`.
+
+A reason in parentheses is the last failed probe or the ejection cause. It remains visible on a backend still shown as `healthy`: a probe failure is recorded immediately, while the state changes only after `unhealthy_threshold` consecutive failures.
 
 ```bash
 keel status
@@ -119,7 +121,7 @@ The `address` must match exactly how it appears in `keel.yaml` (e.g. `10.0.0.1:8
 
 Without `--wait`, the command initiates the drain and returns immediately. The backend transitions to the `Draining` state and continues to drain in the background.
 
-The drain is applied in every worker, and the master re-applies it to any worker it restarts — a worker that crashes mid-drain comes back with the backend still draining instead of putting it back into rotation. Drains are held by the running master only: they are not written to `keel.yaml`, so a full restart of Keel starts every backend `active` again.
+The drain is applied in every worker, and the master re-applies it to any worker it restarts, so a worker that crashes mid-drain returns with the backend still draining. Drain state is held by the running master and is not written to `keel.yaml`: after a full restart every backend is `active` again.
 
 With `--wait`, the command blocks and streams live connection counts until the backend reaches zero active connections, summed across all workers:
 

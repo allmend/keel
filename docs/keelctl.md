@@ -33,10 +33,7 @@ Remote control is off unless `control.remote` is configured. The local Unix
 socket (`keel.control_socket`) is always on and unchanged — `keel status` on
 the node works exactly as before.
 
-`address` must be a literal `ip:port`; a hostname is rejected at startup (see
-[Configuration](configuration.md#control)). The listener is owned by the root
-master process, which is a deliberate trade documented in
-[Security](security.md#the-remote-control-listener-runs-as-root).
+`address` takes a literal `ip:port`; a hostname is rejected during config validation. The listener is served by the root master process — see [Security](security.md#the-remote-control-listener-runs-as-root).
 
 On first start with `control.remote` set (or on the first
 `keel credentials create`), Keel generates the control CA in `ca_dir`:

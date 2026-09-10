@@ -335,15 +335,9 @@ control:
       - 10.1.2.0/24
 ```
 
-`remote.address` must be a literal address and port, not a hostname. Keel binds
-it in the master process, and resolving a name there would hand the work to a
-background thread pool; the master has to stay single-threaded, because it
-forks replacement workers and a fork from a threaded process can deadlock the
-child. A hostname fails validation at startup with a message saying so.
+`remote.address` takes a literal address and port. A hostname is rejected during config validation: the master binds this listener, and resolving a name would move the bind onto a background thread pool, while the master must remain single-threaded to fork replacement workers safely.
 
-The listener runs in the root master process — see
-[Security](security.md#the-remote-control-listener-runs-as-root) for what that
-means and why.
+The listener is served by the root master process. See [Security](security.md#the-remote-control-listener-runs-as-root).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -398,7 +392,7 @@ On `SIGHUP` or `keel config reload`, all files including conf.d fragments are re
 
 ## Hot reload
 
-Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections. The master re-reads the config as well as forwarding the signal, so a worker it restarts later starts from the current config; if the new config fails to load, the master logs it and keeps the previous one for that purpose.
+Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections. The master forwards the signal to every worker and re-reads the config itself, so a worker it restarts later starts from the current config. If the new config fails to load, the master logs the error and retains the previous one for that purpose.
 
 What reloads without restart:
 - Backends removed from a pool — they are moved to `draining`
@@ -412,6 +406,6 @@ What requires a process restart:
 - Worker count (`keel.workers`)
 - Process user/group (`keel.user`, `keel.group`)
 
-A backend is matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution has changed since startup is still recognised as the same backend and is left alone. Reloading resolves no names and makes no DNS queries; a new IP for an existing hostname takes effect on restart, like any other backend change.
+Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
 
 In cluster mode, use `keel config push <file>` to distribute a new config to all nodes via Raft. See [Cluster](cluster.md).

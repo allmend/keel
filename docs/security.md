@@ -76,23 +76,28 @@ Anyone who can open the control socket controls the proxy: draining backends, re
 
 The socket directory is created `0750` before the socket is bound, and the socket itself is set to `0660` (owner and group only). If those permissions cannot be applied, Keel refuses to serve the control socket rather than run it open.
 
-The master binds the socket while still root and then hands it to `keel.user` and `keel.group`, so reaching it requires that group rather than root. The directory holding it stays root-owned (`0750`, group `keel.group`): a process that can write a directory can unlink what is in it, so a worker-writable directory would let a compromised worker replace the master's socket and answer operator commands in its place. The workers create their own sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory that does belong to `keel.user`.
+The master binds the socket as root and assigns it to `keel.user` and `keel.group`, so access requires that group rather than root.
+
+The directory holding it remains owned by root, mode `0750` with group `keel.group`. Write permission on a directory allows unlinking its entries, so a worker-writable directory would let a compromised worker remove the master's socket, bind its own in that path, and answer operator commands in the master's place. The workers create their sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory owned by `keel.user`.
 
 ---
 
 ## The remote control listener runs as root
 
-This one is a known deviation from the process model, recorded here rather than glossed over.
+The `control.remote` mTLS listener is bound and served by the master process, which keeps root privileges. TLS handshakes, client-certificate verification and command parsing for that port therefore run privileged, and the control CA in `ca_dir` is read as root. Everything else follows the process model: the master binds ports and reads certificates, and the unprivileged workers handle all proxied traffic.
 
-Keel's design says the root master binds ports, spawns workers, and never touches request data. The `control.remote` mTLS listener breaks that: the master owns it, so TLS handshakes, client-certificate verification and JSON command parsing for a network-facing port all happen in the privileged process — the same one that holds the listening sockets and runs the fork loop. The control CA in `ca_dir` is read by root as well.
+The listener belongs to the master because a control command answers for the whole instance. Each worker holds only its own connection counts, health results and drain state, and when every worker bound the port, all but one failed with `control: remote listener failed`.
 
-It moved there for correctness. When each worker bound the port, every worker but one failed with `control: remote listener failed`, and the one that won could only answer for itself — it had no view of the other workers' connection counts, health or drain state. Answering for the instance requires the process that knows about all the workers, and that is the master.
+mTLS bounds the exposure: no command is parsed until the client presents a certificate signed by the control CA, and `control.remote.allow` can restrict source ranges as a second tier. Certificate verification itself is the attacker-reachable code that runs as root.
 
-The exposure is bounded by mTLS: a client certificate signed by the control CA is required before any command is parsed, and `control.remote.allow` can restrict source ranges on top. But certificate verification itself is attacker-reachable code running as root, which the worker model was built to avoid.
+Leave `control.remote` unset to avoid this entirely. The local Unix socket runs the same protocol and is unaffected, and `keelctl` then requires a shell on the node.
 
-If that trade does not suit your deployment, leave `control.remote` unset. The local Unix socket is unaffected and runs the same protocol; `keelctl` then needs a shell on the node, as it did before remote control existed.
-
-A better shape — a dedicated unprivileged control process that fans out to the workers, closer to how nginx keeps its master free of request handling — is open for discussion rather than settled.
+| | Parses network input | Privileges |
+|---|---|---|
+| Proxy listeners | yes | unprivileged worker |
+| Local control socket | yes | unprivileged worker (its own socket) / root master (instance socket) |
+| `control.remote` listener | yes | root master |
+| Signals, config files, certificates | no | root master |
 
 ---
 
