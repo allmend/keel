@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.13.2] — 2026-09-10
+
 ### Fixed
 
 - **`keel backend drain --wait` could report completion on missing data.**
@@ -548,7 +552,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/allmend/keel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/allmend/keel/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/allmend/keel/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/allmend/keel/compare/v0.11.0...v0.12.0
