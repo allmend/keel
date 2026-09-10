@@ -808,7 +808,7 @@ pub struct WorkerSockets {
 }
 
 // Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
-pub(crate) fn resolve_addr(addr: &str) -> anyhow::Result<String> {
+fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr.to_owned());
     }
@@ -845,7 +845,15 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
         let addrs: Vec<&str> = resolved.iter().map(String::as_str).collect();
         let weights: Vec<usize> = pool_cfg.backends.iter().map(|b| b.weight as usize).collect();
 
-        build_drain_entries(name, &addrs, &mut drain);
+        // Paired with the configured form, so a reload can match a backend
+        // without resolving it again.
+        let configured: Vec<(&str, &str)> = pool_cfg
+            .backends
+            .iter()
+            .map(|b| b.address.as_str())
+            .zip(addrs.iter().copied())
+            .collect();
+        build_drain_entries(name, &configured, &mut drain);
 
         // Initialise drain state metric for each backend
         for addr in &addrs {

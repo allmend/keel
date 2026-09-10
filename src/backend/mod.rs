@@ -90,14 +90,20 @@ pub struct BackendEntry {
     pub drain_state: AtomicU8,
     pub connections: AtomicI64,
     pub health: HealthState,
+    /// The address as written in `keel.yaml`, which is what a later reload is
+    /// compared against. The map is keyed by the resolved address, so without
+    /// this a hostname-configured backend could not be matched back to its
+    /// config entry without resolving it again.
+    pub config_address: String,
 }
 
 impl BackendEntry {
-    fn new() -> Self {
+    fn new(config_address: &str) -> Self {
         BackendEntry {
             drain_state: AtomicU8::new(DRAIN_ACTIVE),
             connections: AtomicI64::new(0),
             health: HealthState::new(),
+            config_address: config_address.to_owned(),
         }
     }
 
@@ -441,65 +447,42 @@ impl PoolRegistry {
         for (pool_name, pool_cfg) in &cfg.pools {
             let prefix = format!("{pool_name}/");
 
-            // Keys in the drain table are resolved addresses (see
-            // proxy::build_pools), so the config's hostnames have to be
-            // resolved the same way before comparing. Comparing raw strings
-            // made every reload of a hostname-based pool look like "all
-            // backends removed" and drain the whole pool.
-            let mut new_keys: HashSet<String> = HashSet::new();
-            let mut unresolved = false;
-            for b in &pool_cfg.backends {
-                match crate::proxy::resolve_addr(&b.address) {
-                    Ok(addr) => {
-                        new_keys.insert(drain_key(pool_name, &addr));
-                    }
-                    Err(e) => {
-                        unresolved = true;
-                        tracing::warn!(
-                            pool = pool_name,
-                            backend = b.address,
-                            error = %e,
-                            "hot reload: cannot resolve backend address"
-                        );
-                    }
-                }
-            }
-            // A backend we cannot resolve is indistinguishable from one that
-            // was removed. Leaving the pool alone is the safe reading: a
-            // transient DNS failure must never drain a serving pool.
-            if unresolved {
-                tracing::warn!(pool = pool_name, "hot reload: pool left unchanged");
-                continue;
-            }
+            // Compare on the address as configured, which is what the
+            // entry remembers. Resolving again here would put a blocking
+            // getaddrinfo on the async reload task, and would also drain a
+            // backend whose hostname merely resolved to a different IP than
+            // it did at startup.
+            let configured: HashSet<&str> =
+                pool_cfg.backends.iter().map(|b| b.address.as_str()).collect();
 
             // Drain backends removed from config.
             for (key, entry) in &self.drain {
                 if !key.starts_with(&prefix) {
                     continue;
                 }
-                if !new_keys.contains(key) {
-                    if entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
-                        entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-                        let addr = key.trim_start_matches(&prefix);
-                        crate::metrics::set_drain_state(pool_name, addr, DRAIN_DRAINING);
-                        tracing::info!(
-                            pool = pool_name,
-                            backend = addr,
-                            "hot reload: backend removed from config, draining"
-                        );
-                    }
+                let gone = !configured.contains(entry.config_address.as_str());
+                if gone && entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
+                    entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
+                    let addr = key.trim_start_matches(&prefix);
+                    crate::metrics::set_drain_state(pool_name, addr, DRAIN_DRAINING);
+                    tracing::info!(
+                        pool = pool_name,
+                        backend = addr,
+                        "hot reload: backend removed from config, draining"
+                    );
                 }
             }
 
             // Warn about additions that need a restart.
-            let existing_keys: HashSet<&String> = self.drain
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
+            let known: HashSet<&str> = self
+                .drain
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, e)| e.config_address.as_str())
                 .collect();
 
-            for key in &new_keys {
-                if !existing_keys.contains(key) {
-                    let addr = key.trim_start_matches(&prefix);
+            for addr in &configured {
+                if !known.contains(addr) {
                     tracing::warn!(
                         pool = pool_name,
                         backend = addr,
@@ -620,14 +603,17 @@ where
 }
 
 /// Build the drain table from a pool's backends.
+/// Create the drain entries for a pool. Each item is the backend's address as
+/// configured paired with the address it resolved to; the map is keyed by the
+/// resolved one, which is what selection and drain commands use.
 pub fn build_drain_entries(
     pool_name: &str,
-    addrs: &[&str],
+    addrs: &[(&str, &str)],
     drain: &mut HashMap<String, BackendEntry>,
 ) {
-    for addr in addrs {
-        let key = drain_key(pool_name, addr);
-        drain.entry(key).or_insert_with(BackendEntry::new);
+    for (configured, resolved) in addrs {
+        let key = drain_key(pool_name, resolved);
+        drain.entry(key).or_insert_with(|| BackendEntry::new(configured));
     }
 }
 
@@ -638,7 +624,8 @@ mod tests {
     fn registry(eject_for: Duration) -> PoolRegistry {
         let addrs = ["127.0.0.1:1", "127.0.0.1:2"];
         let mut drain = HashMap::new();
-        build_drain_entries("p", &addrs, &mut drain);
+        let pairs: Vec<(&str, &str)> = addrs.iter().map(|a| (*a, *a)).collect();
+        build_drain_entries("p", &pairs, &mut drain);
         let mut pools = HashMap::new();
         pools.insert("p".to_owned(), Pool::LeastConn(Arc::new(LeastConnPool::build(&addrs).unwrap())));
         let mut passive = HashMap::new();
@@ -657,28 +644,42 @@ mod tests {
     }
 
     /// A reload must not touch a pool whose backends are configured as
-    /// hostnames: the drain table is keyed by resolved addresses, so comparing
-    /// raw config strings drained every backend and 502'd the whole pool.
+    /// hostnames. The drain table is keyed by the resolved address, so
+    /// matching on that key drained every backend and 502'd the whole pool.
     #[test]
     fn reload_keeps_hostname_backends_active() {
-        let Ok(resolved) = crate::proxy::resolve_addr("localhost:8080") else {
-            return; // no localhost resolution here; nothing to assert
-        };
-        let addrs = [resolved.as_str()];
+        // As build_pools records it: configured "backend1:80", resolved to an IP.
         let mut drain = HashMap::new();
-        build_drain_entries("web", &addrs, &mut drain);
+        build_drain_entries("web", &[("backend1:80", "10.0.0.7:80")], &mut drain);
         let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
 
         let cfg: crate::config::Config =
-            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: localhost:8080\n")
+            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: backend1:80\n")
                 .expect("config parses");
         reg.sync_from_config(&cfg);
 
-        let key = drain_key("web", &resolved);
         assert_eq!(
-            reg.drain[&key].drain_state.load(Ordering::Relaxed),
+            reg.drain[&drain_key("web", "10.0.0.7:80")].drain_state.load(Ordering::Relaxed),
             DRAIN_ACTIVE,
             "a backend still present in config must stay active across a reload"
+        );
+    }
+
+    /// A hostname that now resolves elsewhere must not look like a removal:
+    /// the entry is matched on what the config says, not on the resolved IP.
+    #[test]
+    fn reload_ignores_a_changed_resolution() {
+        let mut drain = HashMap::new();
+        build_drain_entries("web", &[("backend1:80", "10.0.0.7:80")], &mut drain);
+        let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
+
+        let cfg: crate::config::Config =
+            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: backend1:80\n")
+                .expect("config parses");
+        reg.sync_from_config(&cfg);
+        assert_eq!(
+            reg.drain[&drain_key("web", "10.0.0.7:80")].drain_state.load(Ordering::Relaxed),
+            DRAIN_ACTIVE
         );
     }
 
@@ -686,9 +687,12 @@ mod tests {
     /// config still drains.
     #[test]
     fn reload_drains_backends_removed_from_config() {
-        let addrs = ["127.0.0.1:8080", "127.0.0.2:8080"];
         let mut drain = HashMap::new();
-        build_drain_entries("web", &addrs, &mut drain);
+        build_drain_entries(
+            "web",
+            &[("127.0.0.1:8080", "127.0.0.1:8080"), ("127.0.0.2:8080", "127.0.0.2:8080")],
+            &mut drain,
+        );
         let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
 
         let cfg: crate::config::Config =

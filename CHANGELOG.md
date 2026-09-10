@@ -8,6 +8,37 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`keel backend drain --wait` could report completion on missing data.**
+  Summing connections over the workers that answered gives zero when none
+  answer, which the wait loop read as "drained". It now distinguishes unknown
+  from zero and keeps waiting.
+- **A drain that reached only some workers reported success.** The command now
+  reports how many workers applied it and warns when that is not all of them;
+  the ones that missed it keep sending new connections to the backend.
+- **`keel backend list` failed if any single worker rejected the pool**, which
+  a worker still on the pre-reload config legitimately does. Only a pool no
+  worker knows is reported missing.
+- **A compromised worker could hijack the master's control socket.** It sat in
+  the directory handed to `keel.user` so the workers could create their own
+  sockets, and directory write permission allows unlinking. That directory is
+  root-owned now, with a `workers/` subdirectory for the worker-created
+  sockets.
+- **A restarted worker inherited the master's listening sockets**, letting it
+  accept operator commands and keeping the remote-control port bound if the
+  master died. The child closes them after the fork.
+- **A config reload no longer resolves DNS.** Backends are matched on the
+  address as written in the config, which the drain table now records, instead
+  of resolving each one again on the reload task — that put a blocking
+  `getaddrinfo` per backend on an async runtime thread.
+
+### Changed
+
+- `control.remote.address` must be a literal `ip:port`. A hostname would be
+  resolved through tokio's blocking pool, adding a thread to the process that
+  forks workers.
+
 ---
 
 ## [0.13.1] — 2026-09-10

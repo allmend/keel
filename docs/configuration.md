@@ -402,6 +402,6 @@ What requires a process restart:
 - Worker count (`keel.workers`)
 - Process user/group (`keel.user`, `keel.group`)
 
-A backend is matched by its resolved address, so a hostname that resolves to a different IP than it did at startup reads as one backend removed (drained) and another added (needs a restart). If any backend address in a pool cannot be resolved at all during a reload, that pool is left untouched — a DNS failure never drains a serving pool.
+A backend is matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution has changed since startup is still recognised as the same backend and is left alone. Reloading resolves no names and makes no DNS queries; a new IP for an existing hostname takes effect on restart, like any other backend change.
 
 In cluster mode, use `keel config push <file>` to distribute a new config to all nodes via Raft. See [Cluster](cluster.md).
