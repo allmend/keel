@@ -391,14 +391,17 @@ On `SIGHUP` or `keel config reload`, all files including conf.d fragments are re
 Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections.
 
 What reloads without restart:
-- Backend pool membership and weights
+- Backends removed from a pool — they are moved to `draining`
 - Health check parameters
 - Virtual host routing rules
 - TLS certificates
 
 What requires a process restart:
+- Backends added to a pool, and backend weight changes — both are logged as a warning and otherwise ignored
 - Listener ports (`listeners[].address`)
 - Worker count (`keel.workers`)
 - Process user/group (`keel.user`, `keel.group`)
+
+A backend is matched by its resolved address, so a hostname that resolves to a different IP than it did at startup reads as one backend removed (drained) and another added (needs a restart). If any backend address in a pool cannot be resolved at all during a reload, that pool is left untouched — a DNS failure never drains a serving pool.
 
 In cluster mode, use `keel config push <file>` to distribute a new config to all nodes via Raft. See [Cluster](cluster.md).

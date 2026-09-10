@@ -148,9 +148,9 @@ On success:
 config reloaded
 ```
 
-What reloads: pool membership, health check settings, virtual host rules, TLS certificates.
+What reloads: backends removed from a pool (they are drained), health check settings, virtual host rules, TLS certificates.
 
-What does not reload without a restart: listener ports, worker count.
+What does not reload without a restart: backends added to a pool, backend weights, listener ports, worker count. See [Hot reload](configuration.md#hot-reload) for the details.
 
 In cluster mode, use `keel config push` instead to distribute the new config to all nodes.
 

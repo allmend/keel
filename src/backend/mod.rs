@@ -441,11 +441,36 @@ impl PoolRegistry {
         for (pool_name, pool_cfg) in &cfg.pools {
             let prefix = format!("{pool_name}/");
 
-            let new_keys: HashSet<String> = pool_cfg
-                .backends
-                .iter()
-                .map(|b| drain_key(pool_name, &b.address))
-                .collect();
+            // Keys in the drain table are resolved addresses (see
+            // proxy::build_pools), so the config's hostnames have to be
+            // resolved the same way before comparing. Comparing raw strings
+            // made every reload of a hostname-based pool look like "all
+            // backends removed" and drain the whole pool.
+            let mut new_keys: HashSet<String> = HashSet::new();
+            let mut unresolved = false;
+            for b in &pool_cfg.backends {
+                match crate::proxy::resolve_addr(&b.address) {
+                    Ok(addr) => {
+                        new_keys.insert(drain_key(pool_name, &addr));
+                    }
+                    Err(e) => {
+                        unresolved = true;
+                        tracing::warn!(
+                            pool = pool_name,
+                            backend = b.address,
+                            error = %e,
+                            "hot reload: cannot resolve backend address"
+                        );
+                    }
+                }
+            }
+            // A backend we cannot resolve is indistinguishable from one that
+            // was removed. Leaving the pool alone is the safe reading: a
+            // transient DNS failure must never drain a serving pool.
+            if unresolved {
+                tracing::warn!(pool = pool_name, "hot reload: pool left unchanged");
+                continue;
+            }
 
             // Drain backends removed from config.
             for (key, entry) in &self.drain {
@@ -629,6 +654,56 @@ mod tests {
             reg.release("p", *a);
         }
         picked.into_iter().collect()
+    }
+
+    /// A reload must not touch a pool whose backends are configured as
+    /// hostnames: the drain table is keyed by resolved addresses, so comparing
+    /// raw config strings drained every backend and 502'd the whole pool.
+    #[test]
+    fn reload_keeps_hostname_backends_active() {
+        let Ok(resolved) = crate::proxy::resolve_addr("localhost:8080") else {
+            return; // no localhost resolution here; nothing to assert
+        };
+        let addrs = [resolved.as_str()];
+        let mut drain = HashMap::new();
+        build_drain_entries("web", &addrs, &mut drain);
+        let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
+
+        let cfg: crate::config::Config =
+            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: localhost:8080\n")
+                .expect("config parses");
+        reg.sync_from_config(&cfg);
+
+        let key = drain_key("web", &resolved);
+        assert_eq!(
+            reg.drain[&key].drain_state.load(Ordering::Relaxed),
+            DRAIN_ACTIVE,
+            "a backend still present in config must stay active across a reload"
+        );
+    }
+
+    /// The other half of the same comparison: a backend genuinely gone from
+    /// config still drains.
+    #[test]
+    fn reload_drains_backends_removed_from_config() {
+        let addrs = ["127.0.0.1:8080", "127.0.0.2:8080"];
+        let mut drain = HashMap::new();
+        build_drain_entries("web", &addrs, &mut drain);
+        let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
+
+        let cfg: crate::config::Config =
+            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: 127.0.0.1:8080\n")
+                .expect("config parses");
+        reg.sync_from_config(&cfg);
+
+        assert_eq!(
+            reg.drain[&drain_key("web", "127.0.0.1:8080")].drain_state.load(Ordering::Relaxed),
+            DRAIN_ACTIVE
+        );
+        assert_eq!(
+            reg.drain[&drain_key("web", "127.0.0.2:8080")].drain_state.load(Ordering::Relaxed),
+            DRAIN_DRAINING
+        );
     }
 
     #[test]

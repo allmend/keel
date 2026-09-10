@@ -808,7 +808,7 @@ pub struct WorkerSockets {
 }
 
 // Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
-fn resolve_addr(addr: &str) -> anyhow::Result<String> {
+pub(crate) fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr.to_owned());
     }

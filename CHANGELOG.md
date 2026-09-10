@@ -8,6 +8,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A config reload drained every backend in a pool whose backends are
+  configured as hostnames.** `sync_from_config` compared the raw config
+  strings (`backend1:80`) against the drain table, which is keyed by the
+  addresses resolved at startup (`10.0.0.2:80`), so every backend looked
+  removed: `SIGHUP` moved the whole pool to `draining` and the instance
+  answered 502 until restarted. Config addresses are now resolved the same way
+  before comparing, and a pool with an address that cannot be resolved is left
+  untouched rather than drained.
+
 ---
 
 ## [0.13.0] — 2026-09-09
