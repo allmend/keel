@@ -70,9 +70,19 @@ impl RemoteControlServer {
             ));
         }
 
-        let listener = TcpListener::bind(&self.cfg.address)
-            .await
-            .with_context(|| format!("bind {}", self.cfg.address))?;
+        // Parsed, not resolved: tokio only binds a literal address inline, and
+        // routes anything needing name resolution through spawn_blocking. That
+        // would leave a blocking-pool thread alive in the master, and the
+        // master's fork() for a replacement worker must happen from a
+        // single-threaded process (see run_master).
+        let address: std::net::SocketAddr = self
+            .cfg
+            .address
+            .parse()
+            .with_context(|| format!("control.remote.address must be ip:port, got '{}'", self.cfg.address))?;
+        let listener =
+            TcpListener::bind(address).await.with_context(|| format!("bind {address}"))?;
+        crate::control::register_master_listener(std::os::fd::AsRawFd::as_raw_fd(&listener));
         info!(address = self.cfg.address, allow = ?self.cfg.allow, "control: remote listener ready (mTLS)");
 
         loop {

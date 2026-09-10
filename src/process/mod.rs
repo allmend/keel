@@ -38,12 +38,12 @@ impl BoundListeners {
             .iter()
             .map(|(a, socks)| Ok((a.clone(), socks[index].try_clone()?)))
             .collect::<std::io::Result<HashMap<_, _>>>()?;
-        // Private hand-off socket for Pingora (see proxy::run). Lives next to
-        // the control socket, which the worker user can already write to.
-        let dir = std::path::Path::new(&cfg.keel.control_socket)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/var/run/keel"));
-        let upgrade_sock = dir.join(format!("upgrade-{index}.sock")).to_string_lossy().into_owned();
+        // Private hand-off socket for Pingora (see proxy::run). The worker
+        // creates it, so it goes in the worker-owned socket directory.
+        let upgrade_sock = crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket)
+            .join(format!("upgrade-{index}.sock"))
+            .to_string_lossy()
+            .into_owned();
         let icmp4 = self.icmp4.get(index).map(|s| s.try_clone()).transpose()?;
         let icmp6 = self.icmp6.get(index).map(|s| s.try_clone()).transpose()?;
         Ok(proxy::WorkerSockets { tcp, udp, icmp4, icmp6, upgrade_sock })
@@ -57,15 +57,29 @@ impl BoundListeners {
 /// image default) would make each of them fail. Only called as root.
 fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     use nix::unistd::{chown, Group, User};
+    use std::os::unix::fs::PermissionsExt;
 
     let uid = User::from_name(&cfg.keel.user)?.map(|u| u.uid);
     let gid = Group::from_name(&cfg.keel.group)?.map(|g| g.gid);
 
+    // The instance socket's own directory is deliberately NOT handed to the
+    // worker user: a process that can write it can unlink the master's socket
+    // and bind its own in that place. The master creates it, keeps it, and
+    // gives the workers a subdirectory to create their sockets in.
     let socket_dir = std::path::Path::new(&cfg.keel.control_socket)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("/var/run/keel"));
-    let mut dirs = vec![socket_dir];
+    std::fs::create_dir_all(&socket_dir)
+        .with_context(|| format!("master: cannot create {}", socket_dir.display()))?;
+    // Group-executable so the workers can traverse into their subdirectory.
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o750))
+        .with_context(|| format!("master: cannot restrict {}", socket_dir.display()))?;
+    chown(&socket_dir, None, gid)
+        .with_context(|| format!("master: cannot set group on {}", socket_dir.display()))?;
+    info!(dir = %socket_dir.display(), "master: control socket directory ready (root-owned)");
+
+    let mut dirs = vec![crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket)];
     if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.as_ref()) {
         dirs.push(std::path::PathBuf::from(&remote.ca_dir));
     }
@@ -209,9 +223,15 @@ pub fn run_master(cfg: Config) -> Result<()> {
     // and answers every command by asking all workers — a worker only knows
     // its own connection counts, drain state and health.
     //
-    // A current-thread runtime spawns no threads, so the fork() that replaces
-    // a dead worker still happens from a single-threaded process; and the
-    // runtime is entered only between supervision ticks, so no fork ever
+    // A current-thread runtime runs on this thread and starts none of its
+    // own, so the fork() that replaces a dead worker still happens from a
+    // single-threaded process — forking a threaded one and then allocating,
+    // logging or reading NSS in the child risks a lock held by a thread that
+    // does not exist there. That holds only while nothing reaches tokio's
+    // blocking pool, which is why control.remote.address is required to be a
+    // literal address (a name would resolve via spawn_blocking).
+    //
+    // The runtime is also entered only between supervision ticks, so no fork
     // happens inside a runtime context (Pingora builds its own in the child).
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -343,6 +363,10 @@ fn spawn_worker(cfg: &Config, index: usize, bound: Option<&BoundListeners>) -> R
     match unsafe { fork() }? {
         ForkResult::Parent { child } => Ok(child),
         ForkResult::Child => {
+            // A worker restarted after the master bound its control listeners
+            // inherits them; it must not hold, let alone serve, the master's
+            // control socket or remote-control port.
+            control::close_master_listeners();
             drop_privileges(&cfg.keel.user, &cfg.keel.group);
             let sockets = match bound.map(|b| b.for_worker(index, cfg)) {
                 Some(Ok(s)) => Some(s),

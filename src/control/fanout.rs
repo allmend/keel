@@ -31,13 +31,27 @@ const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_ATTEMPTS: u32 = 40;
 const REPLAY_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The per-worker control socket for worker `index`, placed next to the
-/// instance socket (the same directory the fd hand-off sockets use).
-pub fn worker_socket_path(control_socket: &str, index: usize) -> String {
-    let dir = Path::new(control_socket)
+/// The directory holding the sockets the workers create.
+///
+/// A subdirectory of the instance socket's directory, not the directory
+/// itself: the workers need to create files here, so it belongs to the
+/// unprivileged worker user, and anyone who can write a directory can unlink
+/// what is in it. Keeping the master's control socket out of a
+/// worker-writable directory stops a compromised worker from replacing it
+/// and answering operator commands in the master's place.
+pub fn worker_socket_dir(control_socket: &str) -> std::path::PathBuf {
+    Path::new(control_socket)
         .parent()
-        .unwrap_or_else(|| Path::new("/var/run/keel"));
-    dir.join(format!("worker-{index}.sock")).to_string_lossy().into_owned()
+        .unwrap_or_else(|| Path::new("/var/run/keel"))
+        .join("workers")
+}
+
+/// The per-worker control socket for worker `index`.
+pub fn worker_socket_path(control_socket: &str, index: usize) -> String {
+    worker_socket_dir(control_socket)
+        .join(format!("worker-{index}.sock"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// What a drain actually achieved across the workers.
@@ -556,7 +570,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_socket_paths_sit_next_to_the_instance_socket() {
-        assert_eq!(worker_socket_path("/var/run/keel/keel.sock", 2), "/var/run/keel/worker-2.sock");
+    fn worker_sockets_live_in_a_subdirectory_of_the_instance_socket() {
+        assert_eq!(
+            worker_socket_path("/var/run/keel/keel.sock", 2),
+            "/var/run/keel/workers/worker-2.sock"
+        );
     }
 }

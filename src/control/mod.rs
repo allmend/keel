@@ -15,6 +15,36 @@ use tracing::{error, info};
 // Wire types live in the keel-control crate, shared with keelctl.
 pub use keel_control::{ControlRequest, ControlResponse};
 
+// Master listener fds
+//
+// The first workers are forked before the master binds its control listeners,
+// but a worker the master restarts later inherits them across `fork`, and
+// nothing here ever execs to clear them. An inherited listening fd lets an
+// unprivileged worker accept operator commands the master should have
+// answered, and keeps the remote-control port bound if the master is killed,
+// so a fresh master cannot rebind it. The child closes them right after the
+// fork; closing a descriptor in the child does not disturb the parent's.
+static MASTER_LISTENER_FDS: std::sync::Mutex<Vec<std::os::fd::RawFd>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record a listener the master owns, so a forked child can disown it.
+pub fn register_master_listener(fd: std::os::fd::RawFd) {
+    if let Ok(mut fds) = MASTER_LISTENER_FDS.lock() {
+        fds.push(fd);
+    }
+}
+
+/// Close every listener the master owns. Called in the child after `fork`,
+/// before it becomes a worker.
+pub fn close_master_listeners() {
+    let Ok(fds) = MASTER_LISTENER_FDS.lock() else { return };
+    for fd in fds.iter() {
+        // SAFETY: these fds belong to the master's listeners; in the child
+        // they are inherited copies this process must not keep.
+        unsafe { libc::close(*fd) };
+    }
+}
+
 // Server
 
 pub struct ControlServer {
@@ -86,6 +116,9 @@ impl ControlServer {
             return;
         }
 
+        // Only the master's socket needs disowning in forked children, but a
+        // worker never forks, so registering unconditionally is harmless.
+        register_master_listener(std::os::fd::AsRawFd::as_raw_fd(&listener));
         info!(path = self.socket_path, "control: socket ready");
 
         loop {

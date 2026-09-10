@@ -46,9 +46,9 @@ CLI subcommands communicate with a running Keel instance over a Unix socket. The
 keel --socket /tmp/keel.sock status
 ```
 
-The socket belongs to the master process, and every command covers the whole instance. Workers are separate processes with no shared memory, so each one holds its own drain state, connection counters and health results; the master asks all of them and merges the answers. Each worker has its own socket for that, `worker-<index>.sock`, in the same directory — an internal detail, not an operator interface. In cluster mode there are no workers to fan out to: the node is a single process and answers directly.
+The socket belongs to the master process, and every command covers the whole instance. Workers are separate processes with no shared memory, so each one holds its own drain state, connection counters and health results; the master asks all of them and merges the answers. Each worker has its own socket for that, `worker-<index>.sock`, in a `workers/` subdirectory beside the instance socket — an internal detail, not an operator interface. In cluster mode there are no workers to fan out to: the node is a single process and answers directly.
 
-A worker that does not answer within five seconds is left out of the merged result and logged; the command still reports what the other workers said.
+A worker that does not answer within five seconds is left out of the merged result and logged; the command still reports what the other workers said. `keel backend drain` says so explicitly — it reports how many workers applied the drain, and warns when that is not all of them, because a worker that missed it keeps sending new connections to the backend. `--wait` never reports completion on missing data: if no worker answers it shows the count as unknown and keeps waiting.
 
 If Keel is not running or the socket path is wrong, the command fails with:
 

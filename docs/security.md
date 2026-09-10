@@ -76,7 +76,9 @@ Anyone who can open the control socket controls the proxy: draining backends, re
 
 The socket directory is created `0750` before the socket is bound, and the socket itself is set to `0660` (owner and group only). If those permissions cannot be applied, Keel refuses to serve the control socket rather than run it open.
 
-The master binds the socket while still root and then hands it to `keel.user` and `keel.group`, so reaching it requires that group rather than root. The per-worker sockets beside it (`worker-<index>.sock`) carry the same protocol and the same permissions, in the same `0750` directory.
+The master binds the socket while still root and then hands it to `keel.user` and `keel.group`, so reaching it requires that group rather than root. The directory holding it stays root-owned (`0750`, group `keel.group`): a process that can write a directory can unlink what is in it, so a worker-writable directory would let a compromised worker replace the master's socket and answer operator commands in its place. The workers create their own sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory that does belong to `keel.user`.
+
+The `control.remote` mTLS listener is owned by the master, which is root. TLS handshakes, client-certificate verification and command parsing for that port therefore happen in the privileged process rather than in a worker, and the control CA in `ca_dir` is read by root. This is a deliberate trade for correctness — every worker binding the same port meant all but one failed, and a single worker could only answer for itself — but it does mean the root process parses network input on that port. Leave `control.remote` unset if that is not an acceptable trade for your deployment; the local Unix socket is unaffected.
 
 ---
 

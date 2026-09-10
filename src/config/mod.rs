@@ -186,6 +186,18 @@ pub fn default_control_ca_dir() -> String { "/var/lib/keel/control".into() }
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        // Must be a literal address, not a name: the master binds it inline
+        // so that resolving it cannot add a thread to the process that forks
+        // workers (see control::remote and process::run_master).
+        if let Some(remote) = self.control.as_ref().and_then(|c| c.remote.as_ref()) {
+            if remote.address.parse::<std::net::SocketAddr>().is_err() {
+                anyhow::bail!(
+                    "control.remote.address must be a literal ip:port (e.g. 0.0.0.0:10789), got '{}'",
+                    remote.address
+                );
+            }
+        }
+
         for (name, pool) in &self.pools {
             if pool.backends.is_empty() {
                 anyhow::bail!("pool '{name}' has no backends");
@@ -1519,6 +1531,18 @@ mod tests {
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    #[test]
+    fn remote_control_address_must_be_literal() {
+        // A hostname would resolve through tokio's blocking pool, adding a
+        // thread to the process that forks workers.
+        let yaml = "control:\n  remote:\n    address: localhost:10789\npools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
+        let err = serde_yml::from_str::<Config>(yaml).unwrap().validate().unwrap_err().to_string();
+        assert!(err.contains("literal ip:port"), "unexpected error: {err}");
+
+        let yaml = "control:\n  remote:\n    address: 0.0.0.0:10789\npools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
+        assert!(serde_yml::from_str::<Config>(yaml).unwrap().validate().is_ok());
     }
 
     #[test]
