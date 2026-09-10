@@ -106,6 +106,8 @@ Every TLS listener sets a TLS 1.2 floor and rejects TLS 1.0/1.1 handshakes. This
 - `claim_headers` are removed from every incoming request before verified values are inserted, so a backend can trust them regardless of what the client sent.
 - Rate-limit buckets are per worker process; see [API gateway](gateway.md#rate-limiting) for what that means for the effective limit.
 
+---
+
 ## Corrupt Raft snapshots surface as errors
 
 A Raft snapshot that fails to deserialize is returned as a storage error and surfaces to the operator. It is not silently replaced with an empty state, so a corrupt or tampered snapshot cannot wipe the replicated config and drain map unnoticed.
