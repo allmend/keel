@@ -335,9 +335,19 @@ control:
       - 10.1.2.0/24
 ```
 
+`remote.address` must be a literal address and port, not a hostname. Keel binds
+it in the master process, and resolving a name there would hand the work to a
+background thread pool; the master has to stay single-threaded, because it
+forks replacement workers and a fork from a threaded process can deadlock the
+child. A hostname fails validation at startup with a message saying so.
+
+The listener runs in the root master process — see
+[Security](security.md#the-remote-control-listener-runs-as-root) for what that
+means and why.
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `remote.address` | string | none | TCP listen address for keelctl |
+| `remote.address` | string | none | TCP listen address for keelctl. Must be a literal `ip:port` — a hostname is rejected at startup |
 | `remote.allow` | list | none | Optional source-CIDR restriction; empty = any source. mTLS stays mandatory |
 | `remote.ca_dir` | string | `/var/lib/keel/control` | Control CA storage (`ca.crt` / `ca.key`) |
 

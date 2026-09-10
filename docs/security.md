@@ -78,7 +78,21 @@ The socket directory is created `0750` before the socket is bound, and the socke
 
 The master binds the socket while still root and then hands it to `keel.user` and `keel.group`, so reaching it requires that group rather than root. The directory holding it stays root-owned (`0750`, group `keel.group`): a process that can write a directory can unlink what is in it, so a worker-writable directory would let a compromised worker replace the master's socket and answer operator commands in its place. The workers create their own sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory that does belong to `keel.user`.
 
-The `control.remote` mTLS listener is owned by the master, which is root. TLS handshakes, client-certificate verification and command parsing for that port therefore happen in the privileged process rather than in a worker, and the control CA in `ca_dir` is read by root. This is a deliberate trade for correctness — every worker binding the same port meant all but one failed, and a single worker could only answer for itself — but it does mean the root process parses network input on that port. Leave `control.remote` unset if that is not an acceptable trade for your deployment; the local Unix socket is unaffected.
+---
+
+## The remote control listener runs as root
+
+This one is a known deviation from the process model, recorded here rather than glossed over.
+
+Keel's design says the root master binds ports, spawns workers, and never touches request data. The `control.remote` mTLS listener breaks that: the master owns it, so TLS handshakes, client-certificate verification and JSON command parsing for a network-facing port all happen in the privileged process — the same one that holds the listening sockets and runs the fork loop. The control CA in `ca_dir` is read by root as well.
+
+It moved there for correctness. When each worker bound the port, every worker but one failed with `control: remote listener failed`, and the one that won could only answer for itself — it had no view of the other workers' connection counts, health or drain state. Answering for the instance requires the process that knows about all the workers, and that is the master.
+
+The exposure is bounded by mTLS: a client certificate signed by the control CA is required before any command is parsed, and `control.remote.allow` can restrict source ranges on top. But certificate verification itself is attacker-reachable code running as root, which the worker model was built to avoid.
+
+If that trade does not suit your deployment, leave `control.remote` unset. The local Unix socket is unaffected and runs the same protocol; `keelctl` then needs a shell on the node, as it did before remote control existed.
+
+A better shape — a dedicated unprivileged control process that fans out to the workers, closer to how nginx keeps its master free of request handling — is open for discussion rather than settled.
 
 ---
 
