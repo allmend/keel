@@ -104,15 +104,31 @@ pub fn backend_drain<S: Read + Write>(stream: &mut S, address: &str, wait: bool)
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             println!("Draining {} from pools: {}", address, pools.join(", "));
+            // A drain that only reached some workers leaves the others still
+            // opening connections to the backend; say so rather than let it
+            // read as done.
+            let acked = data["workers_acknowledged"].as_u64();
+            let workers = data["workers"].as_u64();
+            if let (Some(acked), Some(workers)) = (acked, workers) {
+                if acked < workers {
+                    println!(
+                        "  warning: applied on {acked} of {workers} workers — the rest did not answer \
+                         and are still sending new connections to this backend"
+                    );
+                }
+            }
             if data["done"].as_bool() == Some(true) {
                 println!("Drain complete.");
                 return Ok(());
             }
             first = false;
         } else {
-            // Streaming status update
-            let conns = data["connections"].as_i64().unwrap_or(0);
-            print!("\r  connections: {conns}   ");
+            // Streaming status update. A null count means no worker answered:
+            // unknown, not zero.
+            match data["connections"].as_i64() {
+                Some(conns) => print!("\r  connections: {conns}   "),
+                None => print!("\r  connections: unknown (no worker answered)   "),
+            }
             let _ = std::io::stdout().flush();
 
             if data["done"].as_bool() == Some(true) {

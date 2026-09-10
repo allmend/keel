@@ -40,6 +40,15 @@ pub fn worker_socket_path(control_socket: &str, index: usize) -> String {
     dir.join(format!("worker-{index}.sock")).to_string_lossy().into_owned()
 }
 
+/// What a drain actually achieved across the workers.
+pub struct DrainOutcome {
+    pub pools: Vec<String>,
+    /// Workers that applied it.
+    pub acknowledged: usize,
+    /// Workers the master expected to reach.
+    pub workers: usize,
+}
+
 pub struct WorkerFanout {
     sockets: Vec<String>,
     started_at: Instant,
@@ -113,14 +122,18 @@ impl WorkerFanout {
         if responses.is_empty() {
             return ControlResponse::err("no worker answered");
         }
-        // Every worker runs the same config, so "not found" from one is
-        // "not found" everywhere.
-        if let Some(err) = first_error(&responses) {
-            return ControlResponse::err(err);
+        // Only a pool that no worker knows is really missing. One worker can
+        // legitimately disagree — it may still be on the config a reload has
+        // already given the others.
+        if responses.iter().all(|r| !r.ok) {
+            return ControlResponse::err(
+                first_error(&responses).unwrap_or_else(|| format!("pool '{pool}' not found")),
+            );
         }
         let backends = merge_backends(
             responses
                 .iter()
+                .filter(|r| r.ok)
                 .filter_map(|r| {
                     r.data.as_ref().and_then(|d| d.get("backends")).and_then(Value::as_array)
                 })
@@ -129,7 +142,7 @@ impl WorkerFanout {
         ControlResponse::ok(json!({ "pool": pool, "backends": backends }))
     }
 
-    pub async fn drain(&self, address: &str) -> Result<Vec<String>, String> {
+    pub async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
         let request = ControlRequest::BackendDrain { address: address.to_owned(), wait: false };
         let responses = self.ask_all(&request).await;
         if responses.is_empty() {
@@ -156,15 +169,28 @@ impl WorkerFanout {
                 drained.push(address.to_owned());
             }
         }
-        Ok(pools)
+        // A worker that did not answer is still sending traffic to the
+        // backend. The master will replay the drain if it restarts that
+        // worker, but until then the drain is only partly applied and the
+        // operator has to know.
+        Ok(DrainOutcome {
+            pools,
+            acknowledged: responses.iter().filter(|r| r.ok).count(),
+            workers: self.sockets.len(),
+        })
     }
 
-    pub async fn connections_for(&self, address: &str) -> i64 {
-        self.ask_all(&ControlRequest::Status)
-            .await
-            .iter()
-            .map(|r| connections_in(r, address))
-            .sum()
+    /// Open connections to a backend, summed over the workers.
+    ///
+    /// `None` when not one worker answered: that is "unknown", not "zero".
+    /// Reporting zero would tell `drain --wait` the backend is finished while
+    /// connections are still open on it.
+    pub async fn connections_for(&self, address: &str) -> Option<i64> {
+        let responses = self.ask_all(&ControlRequest::Status).await;
+        if responses.is_empty() {
+            return None;
+        }
+        Some(responses.iter().map(|r| connections_in(r, address)).sum())
     }
 
     /// Re-apply the current drains to a worker the master just replaced.
@@ -228,8 +254,13 @@ async fn ask_one(path: &str, line: &str) -> anyhow::Result<ControlResponse> {
         .map_err(|_| anyhow::anyhow!("timed out after {WORKER_TIMEOUT:?}"))?
 }
 
+/// The first failure's message. A response can be `ok: false` with no text,
+/// so fall back to a generic message rather than reporting no error at all.
 fn first_error(responses: &[ControlResponse]) -> Option<String> {
-    responses.iter().find(|r| !r.ok).and_then(|r| r.error.clone())
+    responses
+        .iter()
+        .find(|r| !r.ok)
+        .map(|r| r.error.clone().unwrap_or_else(|| "worker reported a failure".into()))
 }
 
 /// Connections a single worker reports for one backend address, across pools.
@@ -249,8 +280,10 @@ fn connections_in(response: &ControlResponse, address: &str) -> i64 {
 
 /// Merge the per-worker `pools` arrays of a `status` response into one.
 fn merge_pools(responses: &[ControlResponse]) -> Vec<Value> {
-    // Pool order follows the first worker that reported each pool, which is
-    // config order — not sorted, so output stays stable across releases.
+    // Order follows the first worker that reported each pool. Workers emit
+    // pools from a BTreeMap, so that is alphabetical; preserving their order
+    // rather than re-sorting keeps the merge faithful to whatever the workers
+    // send.
     let mut order: Vec<String> = Vec::new();
     let mut by_pool: HashMap<String, Vec<&Vec<Value>>> = HashMap::new();
 
@@ -419,6 +452,107 @@ mod tests {
             backend("10.0.0.2:80", "active", 9, "healthy"),
         ]}]));
         assert_eq!(connections_in(&r, "10.0.0.1:80"), 4);
+    }
+
+    /// A worker can answer `ok: false` without a message; losing that turned
+    /// a failure into "no error" and let it be merged as data.
+    #[test]
+    fn first_error_falls_back_when_a_failure_carries_no_message() {
+        let responses =
+            vec![ControlResponse { ok: false, data: None, error: None }];
+        assert_eq!(first_error(&responses).as_deref(), Some("worker reported a failure"));
+    }
+
+    /// Serve one canned response on a Unix socket, like a worker would.
+    async fn fake_worker(path: String, response: String) {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake worker");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = tokio::io::split(stream);
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(reader);
+                    let _ = reader.read_line(&mut line).await;
+                    let _ = writer.write_all(response.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                });
+            }
+        });
+    }
+
+    fn status_response(address: &str, conns: i64) -> String {
+        ControlResponse::ok(json!({
+            "uptime_secs": 1,
+            "pools": [{"name": "web", "backends": [backend(address, "active", conns, "healthy")]}],
+        }))
+    }
+
+    fn fanout_over(dir: &std::path::Path, workers: usize) -> WorkerFanout {
+        WorkerFanout {
+            sockets: (0..workers)
+                .map(|i| dir.join(format!("w{i}.sock")).to_string_lossy().into_owned())
+                .collect(),
+            started_at: Instant::now(),
+            drained: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reporting zero when nothing answered would tell `drain --wait` the
+    /// backend is finished while it may still be carrying connections.
+    #[tokio::test]
+    async fn connections_are_unknown_rather_than_zero_when_no_worker_answers() {
+        let dir = std::env::temp_dir().join(format!("keel-fanout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fanout = fanout_over(&dir, 2); // nothing is listening on either path
+
+        assert_eq!(fanout.connections_for("10.0.0.1:80").await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn connections_sum_over_the_workers_that_answer() {
+        let dir = std::env::temp_dir().join(format!("keel-fanout-sum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fanout = fanout_over(&dir, 3);
+        fake_worker(fanout.sockets[0].clone(), status_response("10.0.0.1:80", 4)).await;
+        fake_worker(fanout.sockets[1].clone(), status_response("10.0.0.1:80", 7)).await;
+        // sockets[2] is never bound — an unreachable worker is skipped.
+
+        assert_eq!(fanout.connections_for("10.0.0.1:80").await, Some(11));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A drain that reached only some workers must not read as fully applied:
+    /// the others keep sending new connections to the backend.
+    #[tokio::test]
+    async fn drain_reports_how_many_workers_applied_it() {
+        let dir = std::env::temp_dir().join(format!("keel-fanout-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fanout = fanout_over(&dir, 3);
+        let ok = ControlResponse::ok(json!({ "pools": ["web"], "done": true }));
+        fake_worker(fanout.sockets[0].clone(), ok.clone()).await;
+        fake_worker(fanout.sockets[1].clone(), ok).await;
+        // sockets[2] is down.
+
+        let outcome = fanout.drain("10.0.0.1:80").await.expect("drain applied somewhere");
+        assert_eq!(outcome.pools, vec!["web".to_owned()]);
+        assert_eq!(outcome.acknowledged, 2);
+        assert_eq!(outcome.workers, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn drain_fails_when_no_worker_answers() {
+        let dir = std::env::temp_dir().join(format!("keel-fanout-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fanout = fanout_over(&dir, 2);
+        assert!(fanout.drain("10.0.0.1:80").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

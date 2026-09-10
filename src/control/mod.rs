@@ -4,7 +4,7 @@ pub mod remote;
 
 use crate::backend::{BackendStatus, PoolRegistry, DRAIN_ACTIVE, DRAIN_DRAINING, DRAIN_REMOVED};
 use async_trait::async_trait;
-use fanout::WorkerFanout;
+use fanout::{DrainOutcome, WorkerFanout};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -169,25 +169,27 @@ impl Dispatch {
         }
     }
 
-    /// Mark a backend draining. `Ok` carries the pools it was found in.
-    async fn drain(&self, address: &str) -> Result<Vec<String>, String> {
+    /// Mark a backend draining. `Ok` carries the pools it was found in and
+    /// how widely the drain was applied.
+    async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
         match self {
             Dispatch::Local { pools, .. } => {
                 let found = pools.drain_by_address(address);
                 if found.is_empty() {
                     Err(format!("backend '{address}' not found in any pool"))
                 } else {
-                    Ok(found)
+                    Ok(DrainOutcome { pools: found, acknowledged: 1, workers: 1 })
                 }
             }
             Dispatch::Workers(w) => w.drain(address).await,
         }
     }
 
-    /// Connections still open to a backend, summed over every worker.
-    async fn connections_for(&self, address: &str) -> i64 {
+    /// Connections still open to a backend. `None` means no worker answered,
+    /// which is not the same as zero — see `WorkerFanout::connections_for`.
+    async fn connections_for(&self, address: &str) -> Option<i64> {
         match self {
-            Dispatch::Local { pools, .. } => pools.connections_for_address(address),
+            Dispatch::Local { pools, .. } => Some(pools.connections_for_address(address)),
             Dispatch::Workers(w) => w.connections_for(address).await,
         }
     }
@@ -251,8 +253,8 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         }
 
         ControlRequest::BackendDrain { address, wait } => {
-            let found = match dispatch.drain(&address).await {
-                Ok(found) => found,
+            let outcome = match dispatch.drain(&address).await {
+                Ok(outcome) => outcome,
                 Err(e) => {
                     write_line(&mut writer, &ControlResponse::err(e)).await?;
                     return Ok(());
@@ -262,7 +264,9 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             write_line(
                 &mut writer,
                 &ControlResponse::ok(serde_json::json!({
-                    "pools": found,
+                    "pools": outcome.pools,
+                    "workers_acknowledged": outcome.acknowledged,
+                    "workers": outcome.workers,
                     "done": !wait,
                 })),
             )
@@ -271,8 +275,12 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             if wait {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    // `None` is "no worker answered". Never finish on that:
+                    // the backend may still be carrying connections, and
+                    // reporting completion would invite the operator to take
+                    // it away.
                     let conns = dispatch.connections_for(&address).await;
-                    let done = conns == 0;
+                    let done = conns == Some(0);
                     write_line(
                         &mut writer,
                         &ControlResponse::ok(serde_json::json!({
