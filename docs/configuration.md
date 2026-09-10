@@ -335,7 +335,7 @@ control:
       - 10.1.2.0/24
 ```
 
-`remote.address` takes a literal address and port. A hostname is rejected during config validation: the master binds this listener, and resolving a name would move the bind onto a background thread pool, while the master must remain single-threaded to fork replacement workers safely.
+`remote.address` takes a literal address and port. A hostname fails config validation at startup.
 
 The listener is served by the root master process. See [Security](security.md#the-remote-control-listener-runs-as-root).
 
