@@ -181,6 +181,8 @@ jobs:
     needs: [build, keelctl, container]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+
       - name: Download packages
         uses: actions/download-artifact@v7
         with:
@@ -196,7 +198,37 @@ jobs:
       - name: Release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+
+          # The release page carries the CHANGELOG section for this version
+          # verbatim, so readers see what changed without opening another file.
+          # Stops at the next section heading or at the link-reference block,
+          # then trims the trailing separator and blank lines.
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[/) { exit }
+            found { print }
+          ' CHANGELOG.md > changelog.md
+          awk '
+            { line[NR] = $0 }
+            END {
+              first = 1
+              while (first <= NR && line[first] == "") first++
+              last = NR
+              while (last >= first && (line[last] == "" || line[last] == "---")) last--
+              for (i = first; i <= last; i++) print line[i]
+            }
+          ' changelog.md > changelog.trimmed && mv changelog.trimmed changelog.md
+
+          if [ ! -s changelog.md ]; then
+            echo "No CHANGELOG section for $VERSION — release notes will omit it." >&2
+            echo "_No changelog entry for this release._" > changelog.md
+          fi
+
           {
+            cat changelog.md
+            echo
+            echo "---"
+            echo
             echo "## Container"
             echo
             echo '```bash'
@@ -228,8 +260,6 @@ jobs:
             echo "version that does not compile for FreeBSD against current libc. Planned"
             echo "once upstream updates. keelctl (the remote control CLI) has no such"
             echo "dependency and ships for FreeBSD, macOS, and Linux."
-            echo
-            echo "See CHANGELOG.md for what changed in this release."
           } > notes.md
 
       - name: Create release
