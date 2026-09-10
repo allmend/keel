@@ -28,6 +28,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - **A restarted worker inherited the master's listening sockets**, letting it
   accept operator commands and keeping the remote-control port bound if the
   master died. The child closes them after the fork.
+- **A worker restarted after a config reload came back on the startup
+  config.** The master forks replacements from the config it holds and only
+  forwarded `SIGHUP` without re-reading it, so a worker that crashed after a
+  reload silently diverged from its siblings. The master now re-reads on
+  `SIGHUP` and keeps the previous config if the new one fails to load.
 - **A config reload no longer resolves DNS.** Backends are matched on the
   address as written in the config, which the drain table now records, instead
   of resolving each one again on the reload task — that put a blocking

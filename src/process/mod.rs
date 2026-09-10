@@ -188,7 +188,7 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 /// Spawns `cfg.keel.workers` children, each of which drops privileges and
 /// runs the Pingora data plane. The master supervises them — restarting any
 /// that die unexpectedly — and handles SIGHUP (reload) and SIGQUIT (shutdown).
-pub fn run_master(cfg: Config) -> Result<()> {
+pub fn run_master(mut cfg: Config) -> Result<()> {
     install_signal_handlers()?;
 
     // Validate that workers will be able to drop privileges before forking any,
@@ -285,6 +285,19 @@ pub fn run_master(cfg: Config) -> Result<()> {
 
         if RELOAD.swap(false, Ordering::SeqCst) {
             info!("master: reload signal received (SIGHUP), forwarding to workers");
+            // Re-read it here too. The workers reload themselves, but the
+            // master forks replacements from the config it holds, so without
+            // this a worker that crashed after a reload would come back on
+            // the startup config and quietly diverge from its siblings.
+            // Listener set and worker count are fixed for the process
+            // lifetime either way — those need a restart.
+            match crate::config::load(&cfg.path, cfg.conf_dir.as_deref()) {
+                Ok(new_cfg) => cfg = new_cfg,
+                Err(e) => warn!(
+                    error = %format!("{e:#}"),
+                    "master: config reload failed; replacement workers keep the previous config"
+                ),
+            }
             for (pid, _) in &pids {
                 let _ = signal::kill(*pid, Signal::SIGHUP);
             }

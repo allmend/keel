@@ -388,7 +388,7 @@ On `SIGHUP` or `keel config reload`, all files including conf.d fragments are re
 
 ## Hot reload
 
-Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections.
+Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections. The master re-reads the config as well as forwarding the signal, so a worker it restarts later starts from the current config; if the new config fails to load, the master logs it and keeps the previous one for that purpose.
 
 What reloads without restart:
 - Backends removed from a pool — they are moved to `draining`
