@@ -75,6 +75,19 @@ pub struct KProxy {
     limiter: Arc<crate::gateway::ratelimit::RateLimiter>,
 }
 
+/// Headers `forwarded_headers: off` removes from the upstream request.
+const FORWARDED_HEADERS: [&str; 5] =
+    ["x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host", "forwarded"];
+
+/// Remove every forwarding header. Must go through `remove_header`: removing
+/// from `headers` directly leaves the name in pingora's case map, and
+/// serializing the request for an HTTP/1 upstream then panics.
+fn strip_forwarded_headers(req: &mut pingora::http::RequestHeader) {
+    for name in FORWARDED_HEADERS {
+        req.remove_header(name);
+    }
+}
+
 impl KProxy {
     /// X-Forwarded-* and RFC 7239 headers toward the backend, per the vhost's
     /// `forwarded_headers` mode.
@@ -93,11 +106,7 @@ impl KProxy {
         let mode = fwd_cfg.map(|c| &c.mode).unwrap_or(&ForwardedMode::Replace);
 
         if matches!(mode, ForwardedMode::Off) {
-            upstream_request.headers.remove("x-forwarded-for");
-            upstream_request.headers.remove("x-real-ip");
-            upstream_request.headers.remove("x-forwarded-proto");
-            upstream_request.headers.remove("x-forwarded-host");
-            upstream_request.headers.remove("forwarded");
+            strip_forwarded_headers(upstream_request);
             return Ok(());
         }
 
@@ -1515,4 +1524,25 @@ pub fn run_cluster(
     ));
 
     server.run_forever()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stripping_forwarded_headers_keeps_the_request_serializable() {
+        // Built like a parsed downstream HTTP/1 request: header case kept.
+        let mut req = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("X-Forwarded-For", "6.6.6.6").unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("Forwarded", "for=6.6.6.6").unwrap();
+        req.insert_header("Accept", "*/*").unwrap();
+        strip_forwarded_headers(&mut req);
+        let mut wire = Vec::new();
+        req.header_to_h1_wire(&mut wire);
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("Host: example.com\r\n") && wire.contains("Accept: */*\r\n"));
+        assert!(!wire.to_ascii_lowercase().contains("forwarded"));
+    }
 }
