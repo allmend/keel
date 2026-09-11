@@ -166,7 +166,13 @@ impl JwtVerifier {
                 let mut signer = openssl::sign::Signer::new(digest, &key).map_err(|_| Refusal::Signature)?;
                 signer.update(signed).map_err(|_| Refusal::Signature)?;
                 let expected = signer.sign_to_vec().map_err(|_| Refusal::Signature)?;
-                if openssl::memcmp::eq(&expected, signature) { Ok(()) } else { Err(Refusal::Signature) }
+                // memcmp::eq panics on unequal lengths, and the length is the
+                // client's to choose.
+                if expected.len() == signature.len() && openssl::memcmp::eq(&expected, signature) {
+                    Ok(())
+                } else {
+                    Err(Refusal::Signature)
+                }
             }
             (Key::Public(pkey), "RS") if pkey.rsa().is_ok() => {
                 let mut v = openssl::sign::Verifier::new(digest, pkey).map_err(|_| Refusal::Signature)?;
@@ -278,6 +284,16 @@ mod tests {
         assert_eq!(v.verify(&none, now).unwrap_err(), Refusal::Algorithm);
         let rs = token("RS256", r#"{"exp":1700000600}"#, &sign);
         assert_eq!(v.verify(&rs, now).unwrap_err(), Refusal::Algorithm);
+    }
+
+    #[test]
+    fn hs_signature_of_the_wrong_length_is_refused() {
+        let v = JwtVerifier::from_config(&cfg_secret("topsecret")).unwrap();
+        let claims = r#"{"iss":"https://issuer.test","aud":"api","exp":1700000600}"#;
+        for len in [0usize, 1, 31, 33, 64] {
+            let t = token("HS256", claims, move |_| vec![0u8; len]);
+            assert_eq!(v.verify(&t, 1_700_000_000).unwrap_err(), Refusal::Signature, "{len}-byte signature");
+        }
     }
 
     #[test]
