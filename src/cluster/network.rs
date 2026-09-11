@@ -93,7 +93,7 @@ impl ClusterNetwork {
             .map_err(|e| NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e)))?;
 
         if let Some(err) = resp.err {
-            return Err(NetworkError::new(&io::Error::new(io::ErrorKind::Other, err)));
+            return Err(NetworkError::new(&io::Error::other(err)));
         }
         resp.ok.ok_or_else(|| {
             NetworkError::new(&io::Error::new(io::ErrorKind::UnexpectedEof, "empty response"))

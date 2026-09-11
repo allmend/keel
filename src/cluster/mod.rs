@@ -653,44 +653,6 @@ impl ClusterService {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{join_key, join_open, join_seal};
-
-    #[test]
-    fn join_roundtrip_same_secret() {
-        let key = join_key("a-high-entropy-cluster-token");
-        let sealed = join_seal(&key, b"hello cluster").unwrap();
-        // Ciphertext must not contain the plaintext.
-        assert!(!sealed.windows(5).any(|w| w == b"hello"));
-        assert_eq!(join_open(&key, &sealed).unwrap(), b"hello cluster");
-    }
-
-    #[test]
-    fn join_wrong_secret_rejected() {
-        let sealed = join_seal(&join_key("correct-secret"), b"payload").unwrap();
-        assert!(join_open(&join_key("wrong-secret"), &sealed).is_none());
-    }
-
-    #[test]
-    fn join_tamper_rejected() {
-        let key = join_key("secret");
-        let mut sealed = join_seal(&key, b"payload").unwrap();
-        let last = sealed.len() - 1;
-        sealed[last] ^= 0xff; // flip a tag bit
-        assert!(join_open(&key, &sealed).is_none());
-    }
-
-    #[test]
-    fn join_nonces_differ_per_message() {
-        let key = join_key("secret");
-        let a = join_seal(&key, b"x").unwrap();
-        let b = join_seal(&key, b"x").unwrap();
-        // Random nonce ⇒ identical plaintext produces different frames.
-        assert_ne!(a, b);
-    }
-}
-
 // Public factory
 
 pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
@@ -972,4 +934,42 @@ async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
         }
     }
     up
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_key, join_open, join_seal};
+
+    #[test]
+    fn join_roundtrip_same_secret() {
+        let key = join_key("a-high-entropy-cluster-token");
+        let sealed = join_seal(&key, b"hello cluster").unwrap();
+        // Ciphertext must not contain the plaintext.
+        assert!(!sealed.windows(5).any(|w| w == b"hello"));
+        assert_eq!(join_open(&key, &sealed).unwrap(), b"hello cluster");
+    }
+
+    #[test]
+    fn join_wrong_secret_rejected() {
+        let sealed = join_seal(&join_key("correct-secret"), b"payload").unwrap();
+        assert!(join_open(&join_key("wrong-secret"), &sealed).is_none());
+    }
+
+    #[test]
+    fn join_tamper_rejected() {
+        let key = join_key("secret");
+        let mut sealed = join_seal(&key, b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff; // flip a tag bit
+        assert!(join_open(&key, &sealed).is_none());
+    }
+
+    #[test]
+    fn join_nonces_differ_per_message() {
+        let key = join_key("secret");
+        let a = join_seal(&key, b"x").unwrap();
+        let b = join_seal(&key, b"x").unwrap();
+        // Random nonce ⇒ identical plaintext produces different frames.
+        assert_ne!(a, b);
+    }
 }

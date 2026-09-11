@@ -175,7 +175,7 @@ impl ProxyHttp for KProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
-        let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
+        let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
 
         // ACME HTTP-01 responder (plain HTTP only — the challenge arrives on
         // port 80). Must come before redirects and default actions, and works
@@ -366,7 +366,7 @@ impl ProxyHttp for KProxy {
             .client_addr()
             .and_then(|a| a.as_inet())
             .map(|a| a.to_string());
-        let is_tls = session.digest().map_or(false, |d| d.ssl_digest.is_some());
+        let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
 
         // Resolve the raw Host header to a bounded, operator-configured label before
         // using it as a metric label or log filename. Unmatched hosts collapse into a
@@ -450,7 +450,7 @@ impl ProxyHttp for KProxy {
             // is left in place: backends may want it.
             if rules.jwt.is_some() {
                 if let Some(auth) = &rules.auth {
-                    for (_, header) in &auth.jwt.claim_headers {
+                    for header in auth.jwt.claim_headers.values() {
                         upstream_request.remove_header(header);
                     }
                 }
@@ -1010,9 +1010,11 @@ fn log_cache_mode(cfg: &CacheConfig) {
 fn new_server(cfg: &Config, inherited: Option<&WorkerSockets>) -> Server {
     use pingora::server::configuration::Opt;
 
-    let mut conf = pingora::server::configuration::ServerConf::default();
-    conf.grace_period_seconds = Some(cfg.keel.grace_period_seconds);
-    conf.graceful_shutdown_timeout_seconds = Some(5);
+    let mut conf = pingora::server::configuration::ServerConf {
+        grace_period_seconds: Some(cfg.keel.grace_period_seconds),
+        graceful_shutdown_timeout_seconds: Some(5),
+        ..Default::default()
+    };
 
     // Pingora has no API for "use this already-bound listener". Its one entry
     // point is the zero-downtime-upgrade channel: with `upgrade: true`,

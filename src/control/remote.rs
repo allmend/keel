@@ -200,9 +200,9 @@ fn client_cn(
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()?
         .data()
-        .as_utf8()
+        .to_string()
         .ok()?;
-    Some(cn.to_string())
+    Some(cn)
 }
 
 fn build_server_tls(

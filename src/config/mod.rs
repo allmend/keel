@@ -84,7 +84,7 @@ fn check_no_root_sections(path: &str, raw: &str) -> Result<()> {
     let forbidden = ["keel", "metrics", "access_log", "include", "cluster", "acme", "control"];
     if let Some(map) = value.as_mapping() {
         for key in &forbidden {
-            if map.contains_key(*key) {
+            if map.contains_key(key) {
                 anyhow::bail!(
                     "{path}: conf.d files may not contain '{key}' (root-level section only)"
                 );
@@ -434,12 +434,12 @@ impl Config {
         self.acme
             .as_ref()
             .and_then(|a| a.issuers.get(name))
-            .map_or(false, |i| i.challenge == AcmeChallenge::Dns01)
+            .is_some_and(|i| i.challenge == AcmeChallenge::Dns01)
     }
 
     fn validate_acme(&self) -> Result<()> {
         let issuer_defined = |name: &str| {
-            self.acme.as_ref().map_or(false, |a| a.issuers.contains_key(name))
+            self.acme.as_ref().is_some_and(|a| a.issuers.contains_key(name))
         };
 
         for (name, issuer) in self.acme.as_ref().map(|a| &a.issuers).into_iter().flatten() {
@@ -447,7 +447,7 @@ impl Config {
                 (AcmeChallenge::Dns01, None) => anyhow::bail!("acme.issuers.{name}: challenge dns-01 needs a dns provider"),
                 (AcmeChallenge::Http01, Some(_)) => anyhow::bail!("acme.issuers.{name}: dns provider needs challenge: dns-01"),
                 (AcmeChallenge::Dns01, Some(DnsProvider::Rfc2136 { server, zone, tsig_name, tsig_key, tsig_key_file, tsig_algorithm, propagation_wait, .. })) => {
-                    if server.rsplit_once(':').map_or(true, |(h, p)| h.is_empty() || p.parse::<u16>().is_err()) {
+                    if server.rsplit_once(':').is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err()) {
                         anyhow::bail!("acme.issuers.{name}: dns.server must be host:port");
                     }
                     if zone.is_empty() || tsig_name.is_empty() {
@@ -1244,7 +1244,7 @@ impl Vhost {
     /// to true (the challenge path bypasses the redirect in the proxy).
     pub fn redirect_http_effective(&self) -> bool {
         self.redirect_http
-            .unwrap_or_else(|| self.tls.as_ref().map_or(false, |t| t.acme.enabled()))
+            .unwrap_or_else(|| self.tls.as_ref().is_some_and(|t| t.acme.enabled()))
     }
 }
 

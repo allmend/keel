@@ -111,7 +111,7 @@ impl RoutingTable {
             }
 
             // Longest prefix first
-            routes.sort_by(|a, b| b.path_prefix.len().cmp(&a.path_prefix.len()));
+            routes.sort_by_key(|r| std::cmp::Reverse(r.path_prefix.len()));
 
             if let Some(fwd) = &vhost.forwarded_headers {
                 forwarded.insert(vhost.host.clone(), fwd.clone());

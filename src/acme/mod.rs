@@ -513,6 +513,10 @@ impl IssuerPool {
                 ready += 1;
                 challenge.set_ready().await.context("set challenge ready")?;
             }
+            // Required, not decorative: `authorizations` holds a mutable borrow of
+            // `order`, so it must end before `order.poll_ready` below. Clippy's
+            // drop_non_drop only sees that the type has no `Drop` impl.
+            #[allow(clippy::drop_non_drop)]
             drop(authorizations);
             info!(host, tokens = ready, challenge = ?issuer.challenge, "acme: challenges published");
 

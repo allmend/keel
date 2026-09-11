@@ -222,9 +222,9 @@ impl UdpProxyService {
                 self.close_flow(client, flow, None);
             }
         }
-        if !flows.contains_key(&client) {
+        if let std::collections::hash_map::Entry::Vacant(e) = flows.entry(client) {
             let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };
-            flows.insert(client, flow);
+            e.insert(flow);
         }
 
         let flow = flows.get(&client).expect("flow inserted above");

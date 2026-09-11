@@ -398,7 +398,7 @@ fn cmd_backend_list(pools: &PoolRegistry, pool_name: &str) -> String {
     let backends = pools.backends_for_pool(pool_name);
     ControlResponse::ok(serde_json::json!({
         "pool": pool_name,
-        "backends": backends.iter().map(|b| backend_json(b)).collect::<Vec<_>>(),
+        "backends": backends.iter().map(backend_json).collect::<Vec<_>>(),
     }))
 }
 
