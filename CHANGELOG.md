@@ -10,6 +10,41 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.13.3] — 2026-09-11
+
+### Fixed
+
+- **The HTTP cache stored responses the origin marked `private` or
+  `no-store`, together with their `Set-Cookie`.** With `ttl` set, the
+  fallback TTL replaced every "not cacheable" verdict rather than only "the
+  origin sent no freshness", so the first visitor's page and session cookie
+  were served from cache to every later visitor. Reachable where a
+  `host: "*"` vhost had a cache rule with `ttl`, as in `keel-dev.yaml`. The
+  fallback now applies only when the origin gives no freshness and does not
+  forbid storing, and never to requests carrying `Authorization` or
+  `Cookie`. Responses with `Set-Cookie` or `Vary: *` are never stored,
+  requests with `Authorization` follow RFC 9111 §3.5, and `Vary` is
+  honoured.
+- **Cache rules on named vhosts never took effect.** The rule was looked up
+  before the request's vhost was resolved, so only `host: "*"` rules
+  matched and named vhosts never sent `X-Cache`. Rules are now resolved
+  from the Host header. Deployments with cache rules on named vhosts start
+  caching after this upgrade; check those rules against the evaluation
+  order in [docs/caching.md](docs/caching.md).
+- **`forwarded_headers: off` let any client end its own request with a
+  panic** by sending `X-Forwarded-For` or another forwarding header. The
+  headers are now removed without desynchronising pingora's header case
+  map.
+- **A JWT with an HS* signature of the wrong length panicked the request**
+  instead of being refused with 401.
+- **PROXY protocol listeners waited indefinitely for the header.** A peer
+  now has 5 seconds to send it; HTTP and TCP listeners both apply the
+  limit.
+- The remote-control audit log truncated a client-certificate CN at the
+  first interior NUL byte.
+
+---
+
 ## [0.13.2] — 2026-09-10
 
 ### Fixed
@@ -552,7 +587,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.13.3...HEAD
+[0.13.3]: https://github.com/allmend/keel/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/allmend/keel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/allmend/keel/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/allmend/keel/compare/v0.12.0...v0.13.0
