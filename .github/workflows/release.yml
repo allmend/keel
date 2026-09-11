@@ -103,6 +103,10 @@ jobs:
           tool: cross
 
       - name: Build
+        # Cross.toml installs cmake and perl for Pingora's dependencies. keelctl
+        # has none of them, so it builds without the file.
+        env:
+          CROSS_CONFIG: /dev/null
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cross build --release --locked -p keelctl --target ${{ matrix.target }}

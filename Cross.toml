@@ -1,10 +1,13 @@
 # Configuration for `cross` (https://github.com/cross-rs/cross), used by the
-# release pipeline to build static binaries for targets we don't run CI on.
+# release pipeline to build the static keel binaries.
 #
 # The pre-build hooks install what Pingora's dependency tree needs inside the
 # cross build containers:
 #   - cmake, make: libz-ng-sys (zlib-ng), a Pingora transitive dependency
 #   - perl:        openssl-src, when building with --features vendored-openssl
+#
+# keelctl has none of these dependencies and builds without this file
+# (CROSS_CONFIG=/dev/null in release.yml).
 
 # DEBIAN_FRONTEND=noninteractive: tzdata (pulled in by cmake) otherwise stops
 # the build waiting for an interactive timezone prompt.
@@ -12,7 +15,4 @@
 pre-build = ["export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes --no-install-recommends cmake make perl"]
 
 [target.aarch64-unknown-linux-musl]
-pre-build = ["export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes --no-install-recommends cmake make perl"]
-
-[target.x86_64-unknown-freebsd]
 pre-build = ["export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes --no-install-recommends cmake make perl"]
