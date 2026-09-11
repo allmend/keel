@@ -12,6 +12,7 @@
 //! fallback would let any client claim any address.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use pingora::protocols::Stream;
 use tokio::io::AsyncReadExt;
@@ -130,11 +131,27 @@ fn parse_v2(buf: &[u8]) -> Result<Header, Error> {
     Ok(Header { consumed: total, addresses })
 }
 
-/// Read and consume the header at the start of a Pingora stream. Pingora's
-/// peek reads exactly the requested length, so the read is staged: six bytes
-/// to tell the versions apart, then the v1 line up to CRLF or the v2 body by
-/// its length field.
+/// How long a peer has to deliver the whole header after connecting. Without
+/// a bound, a peer that sends nothing holds the connection — and, through the
+/// v2 length field, up to 64 KiB — indefinitely.
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read and consume the header at the start of a Pingora stream, giving up
+/// after [`HEADER_TIMEOUT`].
 pub async fn read_from_stream(stream: &mut Stream) -> Result<Addresses, Error> {
+    read_within(stream, HEADER_TIMEOUT).await
+}
+
+async fn read_within(stream: &mut Stream, limit: Duration) -> Result<Addresses, Error> {
+    tokio::time::timeout(limit, read_header(stream))
+        .await
+        .unwrap_or(Err(Error::Invalid("timed out waiting for header")))
+}
+
+/// Pingora's peek reads exactly the requested length, so the read is staged:
+/// six bytes to tell the versions apart, then the v1 line up to CRLF or the v2
+/// body by its length field.
+async fn read_header(stream: &mut Stream) -> Result<Addresses, Error> {
     let mut prefix = [0u8; 6];
     stream.try_peek(&mut prefix).await.map_err(|_| Error::Invalid("connection closed before header"))?;
     if &prefix == b"PROXY " {
@@ -220,5 +237,30 @@ mod tests {
         assert_eq!(parse(&bad), Err(Error::Invalid("v2 version")));
         assert_eq!(parse(&v2(5, 1, &body)), Err(Error::Invalid("v2 command")));
         assert_eq!(parse(&V2_SIGNATURE[..5]), Err(Error::Incomplete));
+    }
+
+    async fn accepted_pair() -> (tokio::net::TcpStream, Stream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, Box::new(pingora::protocols::l4::stream::Stream::from(server)))
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_sends_nothing_times_out() {
+        let (_client, mut stream) = accepted_pair().await;
+        let started = std::time::Instant::now();
+        let r = read_within(&mut stream, Duration::from_millis(100)).await;
+        assert_eq!(r, Err(Error::Invalid("timed out waiting for header")));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_header_within_the_limit_is_read() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut stream) = accepted_pair().await;
+        client.write_all(b"PROXY TCP4 203.0.113.9 10.0.0.1 5555 80\r\n").await.unwrap();
+        let r = read_within(&mut stream, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(r.unwrap().0, "203.0.113.9:5555".parse().unwrap());
     }
 }
