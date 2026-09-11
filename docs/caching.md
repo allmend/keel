@@ -81,7 +81,7 @@ vhosts:
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Must be `true` to cache any response for this vhost |
-| `ttl` | integer | none | Fallback TTL in seconds when origin sends no `Cache-Control` |
+| `ttl` | integer | none | Fallback TTL in seconds when the origin gives no freshness; see [How responses are evaluated](#how-responses-are-evaluated) |
 | `statuses` | list of integers | `[200]` | HTTP status codes to cache |
 | `content_types` | list of strings | *(all)* | Content-type patterns to cache; empty means no restriction |
 
@@ -131,10 +131,16 @@ When a cacheable request arrives (GET or HEAD, cache enabled for the matching ro
 
 1. **Status filter** — the response status must be in `statuses`. If `statuses` is empty, only `200` is cached.
 2. **Content-type filter** — if `content_types` is non-empty, the response `Content-Type` header must match at least one pattern.
-3. **Cache-Control** — if the origin sends a valid `Cache-Control` max-age, it is respected. `no-store` and `private` are always honoured — Keel will not cache them regardless of the rule config.
-4. **TTL fallback** — if the origin sends no usable `Cache-Control` and `ttl` is set, the response is cached for `ttl` seconds.
+3. **Set-Cookie** — a response that sets a cookie is never stored.
+4. **`Vary: *`** — never stored. Other `Vary` values are honoured; see [Vary](#vary).
+5. **Origin freshness** — `Cache-Control` `max-age` / `s-maxage`, then `Expires`, decide how long the response is fresh. `private` and `no-store` are never stored. A response to a request that carried `Authorization` is stored only when the origin allows it with `public`, `s-maxage`, or `must-revalidate` (RFC 9111 §3.5).
+6. **TTL fallback** — when the origin gives no freshness (no `max-age`, `s-maxage`, or `Expires`) and does not forbid storing, the response is stored for `ttl` seconds. The fallback does not apply to requests that carried `Authorization` or `Cookie`: a response that may be personalised is stored only when the origin says it may be.
 
-All conditions must pass. A response that matches the status and content-type filters but carries `Cache-Control: no-store` is not cached.
+All conditions must pass. A response that matches the status and content-type filters but carries `Cache-Control: no-store` is not cached, whatever `ttl` is set to.
+
+### Vary
+
+A response with `Vary` is stored once per combination of values of the request headers it names. A request is answered from cache only by the entry whose values match its own. `Vary: Accept-Encoding`, for example, keeps compressed and uncompressed copies apart.
 
 ### Content-type pattern matching
 

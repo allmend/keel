@@ -2,7 +2,7 @@ use crate::{
     access_log::{AccessLogEntry, AccessLogger},
     backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
     cache::CacheHandle,
-    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm},
+    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, VhostCacheConfig},
     control::ControlServer,
     health,
     metrics::MetricsService,
@@ -16,9 +16,10 @@ use chrono::Utc;
 use ipnet::IpNet;
 use pingora::{
     cache::{
-        cache_control::CacheControl,
+        cache_control::{CacheControl, Cacheable as CcCacheable, InterpretCacheControl},
         filters::{request_cacheable, resp_cacheable},
-        CacheKey, CacheMetaDefaults,
+        key::HashBinary,
+        CacheKey, CacheMeta, CacheMetaDefaults, RespCacheable, VarianceBuilder,
     },
     lb::selection::{BackendIter, BackendSelection},
     proxy::{http_proxy_service, ProxyHttp, Session},
@@ -86,6 +87,86 @@ fn strip_forwarded_headers(req: &mut pingora::http::RequestHeader) {
     for name in FORWARDED_HEADERS {
         req.remove_header(name);
     }
+}
+
+/// Whether a response may be stored under `rule`, and until when. Kept out of
+/// the pingora hook so the decision can be tested on its own.
+fn response_cacheability(
+    rule: &VhostCacheConfig,
+    req: &pingora::http::RequestHeader,
+    resp: &pingora::http::ResponseHeader,
+    now: std::time::SystemTime,
+) -> RespCacheable {
+    use pingora::cache::{NoCacheReason, RespCacheable::{Cacheable, Uncacheable}};
+    use std::time::Duration;
+
+    // Status filter (default: 200 only)
+    let status = resp.status.as_u16();
+    let allowed = if rule.statuses.is_empty() { &[200u16] as &[u16] } else { &rule.statuses };
+    if !allowed.contains(&status) {
+        return Uncacheable(NoCacheReason::Custom("status filtered"));
+    }
+
+    // Content-type filter (empty = no restriction)
+    if !rule.content_types.is_empty() {
+        let ct = resp.headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Strip parameters ("text/html; charset=utf-8" → "text/html")
+        let ct_base = ct.split(';').next().unwrap_or(ct).trim();
+        let matched = rule.content_types.iter().any(|pattern| {
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                ct_base.starts_with(prefix)
+            } else {
+                ct_base.eq_ignore_ascii_case(pattern)
+            }
+        });
+        if !matched {
+            return Uncacheable(NoCacheReason::Custom("content-type filtered"));
+        }
+    }
+
+    // A stored Set-Cookie would hand one client's cookie to every later one.
+    if resp.headers.contains_key("set-cookie") {
+        return Uncacheable(NoCacheReason::Custom("set-cookie"));
+    }
+    if vary_names(resp).iter().any(|n| n == "*") {
+        return Uncacheable(NoCacheReason::Custom("vary *"));
+    }
+
+    // Origin freshness: Cache-Control, then Expires; RFC 9111 §3.5 for
+    // requests that carried Authorization.
+    static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
+    let authorization = req.headers.contains_key("authorization");
+    let cc = CacheControl::from_headers_named("cache-control", &resp.headers);
+    let verdict = resp_cacheable(cc.as_ref(), resp.clone(), authorization, &DEFAULTS);
+    if matches!(verdict, Cacheable(_)) {
+        return verdict;
+    }
+
+    // TTL fallback: only when the origin said nothing about freshness and did
+    // not forbid storing, and only for requests that cannot have produced a
+    // personalised response.
+    let Some(ttl) = rule.ttl else { return verdict };
+    let forbidden = cc.as_ref().is_some_and(|c| c.is_cacheable() == CcCacheable::No);
+    let personal = authorization || req.headers.contains_key("cookie");
+    if forbidden || personal || resp.headers.contains_key("expires") {
+        return verdict;
+    }
+    Cacheable(CacheMeta::new(now + Duration::from_secs(ttl as u64), now, 0, 0, resp.clone()))
+}
+
+/// Lowercased header names listed in a response's `Vary` headers.
+fn vary_names(resp: &pingora::http::ResponseHeader) -> Vec<String> {
+    resp.headers
+        .get_all("vary")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
 impl KProxy {
@@ -503,7 +584,7 @@ impl ProxyHttp for KProxy {
     fn request_cache_filter(
         &self,
         session: &mut Session,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         let Some(ref cache) = self.cache else { return Ok(()); };
 
@@ -511,9 +592,14 @@ impl ProxyHttp for KProxy {
             return Ok(());
         }
 
-        let path = session.req_header().uri.path();
-        let routing = self.routing.load();
-        if routing.cache_config(&ctx.vhost, path).is_none() {
+        // Resolved from the Host header, like `request_filter` does: `ctx.vhost`
+        // is set in `upstream_peer`, which pingora calls after this hook.
+        let configured = {
+            let req = session.req_header();
+            let host = req.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("*");
+            self.routing.load().cache_config(host, req.uri.path()).is_some()
+        };
+        if !configured {
             return Ok(());
         }
 
@@ -545,66 +631,33 @@ impl ProxyHttp for KProxy {
         session: &Session,
         resp: &pingora::http::ResponseHeader,
         ctx: &mut Self::CTX,
-    ) -> pingora::Result<pingora::cache::RespCacheable> {
-        use pingora::cache::{
-            CacheMeta, NoCacheReason, RespCacheable::{Cacheable, Uncacheable},
-        };
-        use std::time::{Duration, SystemTime};
+    ) -> pingora::Result<RespCacheable> {
+        use pingora::cache::{NoCacheReason, RespCacheable::Uncacheable};
 
         let host = ctx.vhost.split(':').next().unwrap_or(&ctx.vhost);
         let path = session.req_header().uri.path();
         let routing = self.routing.load();
-
         let Some(rule) = routing.cache_config(host, path) else {
             return Ok(Uncacheable(NoCacheReason::Custom("not configured")));
         };
+        Ok(response_cacheability(rule, session.req_header(), resp, std::time::SystemTime::now()))
+    }
 
-        // Status filter (default: 200 only)
-        let status = resp.status.as_u16();
-        let allowed = if rule.statuses.is_empty() { &[200u16] as &[u16] } else { &rule.statuses };
-        if !allowed.contains(&status) {
-            return Ok(Uncacheable(NoCacheReason::Custom("status filtered")));
+    /// Store one entry per combination of the request headers the response's
+    /// `Vary` names. Pingora's default ignores `Vary`.
+    fn cache_vary_filter(
+        &self,
+        meta: &CacheMeta,
+        _ctx: &mut Self::CTX,
+        req: &pingora::http::RequestHeader,
+    ) -> Option<HashBinary> {
+        let names = vary_names(meta.response_header());
+        let mut variance = VarianceBuilder::new();
+        for name in &names {
+            let value = req.headers.get(name.as_str()).map(|v| v.as_bytes().to_vec()).unwrap_or_default();
+            variance.add_owned_value(name, value);
         }
-
-        // Content-type filter (empty = no restriction)
-        if !rule.content_types.is_empty() {
-            let ct = resp.headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            // Strip parameters ("text/html; charset=utf-8" → "text/html")
-            let ct_base = ct.split(';').next().unwrap_or(ct).trim();
-            let matched = rule.content_types.iter().any(|pattern| {
-                if let Some(prefix) = pattern.strip_suffix('*') {
-                    ct_base.starts_with(prefix)
-                } else {
-                    ct_base.eq_ignore_ascii_case(pattern)
-                }
-            });
-            if !matched {
-                return Ok(Uncacheable(NoCacheReason::Custom("content-type filtered")));
-            }
-        }
-
-        // Cache-Control from origin
-        static DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
-        let cc = CacheControl::from_headers_named("cache-control", &resp.headers);
-        let result = resp_cacheable(cc.as_ref(), resp.clone(), false, &DEFAULTS);
-
-        // TTL override: apply fallback when origin sends no Cache-Control
-        if matches!(result, Uncacheable(_)) {
-            if let Some(ttl) = rule.ttl {
-                let now = SystemTime::now();
-                let meta = CacheMeta::new(
-                    now + Duration::from_secs(ttl as u64),
-                    now, 0, 0,
-                    resp.clone(),
-                );
-                return Ok(Cacheable(meta));
-            }
-        }
-
-        Ok(result)
+        variance.finalize()
     }
 
     async fn response_filter(
@@ -1544,5 +1597,74 @@ mod tests {
         let wire = String::from_utf8(wire).unwrap();
         assert!(wire.contains("Host: example.com\r\n") && wire.contains("Accept: */*\r\n"));
         assert!(!wire.to_ascii_lowercase().contains("forwarded"));
+    }
+
+    fn rule(ttl: Option<u32>) -> VhostCacheConfig {
+        VhostCacheConfig { enabled: true, ttl, statuses: vec![], content_types: vec![] }
+    }
+
+    fn req(headers: &[(&str, &str)]) -> pingora::http::RequestHeader {
+        let mut r = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
+        for (k, v) in headers {
+            r.insert_header(k.to_string(), *v).unwrap();
+        }
+        r
+    }
+
+    fn resp(headers: &[(&str, &str)]) -> pingora::http::ResponseHeader {
+        let mut r = pingora::http::ResponseHeader::build(200, None).unwrap();
+        for (k, v) in headers {
+            r.append_header(k.to_string(), *v).unwrap();
+        }
+        r
+    }
+
+    fn stored(rule: &VhostCacheConfig, req: &pingora::http::RequestHeader, resp: &pingora::http::ResponseHeader) -> bool {
+        matches!(response_cacheability(rule, req, resp, std::time::SystemTime::now()), RespCacheable::Cacheable(_))
+    }
+
+    #[test]
+    fn ttl_fallback_never_overrides_the_origin() {
+        let r = rule(Some(60));
+        let anon = req(&[]);
+        assert!(stored(&r, &anon, &resp(&[])), "no freshness information: the fallback applies");
+        assert!(!stored(&rule(None), &anon, &resp(&[])), "no ttl and no freshness: not stored");
+        assert!(!stored(&r, &anon, &resp(&[("cache-control", "private")])));
+        assert!(!stored(&r, &anon, &resp(&[("cache-control", "no-store")])));
+        assert!(!stored(&r, &anon, &resp(&[("set-cookie", "session=a")])));
+        assert!(!stored(&r, &anon, &resp(&[("cache-control", "public, max-age=60"), ("set-cookie", "session=a")])));
+        assert!(!stored(&r, &anon, &resp(&[("vary", "Accept, *")])));
+        assert!(stored(&r, &anon, &resp(&[("cache-control", "public, max-age=60")])));
+        assert!(stored(&rule(None), &anon, &resp(&[("cache-control", "max-age=60")])), "origin freshness needs no ttl");
+    }
+
+    #[test]
+    fn personalised_requests_need_the_origins_permission() {
+        let r = rule(Some(60));
+        let cookie = req(&[("cookie", "user=alice")]);
+        let auth = req(&[("authorization", "Bearer x")]);
+        assert!(!stored(&r, &cookie, &resp(&[])), "fallback skips requests with Cookie");
+        assert!(!stored(&r, &auth, &resp(&[])), "fallback skips requests with Authorization");
+        assert!(!stored(&r, &auth, &resp(&[("cache-control", "max-age=60")])), "RFC 9111 3.5");
+        assert!(stored(&r, &auth, &resp(&[("cache-control", "public, max-age=60")])));
+        assert!(stored(&r, &cookie, &resp(&[("cache-control", "max-age=60")])));
+    }
+
+    #[test]
+    fn status_and_content_type_filters_apply_first() {
+        let mut r = rule(Some(60));
+        r.content_types = vec!["text/*".into()];
+        let anon = req(&[]);
+        assert!(stored(&r, &anon, &resp(&[("content-type", "text/html; charset=utf-8")])));
+        assert!(!stored(&r, &anon, &resp(&[("content-type", "image/png")])));
+        let mut not_found = pingora::http::ResponseHeader::build(404, None).unwrap();
+        not_found.insert_header("cache-control", "public, max-age=60").unwrap();
+        assert!(!stored(&rule(Some(60)), &anon, &not_found), "only 200 by default");
+    }
+
+    #[test]
+    fn vary_names_are_split_and_lowercased() {
+        let r = resp(&[("vary", "Accept-Encoding, Accept-Language"), ("vary", "X-Tenant")]);
+        assert_eq!(vary_names(&r), ["accept-encoding", "accept-language", "x-tenant"]);
     }
 }
