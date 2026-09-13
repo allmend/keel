@@ -70,6 +70,21 @@ pub struct KProxy {
     acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
+/// One RFC 7239 parameter value: a bare token where that is legal, else a
+/// quoted-string. IPv6 nodes must be quoted because of the brackets and
+/// colons, and `host` is whatever the client sent — unquoted, a Host of
+/// `x;for=1.2.3.4` would add parameters to a header the backend trusts.
+fn forwarded_value(v: &str) -> String {
+    const TOKEN_EXTRA: &[u8] = b"!#$%&'*+-.^_`|~";
+    let is_token = !v.is_empty()
+        && v.bytes().all(|b| b.is_ascii_alphanumeric() || TOKEN_EXTRA.contains(&b));
+    if is_token {
+        v.to_owned()
+    } else {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 /// Headers `forwarded_headers: off` removes from the upstream request.
 const FORWARDED_HEADERS: [&str; 5] =
     ["x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host", "forwarded"];
@@ -219,9 +234,18 @@ impl KProxy {
         upstream_request.insert_header("x-real-ip", real_ip.to_string().as_str())?;
         upstream_request.insert_header("x-forwarded-proto", proto)?;
         upstream_request.insert_header("x-forwarded-host", host.as_str())?;
+        let node = match real_ip {
+            IpAddr::V6(_) => format!("[{real_ip}]"),
+            IpAddr::V4(_) => real_ip.to_string(),
+        };
         upstream_request.insert_header(
             "forwarded",
-            format!("for={real_ip};proto={proto};host={host}").as_str(),
+            format!(
+                "for={};proto={proto};host={}",
+                forwarded_value(&node),
+                forwarded_value(host)
+            )
+            .as_str(),
         )?;
 
         Ok(())
@@ -523,10 +547,14 @@ impl ProxyHttp for KProxy {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        // 0.9 hashes `primary` alone, so the two components are length-framed
-        // rather than concatenated: without it "ex.com" + "/a/b" and "ex.com/a"
-        // + "/b" would collide.
-        let mut primary = Vec::with_capacity(4 + host.len() + path.len());
+        // The scheme is part of the identity: a backend that answers by
+        // X-Forwarded-Proto (a redirect to https, say) must not have its http
+        // answer served to https clients. 0.9 hashes `primary` alone, so the
+        // components are framed rather than concatenated — otherwise
+        // "ex.com" + "/a/b" would collide with "ex.com/a" + "/b".
+        let scheme = if session.digest().is_some_and(|d| d.ssl_digest.is_some()) { b's' } else { b'h' };
+        let mut primary = Vec::with_capacity(5 + host.len() + path.len());
+        primary.push(scheme);
         primary.extend_from_slice(&(host.len() as u32).to_be_bytes());
         primary.extend_from_slice(host.as_bytes());
         primary.extend_from_slice(path.as_bytes());
