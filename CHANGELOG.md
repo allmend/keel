@@ -25,6 +25,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Proxy listeners terminate TLS with rustls.** Pingora 0.9's rustls backend
+  takes a certificate resolver, so per-handshake SNI selection and hot-swap
+  now work there; that hook was missing in 0.8, which is the only reason these
+  listeners used OpenSSL. OpenSSL is no longer in the TLS data path — Keel
+  still uses it for X509 parsing (ACME certificate dates, the `tls` health
+  probe, control-plane client CNs), so builds still need it. The certificate
+  store keeps one rustls view instead of two: a key rustls cannot use is now
+  rejected at load rather than silently served to proxy listeners only. TLS
+  1.2 stays the floor and no ALPN is offered, both as before.
 - **Pingora 0.8.1 → 0.9.0.** Keel's cache storage backends follow the new
   `Storage` API: `purge` takes a `PurgeTarget` and reports a `PurgeOutcome`
   instead of a bool, and the eviction manager tracks `CacheEntryKey` rather

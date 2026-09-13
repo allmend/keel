@@ -17,7 +17,7 @@ path = "src/main.rs"
 # Control protocol shared with keelctl
 keel-control = { path = "crates/keel-control" }
 # Proxy framework
-pingora = { version = "0.9", features = ["lb", "openssl", "cache"] }
+pingora = { version = "0.9", features = ["lb", "rustls", "cache"] }
 async-trait = "0.1"
 
 # CLI
@@ -73,8 +73,9 @@ rustls-native-certs = "0.8"
 # AEAD + digest for encrypting the cluster join exchange (already in tree via rustls)
 ring = "0.17"
 
-# Already in tree via pingora's openssl feature; declared here so release builds
-# can force the vendored (compiled-from-source, statically linked) OpenSSL.
+# X509 parsing outside the data plane: certificate dates in ACME and the tls
+# health probe, and the client-cert CN in remote control. Pingora terminates
+# TLS with rustls, so this is the only thing still pulling OpenSSL in.
 openssl = "0.10"
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 

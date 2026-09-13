@@ -912,25 +912,38 @@ fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegist
     }
 }
 
-// Build TLS listener settings with our SNI cert resolver and a TLS 1.2 floor.
-// TLS 1.0/1.1 are obsolete and must never be negotiable.
+// Build TLS listener settings that resolve the certificate from the live store
+// on every handshake, so SNI selection and hot-swap work without rebuilding the
+// listener. The rustls backend negotiates TLS 1.2/1.3 only, so the floor that
+// used to be set explicitly is inherent.
 fn build_tls_settings(
     cert_store: &Arc<CertStore>,
     address: &str,
 ) -> pingora::listeners::tls::TlsSettings {
+    // `with_callbacks` is the only constructor that does not demand certificate
+    // files; the callback itself has nothing to do, since the resolver below
+    // chooses the certificate during the handshake.
     let mut settings =
-        pingora::listeners::tls::TlsSettings::with_callbacks(cert_store.make_callbacks())
+        pingora::listeners::tls::TlsSettings::with_callbacks(Box::new(NoTlsCallback))
             .unwrap_or_else(|e| {
                 error!(address, error = %e, "failed to create TLS settings");
                 std::process::exit(1);
             });
-    if let Err(e) =
-        settings.set_min_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
-    {
-        error!(address, error = %e, "failed to set minimum TLS version");
-        std::process::exit(1);
-    }
+    settings.set_cert_resolver(cert_store.rustls_resolver());
+    // No ALPN, matching what these listeners offered on the OpenSSL backend.
+    // Advertising h2 here would route every HTTP/2 request to the wildcard
+    // vhost: h2 carries the name in `:authority`, and vhost resolution reads
+    // the `Host` header. Offer h2 only once that reads the authority too.
     settings
+}
+
+/// Required by `TlsSettings::with_callbacks`, which is the file-free way to
+/// build settings; certificate selection happens in the resolver instead.
+struct NoTlsCallback;
+
+#[async_trait]
+impl pingora::listeners::TlsAccept for NoTlsCallback {
+    async fn certificate_callback(&self, _ssl: &mut pingora::protocols::tls::TlsRef) {}
 }
 
 fn log_cache_mode(cfg: &CacheConfig) {

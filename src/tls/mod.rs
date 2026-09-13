@@ -1,53 +1,31 @@
 //! Certificate store shared by every TLS listener.
 //!
-//! Each vhost certificate is parsed twice at load time: into OpenSSL objects
-//! for the Pingora proxy listeners (whose per-handshake SNI callback is what
-//! makes hot-swap possible there), and into a rustls `CertifiedKey` for
-//! rustls-based listeners — the TCP `terminate` mode and HTTP/3, both of
-//! which run outside Pingora's OpenSSL data plane. Both views read the same
-//! atomically swapped map, so a SIGHUP reload or an ACME issuance replaces
-//! the certificate for every listener kind at once.
+//! Each vhost certificate is parsed at load time into a rustls `CertifiedKey`,
+//! which every listener kind resolves from: the Pingora proxy listeners, the
+//! TCP `terminate` mode, and HTTP/3. The map is swapped atomically, so a
+//! SIGHUP reload or an ACME issuance replaces the certificate for all of them
+//! at once. Before pingora 0.9 the proxy listeners needed an OpenSSL pair of
+//! their own, because rustls had no per-handshake certificate callback there.
 
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
-use pingora::listeners::{TlsAccept, TlsAcceptCallbacks};
-use pingora::protocols::tls::TlsRef;
-use pingora::tls::{
-    ext::{ssl_use_certificate, ssl_use_private_key},
-    pkey::{PKey, Private},
-    ssl::NameType,
-    x509::X509,
-};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // Cert store
 
 struct CertPair {
-    cert: X509,
-    key: PKey<Private>,
-    /// `None` when rustls cannot use the key (OpenSSL accepts more key
-    /// types); such a host is served by Pingora listeners only.
-    rustls: Option<Arc<CertifiedKey>>,
+    rustls: Arc<CertifiedKey>,
 }
 
 impl CertPair {
     fn from_pem(cert_pem: &[u8], key_pem: &[u8], label: &str) -> anyhow::Result<Self> {
-        let cert = X509::from_pem(cert_pem).map_err(|e| anyhow::anyhow!("invalid cert '{label}': {e}"))?;
-        let key = PKey::private_key_from_pem(key_pem)
-            .map_err(|e| anyhow::anyhow!("invalid key '{label}': {e}"))?;
-        let rustls = match certified_key(cert_pem, key_pem) {
-            Ok(k) => Some(Arc::new(k)),
-            Err(e) => {
-                warn!(cert = label, error = %e, "TLS: certificate unusable by rustls listeners");
-                None
-            }
-        };
-        Ok(CertPair { cert, key, rustls })
+        let key = certified_key(cert_pem, key_pem)
+            .map_err(|e| anyhow::anyhow!("certificate '{label}' unusable: {e}"))?;
+        Ok(CertPair { rustls: Arc::new(key) })
     }
 }
 
@@ -90,11 +68,6 @@ impl CertStore {
         let mut map = HashMap::new();
         map.insert(host.to_owned(), CertPair::from_pem(cert_pem.as_bytes(), key_pem.as_bytes(), host).unwrap());
         CertStore::from_map(map)
-    }
-
-    /// Build a boxed `TlsAcceptCallbacks` that reads from this store on every handshake.
-    pub fn make_callbacks(&self) -> TlsAcceptCallbacks {
-        Box::new(SniCertResolver { certs: Arc::clone(&self.inner) })
     }
 
     /// The rustls view: a `ResolvesServerCert` that reads this store on every
@@ -311,35 +284,6 @@ fn lookup<'a>(map: &'a CertMap, sni: Option<&str>) -> Option<&'a CertPair> {
         .or_else(|| map.get("*"))
 }
 
-// SNI cert resolver (OpenSSL, Pingora listeners)
-
-/// Selects a certificate per TLS handshake based on the SNI hostname.
-/// Falls back to the `"*"` entry if no exact match is found.
-struct SniCertResolver {
-    certs: Arc<ArcSwap<CertMap>>,
-}
-
-#[async_trait]
-impl TlsAccept for SniCertResolver {
-    async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
-        let sni = ssl.servername(NameType::HOST_NAME).map(str::to_owned);
-        let store = self.certs.load();
-
-        match lookup(&store, sni.as_deref()) {
-            Some(pair) => {
-                if let Err(e) = ssl_use_certificate(ssl, &pair.cert) {
-                    error!(sni, error = %e, "TLS: failed to set certificate");
-                    return;
-                }
-                if let Err(e) = ssl_use_private_key(ssl, &pair.key) {
-                    error!(sni, error = %e, "TLS: failed to set private key");
-                }
-            }
-            None => warn!(sni, "TLS: no certificate found for SNI hostname"),
-        }
-    }
-}
-
 // SNI cert resolver (rustls)
 
 /// The same selection for rustls: exact SNI, then `"*"`. Reads the live map
@@ -359,15 +303,11 @@ impl std::fmt::Debug for RustlsCertResolver {
 }
 
 impl RustlsCertResolver {
-    /// Resolve by name; `None` when no certificate (or none rustls can use)
-    /// matches, which makes rustls abort the handshake.
+    /// Resolve by name; `None` when no certificate matches, which makes rustls
+    /// abort the handshake.
     pub fn resolve_name(&self, sni: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let store = self.certs.load();
-        let pair = lookup(&store, sni)?;
-        if pair.rustls.is_none() {
-            warn!(sni, "TLS: certificate for SNI hostname is unusable by rustls");
-        }
-        pair.rustls.clone()
+        Some(lookup(&store, sni)?.rustls.clone())
     }
 }
 
@@ -410,19 +350,19 @@ mod tests {
         for h in hosts {
             let (c, k) = pem_pair(if *h == "*" { "fallback.example" } else { h });
             let pair = CertPair::from_pem(&c, &k, h).unwrap();
-            leaves.insert(h.to_string(), pair.rustls.as_ref().unwrap().cert[0].to_vec());
+            leaves.insert(h.to_string(), pair.rustls.cert[0].to_vec());
             map.insert(h.to_string(), pair);
         }
         (CertStore::from_map(map), leaves)
     }
 
     #[test]
-    fn rustls_view_is_built_from_the_same_pem() {
+    fn the_served_leaf_is_the_certificate_from_the_pem() {
         let (c, k) = pem_pair("api.example.com");
         let pair = CertPair::from_pem(&c, &k, "test").unwrap();
-        let ck = pair.rustls.expect("rustls key");
-        assert_eq!(ck.cert.len(), 1);
-        assert_eq!(ck.cert[0].as_ref(), pair.cert.to_der().unwrap().as_slice());
+        assert_eq!(pair.rustls.cert.len(), 1);
+        let from_pem = rustls_pemfile::certs(&mut &c[..]).next().unwrap().unwrap();
+        assert_eq!(pair.rustls.cert[0].as_ref(), from_pem.as_ref());
     }
 
     #[test]
@@ -458,7 +398,7 @@ mod tests {
 
         let (c, k) = pem_pair("api.example.com");
         let renewed = CertPair::from_pem(&c, &k, "renewed").unwrap();
-        let renewed_leaf = renewed.rustls.as_ref().unwrap().cert[0].to_vec();
+        let renewed_leaf = renewed.rustls.cert[0].to_vec();
         let mut map = HashMap::new();
         map.insert("api.example.com".to_owned(), renewed);
         store.inner.store(Arc::new(map));
@@ -476,7 +416,7 @@ mod tests {
         // OpenSSL parses cert and key independently; rustls builds a key too.
         // Mismatch is caught at handshake time, not here — both views exist.
         let pair = CertPair::from_pem(&c, &other_key, "x").unwrap();
-        assert!(pair.rustls.is_some());
+        assert_eq!(pair.rustls.cert.len(), 1);
     }
 
     /// End to end: a rustls server on the store's config serves the SNI
@@ -517,7 +457,7 @@ mod tests {
         // Swap the exact entry; the running acceptor serves the new one.
         let (c, k) = pem_pair("api.example.com");
         let renewed = CertPair::from_pem(&c, &k, "renewed").unwrap();
-        let renewed_leaf = renewed.rustls.as_ref().unwrap().cert[0].to_vec();
+        let renewed_leaf = renewed.rustls.cert[0].to_vec();
         let mut map = HashMap::new();
         map.insert("api.example.com".to_owned(), renewed);
         store.inner.store(Arc::new(map));
