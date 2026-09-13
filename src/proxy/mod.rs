@@ -1374,6 +1374,7 @@ fn add_udp_services(
             pools: Arc::clone(pools),
             access_logger: Arc::clone(access_logger),
             flow_timeout: std::time::Duration::from_secs(cfg.keel.udp_flow_timeout_seconds),
+            max_flows: cfg.keel.udp_max_flows,
             socket,
             proxy_protocol: l.proxy_protocol,
         };

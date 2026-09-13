@@ -52,6 +52,9 @@ pub struct UdpProxyService {
     pub pools: Arc<PoolRegistry>,
     pub access_logger: Arc<AccessLogger>,
     pub flow_timeout: Duration,
+    /// Most flows this worker holds at once; further clients are dropped
+    /// until one expires.
+    pub max_flows: usize,
     /// Socket bound by the root master before the privilege drop. `None`
     /// (unprivileged dev runs) means the service binds its own.
     pub socket: Option<std::net::UdpSocket>,
@@ -221,6 +224,13 @@ impl UdpProxyService {
             if let Some(flow) = flows.remove(&client) {
                 self.close_flow(client, flow, None);
             }
+        }
+        if !flows.contains_key(&client) && flows.len() >= self.max_flows {
+            // Opening one costs a socket and a task, and the worker's HTTP and
+            // TCP listeners share its descriptors. Existing flows keep working.
+            debug!(pool = self.pool, listener = self.listener, client = %client, flows = flows.len(), "udp: flow limit reached, datagram dropped");
+            crate::metrics::record_udp_error(&self.pool, "flow_limit");
+            return;
         }
         if let std::collections::hash_map::Entry::Vacant(e) = flows.entry(client) {
             let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };

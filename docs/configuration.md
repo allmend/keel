@@ -43,10 +43,11 @@ keel:
 | `control_socket` | string | `/var/run/keel/keel.sock` |
 | `grace_period_seconds` | integer | `10` |
 | `udp_flow_timeout_seconds` | integer | `30` |
+| `udp_max_flows` | integer | `8192` |
 
 On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
-`udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. See [UDP proxying](udp-proxying.md).
+`udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. `udp_max_flows` caps how many flows one worker holds at once — each costs an upstream socket and a task, and the worker's HTTP and TCP listeners share its descriptors. Both must be at least 1. See [UDP proxying](udp-proxying.md).
 
 Changing `workers` or `udp_flow_timeout_seconds` requires a process restart. All other settings can be changed via hot reload.
 

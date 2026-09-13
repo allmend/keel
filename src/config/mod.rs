@@ -262,6 +262,9 @@ impl Config {
         if self.keel.udp_flow_timeout_seconds == 0 {
             anyhow::bail!("keel.udp_flow_timeout_seconds must be at least 1");
         }
+        if self.keel.udp_max_flows == 0 {
+            anyhow::bail!("keel.udp_max_flows must be at least 1");
+        }
         for l in &self.listeners {
             if let Some(pool) = &l.tcp_pool {
                 if !self.pools.contains_key(pool) {
@@ -550,6 +553,13 @@ pub struct KeelConfig {
     /// stay idle before it expires and releases its backend. Must be >= 1.
     #[serde(default = "default_udp_flow_timeout")]
     pub udp_flow_timeout_seconds: u64,
+
+    /// Most UDP flows one worker will hold open at once. A flow costs an
+    /// upstream socket and a task, so an unbounded table lets a datagram
+    /// flood from spoofed sources exhaust the worker's descriptors — which
+    /// its HTTP and TCP listeners share.
+    #[serde(default = "default_udp_max_flows")]
+    pub udp_max_flows: usize,
 }
 
 impl Default for KeelConfig {
@@ -561,12 +571,14 @@ impl Default for KeelConfig {
             control_socket: default_control_socket(),
             grace_period_seconds: default_grace_period(),
             udp_flow_timeout_seconds: default_udp_flow_timeout(),
+            udp_max_flows: default_udp_max_flows(),
         }
     }
 }
 
 fn default_grace_period() -> u64 { 10 }
 fn default_udp_flow_timeout() -> u64 { 30 }
+fn default_udp_max_flows() -> usize { 8192 }
 
 fn default_workers() -> usize {
     std::thread::available_parallelism()
@@ -1436,5 +1448,8 @@ mod tests {
         let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
         cfg.keel.udp_flow_timeout_seconds = 0;
         assert!(err(&cfg).contains("udp_flow_timeout_seconds"));
+        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+        cfg.keel.udp_max_flows = 0;
+        assert!(err(&cfg).contains("udp_max_flows"));
     }
 }

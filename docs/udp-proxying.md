@@ -49,6 +49,7 @@ pools:
 | `keel` field | Default | Notes |
 |---|---|---|
 | `udp_flow_timeout_seconds` | `30` | Idle time before a flow expires. Applies to every UDP listener. Must be at least 1 |
+| `udp_max_flows` | `8192` | Most flows one worker holds at once. Datagrams from further clients are dropped and counted in `keel_udp_errors_total{reason="flow_limit"}` until a flow expires; existing flows are unaffected. A flow costs an upstream socket and a task, so this bounds what a flood from spoofed source addresses can consume |
 
 Config validation fails at startup for an unknown `udp_pool`, a
 `udp_pool` + `tls: true` combination, `udp_pool` and `tcp_pool` on the same
