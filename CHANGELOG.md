@@ -10,6 +10,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.15.1] — 2026-09-13
+
+### Fixed
+
+- **The tiered cache reported a purge the eviction manager could not trust.**
+  Two tiers were collapsed with "purged if either was", so an entry one tier
+  had only marked stale was reported as removed — and the manager stops
+  tracking what it is told was purged. `Expired` now outranks `Purged`, and
+  `expire` is implemented rather than inherited, because the inherited one
+  deletes from both tiers and loses the body a revalidation would reuse.
+- **A failed disk-cache delete left an untracked file.** The key was dropped
+  from the eviction manager before the file was unlinked, so an unlink error
+  left a file nothing tracked and nothing would ever evict. The entry leaves
+  the manager only once its file is gone, and an IO error is reported as an
+  error rather than as "not found".
+
+---
+
 ## [0.15.0] — 2026-09-13
 
 ### Added
@@ -694,7 +712,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/allmend/keel/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/allmend/keel/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/allmend/keel/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/allmend/keel/compare/v0.13.2...v0.13.3
