@@ -14,8 +14,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use pingora::protocols::Stream;
-use tokio::io::AsyncReadExt;
+use pingora::protocols::Peek;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Addresses carried by a PROXY header. `None` for `LOCAL` (v2) and
 /// `UNKNOWN` (v1): a health check from the load balancer itself, to be
@@ -136,13 +136,23 @@ fn parse_v2(buf: &[u8]) -> Result<Header, Error> {
 /// v2 length field, up to 64 KiB — indefinitely.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Read and consume the header at the start of a Pingora stream, giving up
+/// Read and consume the header at the start of a Pingora transport, giving up
 /// after [`HEADER_TIMEOUT`].
-pub async fn read_from_stream(stream: &mut Stream) -> Result<Addresses, Error> {
+///
+/// Generic over the transport because the header arrives in two places: on the
+/// boxed `Stream` a `ServerApp` is handed, and on the raw L4 stream a pre-TLS
+/// callback sees before the handshake.
+pub async fn read_from_stream<S>(stream: &mut S) -> Result<Addresses, Error>
+where
+    S: Peek + AsyncRead + Unpin + Send + ?Sized,
+{
     read_within(stream, HEADER_TIMEOUT).await
 }
 
-async fn read_within(stream: &mut Stream, limit: Duration) -> Result<Addresses, Error> {
+async fn read_within<S>(stream: &mut S, limit: Duration) -> Result<Addresses, Error>
+where
+    S: Peek + AsyncRead + Unpin + Send + ?Sized,
+{
     tokio::time::timeout(limit, read_header(stream))
         .await
         .unwrap_or(Err(Error::Invalid("timed out waiting for header")))
@@ -151,7 +161,10 @@ async fn read_within(stream: &mut Stream, limit: Duration) -> Result<Addresses, 
 /// Pingora's peek reads exactly the requested length, so the read is staged:
 /// six bytes to tell the versions apart, then the v1 line up to CRLF or the v2
 /// body by its length field.
-async fn read_header(stream: &mut Stream) -> Result<Addresses, Error> {
+async fn read_header<S>(stream: &mut S) -> Result<Addresses, Error>
+where
+    S: Peek + AsyncRead + Unpin + Send + ?Sized,
+{
     let mut prefix = [0u8; 6];
     stream.try_peek(&mut prefix).await.map_err(|_| Error::Invalid("connection closed before header"))?;
     if &prefix == b"PROXY " {
@@ -239,11 +252,11 @@ mod tests {
         assert_eq!(parse(&V2_SIGNATURE[..5]), Err(Error::Incomplete));
     }
 
-    async fn accepted_pair() -> (tokio::net::TcpStream, Stream) {
+    async fn accepted_pair() -> (tokio::net::TcpStream, pingora::protocols::l4::stream::Stream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
-        (client, Box::new(pingora::protocols::l4::stream::Stream::from(server)))
+        (client, pingora::protocols::l4::stream::Stream::from(server))
     }
 
     #[tokio::test]

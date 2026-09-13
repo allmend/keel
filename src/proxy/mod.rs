@@ -1075,6 +1075,7 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         acme_challenge_dir,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
+    add_proxy_protocol_tls_services(&mut server, cfg, proxy.clone(), &cert_store);
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg
@@ -1082,7 +1083,7 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         .iter()
         .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
         .collect();
-    let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
+    let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls && !l.proxy_protocol).collect();
 
     if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
@@ -1151,7 +1152,7 @@ impl pingora::apps::ServerApp for ProxyProtocolApp {
         mut stream: pingora::protocols::Stream,
         shutdown: &pingora::server::ShutdownWatch,
     ) -> Option<pingora::protocols::Stream> {
-        match crate::proxy_protocol::read_from_stream(&mut stream).await {
+        match crate::proxy_protocol::read_from_stream(&mut *stream).await {
             Ok(Some((src, _))) => {
                 let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
                 let _ = digest.peer_addr.set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
@@ -1165,6 +1166,60 @@ impl pingora::apps::ServerApp for ProxyProtocolApp {
             }
         }
         pingora::apps::ServerApp::process_new(&self.inner, stream, shutdown).await
+    }
+}
+
+/// Reads the PROXY header before the TLS handshake, so a `tls: true` listener
+/// behind a load balancer still learns the real client address. Pingora hands
+/// the raw L4 stream here, ahead of the handshake it would otherwise do first
+/// — which is why this could not work before pingora 0.9.
+struct ProxyProtocolPreTls {
+    listener: String,
+}
+
+#[async_trait]
+impl pingora::listeners::PreTlsProcess for ProxyProtocolPreTls {
+    async fn process(
+        &self,
+        stream: &mut pingora::protocols::l4::stream::Stream,
+    ) -> pingora::Result<()> {
+        use pingora::protocols::{GetSocketDigest, UniqueID};
+        match crate::proxy_protocol::read_from_stream(stream).await {
+            Ok(Some((src, _))) => {
+                let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
+                let _ = digest
+                    .peer_addr
+                    .set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
+                stream.set_socket_digest(digest);
+                Ok(())
+            }
+            Ok(None) => Ok(()), // LOCAL / UNKNOWN: the socket peer is the client
+            Err(e) => {
+                tracing::debug!(listener = self.listener, error = ?e, "proxy_protocol: connection rejected");
+                crate::metrics::record_proxy_protocol_error(&self.listener);
+                Err(Error::explain(ErrorType::ConnectProxyFailure, "invalid PROXY protocol header"))
+            }
+        }
+    }
+}
+
+/// One service per TLS listener with `proxy_protocol: true`. They get their own
+/// service because the callback applies to every endpoint of the collection it
+/// is set on, and a listener without `proxy_protocol` must not demand a header.
+fn add_proxy_protocol_tls_services(
+    server: &mut Server,
+    cfg: &Config,
+    proxy: KProxy,
+    cert_store: &Arc<CertStore>,
+) {
+    for l in cfg.listeners.iter().filter(|l| l.tls && l.proxy_protocol) {
+        info!(address = l.address, "adding TLS listener (PROXY protocol)");
+        let mut svc = http_proxy_service(&server.configuration, proxy.clone());
+        svc.endpoints()
+            .set_pre_tls_callback(Arc::new(ProxyProtocolPreTls { listener: l.address.clone() }));
+        let settings = build_tls_settings(cert_store, &l.address);
+        svc.add_tls_with_settings(&l.address, None, settings);
+        server.add_service(svc);
     }
 }
 
@@ -1413,6 +1468,7 @@ pub fn run_cluster(
         acme_challenge_dir,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
+    add_proxy_protocol_tls_services(&mut server, cfg, proxy.clone(), &cert_store);
     let mut svc = http_proxy_service(&server.configuration, proxy);
 
     let plain: Vec<_> = cfg
@@ -1420,7 +1476,7 @@ pub fn run_cluster(
         .iter()
         .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
         .collect();
-    let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls).collect();
+    let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls && !l.proxy_protocol).collect();
 
     if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");

@@ -263,13 +263,6 @@ impl Config {
             anyhow::bail!("keel.udp_flow_timeout_seconds must be at least 1");
         }
         for l in &self.listeners {
-            if l.proxy_protocol && l.tls {
-                anyhow::bail!(
-                    "listener '{}': proxy_protocol is not supported on tls listeners — the header \
-                     precedes the TLS handshake, which Pingora completes before Keel sees the connection",
-                    l.address
-                );
-            }
             if let Some(pool) = &l.tcp_pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("listener '{}' references unknown tcp_pool '{pool}'", l.address);
@@ -593,7 +586,8 @@ pub struct Listener {
 
     /// Expect a PROXY protocol v1/v2 header on every connection (TCP, HTTP)
     /// or datagram (UDP) and take the client address from it. Connections
-    /// without one are rejected. Not available on `tls: true` listeners.
+    /// without one are rejected. On `tls: true` listeners the header is read
+    /// before the handshake.
     #[serde(default)]
     pub proxy_protocol: bool,
 
@@ -1428,14 +1422,13 @@ mod tests {
     }
 
     #[test]
-    fn proxy_protocol_allowed_except_on_tls_listeners() {
+    fn proxy_protocol_allowed_on_every_listener_kind() {
         parse("  - address: 0.0.0.0:80\n    proxy_protocol: true\n").validate().expect("http listener");
+        parse("  - address: 0.0.0.0:443\n    tls: true\n    proxy_protocol: true\n").validate().expect("tls listener");
         parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n    proxy_protocol: true\n").validate().expect("udp listener");
         parse("  - address: 0.0.0.0:5353\n    tcp_pool: dns\n    tls_mode: terminate\n    tls_host: x\n    proxy_protocol: true\n")
             .validate()
             .expect_err("tls_host x unknown, but proxy_protocol itself is fine on tcp listeners");
-        let cfg = parse("  - address: 0.0.0.0:443\n    tls: true\n    proxy_protocol: true\n");
-        assert!(err(&cfg).contains("not supported on tls listeners"));
     }
 
     #[test]

@@ -25,9 +25,11 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
-    # FreeBSD (x86_64-unknown-freebsd) is currently not built: pingora-core 0.8
-    # pins nix 0.24, which no longer compiles against modern libc's FreeBSD
-    # kevent ABI. Revisit when pingora bumps its nix dependency.
+    continue-on-error: ${{ matrix.name == 'freebsd_x86_64' }}
+    # FreeBSD builds again since pingora 0.9 moved nix 0.24 -> 0.31; nix 0.24 did
+    # not compile against modern libc's FreeBSD kevent ABI. It stays
+    # continue-on-error for its first releases: the target has no CI coverage
+    # beyond this build, and a FreeBSD failure must not hold back a release.
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +38,8 @@ jobs:
             target: x86_64-unknown-linux-musl
           - name: linux_arm64
             target: aarch64-unknown-linux-musl
+          - name: freebsd_x86_64
+            target: x86_64-unknown-freebsd
     steps:
       - uses: actions/checkout@v5
 

@@ -30,7 +30,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Load balancing — round robin, weighted, consistent hash, least-conn
 - TCP (L4) proxying — `tcp_pool` listeners with `passthrough`, `terminate`, and `reencrypt` TLS modes; certificates from ACME or files, SNI selection, optional backend verification
 - UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
-- PROXY Protocol v1/v2 — real client addresses behind an NLB or another proxy, on HTTP, TCP, and UDP listeners
+- PROXY Protocol v1/v2 — real client addresses behind an NLB or another proxy, on HTTP, HTTPS, TCP, and UDP listeners
 - TLS termination with per-vhost certificates
 - ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
@@ -99,7 +99,8 @@ docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.14.
 
 ### Prebuilt binaries
 
-Download a Linux binary (x86_64 or arm64) from the
+Download a Linux binary (x86_64 or arm64), or the best-effort FreeBSD
+x86_64 build, from the
 [releases page](https://github.com/allmend/keel/releases) — each release
 includes the binary, an example config, and `SHA256SUMS`.
 

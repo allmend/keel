@@ -8,6 +8,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **PROXY protocol on `tls: true` listeners.** The header is read before the
+  TLS handshake, so Keel behind an NLB or another proxy learns the real client
+  address on HTTPS listeners too. Previously the combination was refused at
+  load, because pingora completed the handshake before Keel saw the
+  connection; pingora 0.9's pre-TLS callback is what makes it possible. Such
+  listeners get their own proxy service, so a TLS listener without
+  `proxy_protocol` still never demands a header.
+- **FreeBSD binaries again.** `x86_64-unknown-freebsd` builds now that pingora
+  0.9 moved `nix` 0.24 → 0.31; the old pin did not compile against modern
+  libc's FreeBSD kevent ABI. Releases carry a FreeBSD keel binary alongside
+  the Linux ones, best-effort at first: the leg is `continue-on-error`, since
+  the target has no CI coverage beyond the build itself.
+
 ### Changed
 
 - **Pingora 0.8.1 → 0.9.0.** Keel's cache storage backends follow the new

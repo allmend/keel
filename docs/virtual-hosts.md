@@ -129,6 +129,8 @@ listeners:
     proxy_protocol: true
 ```
 
+On a `tls: true` listener the header is read before the TLS handshake, so the real client address is known for the handshake's own logging as well.
+
 Versions 1 (text) and 2 (binary) are accepted. A `LOCAL` (v2) or `UNKNOWN` (v1) header, which load balancers send for their own health checks, leaves the socket's own peer as the client. A connection that does not start with a valid header is closed without a response and counted in `keel_proxy_protocol_errors_total`; there is no fallback, since a fallback would let any client claim any address. Enable the option only on listeners that are reached exclusively through a load balancer sending the header.
 
 The option works on plain HTTP listeners, on `tcp_pool` listeners in every `tls_mode` (the header precedes the TLS handshake, which Keel performs itself there), and on `udp_pool` listeners, where each datagram carries a v2 header as an NLB sends them. It is not available on `tls: true` HTTP listeners: Pingora completes the TLS handshake before Keel sees the connection, so the header cannot be read there. Terminate TLS on the load balancer, or use a `tcp_pool` listener with `tls_mode: terminate` in front of an HTTP listener, for that case.

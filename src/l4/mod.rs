@@ -260,7 +260,7 @@ impl ServerApp for TcpProxyApp {
         // The header comes before TLS on the wire, so it is read here, ahead
         // of any termination in `splice`.
         if self.proxy_protocol {
-            match crate::proxy_protocol::read_from_stream(&mut session).await {
+            match crate::proxy_protocol::read_from_stream(&mut *session).await {
                 Ok(Some((src, _))) => client_addr = Some(src.to_string()),
                 Ok(None) => {}
                 Err(e) => {
