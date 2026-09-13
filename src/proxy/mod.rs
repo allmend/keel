@@ -56,10 +56,6 @@ pub struct ProxyCtx {
     uri: String,
     protocol: String,
     user_agent: Option<String>,
-    /// Gateway rules of the matched route, resolved in `request_filter`.
-    gateway: Option<Arc<crate::vhost::GatewayRules>>,
-    /// Verified JWT claims to forward as headers.
-    claim_headers: Vec<(String, String)>,
 }
 
 // Proxy implementation
@@ -72,8 +68,6 @@ pub struct KProxy {
     cache: Option<CacheHandle>,
     /// HTTP-01 challenge token directory — Some when any host is ACME-managed.
     acme_challenge_dir: Option<std::path::PathBuf>,
-    /// Per-worker token buckets for `rate_limit` rules.
-    limiter: Arc<crate::gateway::ratelimit::RateLimiter>,
 }
 
 /// Headers `forwarded_headers: off` removes from the upstream request.
@@ -255,15 +249,13 @@ impl ProxyHttp for KProxy {
             uri: String::new(),
             protocol: String::new(),
             user_agent: None,
-            gateway: None,
-            claim_headers: Vec::new(),
         }
     }
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
 
@@ -336,69 +328,6 @@ impl ProxyHttp for KProxy {
                     .await?;
                 return Ok(true);
             }
-        }
-
-        // Gateway rules for the route this request will take. The rate limit
-        // answers here, before any backend work; header and path rules are
-        // applied in the upstream/response filters from `ctx.gateway`.
-        let req_path = session.req_header().uri.path().to_owned();
-        if let Some(rules) = routing.gateway(&host, &req_path) {
-            if let Some(rl) = &rules.rate_limit {
-                let client_ip = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
-                if let Some(ip) = client_ip {
-                    let (rate, burst) = rl.limit();
-                    let limit = crate::gateway::ratelimit::Limit { rate, burst };
-                    if let Err(wait) = self.limiter.check(&rules.id, ip, limit, Instant::now()) {
-                        let label = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
-                        crate::metrics::record_rate_limited(&label);
-                        ctx.vhost = label;
-                        ctx.host_header = host.clone();
-                        let retry = wait.as_secs_f64().ceil().max(1.0) as u64;
-                        let body = "rate limited\n";
-                        let mut resp = pingora::http::ResponseHeader::build(429, Some(3))?;
-                        resp.insert_header("retry-after", retry.to_string().as_str())?;
-                        resp.insert_header("content-type", "text/plain")?;
-                        resp.insert_header("content-length", body.len().to_string())?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session.write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true).await?;
-                        return Ok(true);
-                    }
-                }
-            }
-            if let (Some(auth), Some(verifier)) = (&rules.auth, &rules.jwt) {
-                let token = session
-                    .req_header()
-                    .headers
-                    .get(auth.jwt.header.as_str())
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(crate::gateway::jwt::bearer_token);
-                let outcome = match token {
-                    None => Err(crate::gateway::jwt::Refusal::Missing),
-                    Some(t) => verifier.verify(t, crate::gateway::jwt::now_secs()),
-                };
-                match outcome {
-                    Ok(claims) => ctx.claim_headers = claims,
-                    Err(refusal) => {
-                        let label = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
-                        crate::metrics::record_auth_failure(&label, refusal.as_str());
-                        ctx.vhost = label;
-                        ctx.host_header = host.clone();
-                        let body = "unauthorized\n";
-                        let challenge = match refusal {
-                            crate::gateway::jwt::Refusal::Missing => "Bearer".to_owned(),
-                            r => format!("Bearer error=\"invalid_token\", error_description=\"{}\"", r.as_str()),
-                        };
-                        let mut resp = pingora::http::ResponseHeader::build(401, Some(3))?;
-                        resp.insert_header("www-authenticate", challenge.as_str())?;
-                        resp.insert_header("content-type", "text/plain")?;
-                        resp.insert_header("content-length", body.len().to_string())?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session.write_response_body(Some(bytes::Bytes::from_static(body.as_bytes())), true).await?;
-                        return Ok(true);
-                    }
-                }
-            }
-            ctx.gateway = Some(rules);
         }
 
         // HTTP → HTTPS redirect — plain HTTP only, TLS passes through.
@@ -520,35 +449,6 @@ impl ProxyHttp for KProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         self.apply_forwarded_headers(session, upstream_request, ctx)?;
-        if let Some(rules) = &ctx.gateway {
-            if let Some(rw) = &rules.rewrite {
-                if let Some(new_path) = crate::gateway::rewrite_path(upstream_request.uri.path(), rw) {
-                    let pq = match upstream_request.uri.query() {
-                        Some(q) => format!("{new_path}?{q}"),
-                        None => new_path,
-                    };
-                    if let Ok(uri) = pq.parse::<http::Uri>() {
-                        upstream_request.set_uri(uri);
-                    }
-                }
-            }
-            if let Some(h) = &rules.headers {
-                crate::gateway::apply_request_ops(upstream_request, &h.request);
-            }
-            // Claim headers always replace whatever the client sent under the
-            // same name, so a backend can trust them. The token header itself
-            // is left in place: backends may want it.
-            if rules.jwt.is_some() {
-                if let Some(auth) = &rules.auth {
-                    for header in auth.jwt.claim_headers.values() {
-                        upstream_request.remove_header(header);
-                    }
-                }
-                for (header, value) in &ctx.claim_headers {
-                    let _ = upstream_request.insert_header(header.clone(), value.as_str());
-                }
-            }
-        }
         Ok(())
     }
 
@@ -664,7 +564,7 @@ impl ProxyHttp for KProxy {
         &self,
         session: &mut Session,
         upstream_response: &mut pingora::http::ResponseHeader,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         use pingora::cache::CachePhase;
         let value = match session.cache.phase() {
@@ -674,9 +574,6 @@ impl ProxyHttp for KProxy {
         };
         if let Some(value) = value {
             let _ = upstream_response.insert_header("x-cache", value);
-        }
-        if let Some(h) = ctx.gateway.as_ref().and_then(|r| r.headers.as_ref()) {
-            crate::gateway::apply_response_ops(upstream_response, &h.response);
         }
         Ok(())
     }
@@ -986,28 +883,6 @@ impl pingora::services::background::BackgroundService for EjectionSweeper {
     }
 }
 
-/// Drops rate-limit buckets idle for ten minutes, once a minute.
-struct LimiterSweeper {
-    limiter: Arc<crate::gateway::ratelimit::RateLimiter>,
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for LimiterSweeper {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                _ = tick.tick() => {
-                    self.limiter.sweep(Instant::now(), std::time::Duration::from_secs(600));
-                }
-            }
-        }
-    }
-}
-
 /// Register one health-check service per pool that configures one, plus the
 /// passive-ejection sweeper.
 fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
@@ -1185,15 +1060,12 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
-    let limiter = Arc::new(crate::gateway::ratelimit::RateLimiter::default());
-    server.add_service(background_service("ratelimit-sweep", LimiterSweeper { limiter: Arc::clone(&limiter) }));
     let proxy = KProxy {
         routing,
         pools: Arc::clone(&pools),
         access_logger,
         cache,
         acme_challenge_dir,
-        limiter,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);
@@ -1526,15 +1398,12 @@ pub fn run_cluster(
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
-    let limiter = Arc::new(crate::gateway::ratelimit::RateLimiter::default());
-    server.add_service(background_service("ratelimit-sweep", LimiterSweeper { limiter: Arc::clone(&limiter) }));
     let proxy = KProxy {
         routing,
         pools: Arc::clone(&pools),
         access_logger,
         cache,
         acme_challenge_dir,
-        limiter,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     let mut svc = http_proxy_service(&server.configuration, proxy);

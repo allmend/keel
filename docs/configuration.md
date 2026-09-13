@@ -12,8 +12,8 @@ Keel is configured via a YAML file, defaulting to `keel.yaml` in the working dir
 | `access_log` | NDJSON access log output | [Access logging](access-logging.md) |
 | `cache` | Memory and disk HTTP cache | [Caching](caching.md) |
 | `pools` | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
-| `vhosts` | Virtual host routing rules, TLS, cache rules, gateway rules | [Virtual hosts](virtual-hosts.md), [API gateway](gateway.md) |
-| `acme` | ACME issuers: directory, contact, challenge type, DNS provider | [ACME](acme.md) |
+| `vhosts` | Virtual host routing rules, TLS, cache rules | [Virtual hosts](virtual-hosts.md) |
+| `acme` | ACME issuers: directory, contact | [ACME](acme.md) |
 | `certificates` | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-for-tcp--tls-passthrough-backends) |
 | `include` | Glob patterns for conf.d-style config splitting | [below](#config-splitting) |
 | `cluster` | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
@@ -235,10 +235,6 @@ vhosts:
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
 | `cache.ttl` | integer | none | Seconds; fallback TTL when origin omits `Cache-Control` |
 | `default_action` | object | none | Answer directly without a pool: `redirect:` or `status:`/`body:` — see [Virtual hosts](virtual-hosts.md#default-action). Excludes `pool`/`routes` |
-| `rate_limit` | object | none | Per-client-IP token bucket: `requests`, `per` (default `1s`), `burst` (default `requests`). Also per route. See [API gateway](gateway.md) |
-| `headers` | object | none | `request` and `response` blocks, each with `set` (map) and `remove` (list). Also per route |
-| `rewrite` | object | none | `strip_prefix`, `add_prefix` applied to the backend path. Also per route |
-| `auth.jwt` | object | none | JWT validation: one of `secret`, `secret_file`, `public_key`; optional `issuer`, `audience`, `header`, `leeway`, `claim_headers`. Also per route. See [API gateway](gateway.md#authentication-jwt) |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
 
@@ -270,8 +266,6 @@ acme:
 | `issuers.<name>.directory` | string | `https://acme-v02.api.letsencrypt.org/directory` | ACME v2 directory URL |
 | `issuers.<name>.root_ca` | string | none | Extra trust root for the ACME API (internal or self-signed CAs) |
 | `issuers.<name>.renew_before` | string | global value | Per-issuer renewal override |
-| `issuers.<name>.challenge` | string | `http-01` | `http-01` or `dns-01`. Wildcard hosts need `dns-01` |
-| `issuers.<name>.dns` | object | none | `dns-01` provider: `type: rfc2136` with `server`, `zone`, `tsig_name`, `tsig_key` or `tsig_key_file`, `tsig_algorithm`, `propagation_wait`, `ttl`. See [ACME](acme.md#dns-01-challenge) |
 
 ---
 

@@ -16,7 +16,7 @@
 
 > ⚠️ **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not production-ready yet — feedback welcome.
 
-Keel is a fast, modern, self-hosted load balancer, reverse proxy, and API gateway written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, runtime pool management, automatic TLS, true config hot-swap — from a single static binary.
+Keel is a fast, modern, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, runtime pool management, automatic TLS, true config hot-swap — from a single static binary.
 
 Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
@@ -32,7 +32,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
 - PROXY Protocol v1/v2 — real client addresses behind an NLB or another proxy, on HTTP, TCP, and UDP listeners
 - TLS termination with per-vhost certificates
-- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01 and DNS-01 (RFC 2136 + TSIG, wildcards), renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
+- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
 - HTTP → HTTPS redirect (implicit for ACME vhosts)
 - Default vhost action — redirect or static response for unknown hosts, no pool needed
 - Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
@@ -42,7 +42,6 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Config hot reload (SIGHUP or `keel config reload`)
 - TLS certificate hot-swap
 - Two-tier HTTP cache (memory L1 + disk L2)
-- Gateway rules per vhost or route — per-IP rate limiting, JWT authentication (HS/RS/ES, claims to headers), request/response header set/remove, path prefix rewriting
 - Prometheus metrics (`/metrics`)
 - NDJSON access logs, per-vhost
 - conf.d config splitting — vhosts, pools, and certificates per team file
@@ -89,8 +88,8 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ### Container image
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.13.3
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.13.3
+docker pull ghcr.io/allmend/keel:0.14.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.14.0
 ```
 
 ### Prebuilt binaries
@@ -219,7 +218,6 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 - [UDP proxying (L4)](docs/udp-proxying.md)
 - [Clustering](docs/cluster.md)
 - [Caching](docs/caching.md)
-- [API gateway](docs/gateway.md)
 - [Access logging](docs/access-logging.md)
 - [Metrics reference](docs/metrics.md)
 - [Automatic TLS / ACME](docs/acme.md)
@@ -231,7 +229,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is at v0.13.3, alpha quality. Core proxy, TLS + ACME (HTTP-01 and DNS-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, protocol health checks with passive detection, and gateway rules (rate limiting, JWT, headers, rewrites) are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.14.0, alpha quality. Core proxy, TLS + ACME (HTTP-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 ---
 

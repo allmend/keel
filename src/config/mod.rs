@@ -380,10 +380,6 @@ impl Config {
                     }
                 }
             }
-            validate_gateway(&format!("vhost '{}'", vhost.host), vhost.rate_limit.as_ref(), vhost.headers.as_ref(), vhost.rewrite.as_ref(), vhost.auth.as_ref())?;
-            for route in &vhost.routes {
-                validate_gateway(&format!("vhost '{}' route '{}'", vhost.host, route.path), route.rate_limit.as_ref(), route.headers.as_ref(), route.rewrite.as_ref(), route.auth.as_ref())?;
-            }
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("vhost '{}' references unknown pool '{pool}'", vhost.host);
@@ -405,9 +401,9 @@ impl Config {
                             vhost.host
                         );
                     }
-                    if vhost.host.contains('*') && !self.issuer_uses_dns01(tls.acme.issuer_name().unwrap_or(DEFAULT_ISSUER)) {
+                    if vhost.host.contains('*') {
                         anyhow::bail!(
-                            "vhost '{}': wildcard certificates need an issuer with challenge: dns-01",
+                            "vhost '{}': ACME cannot issue wildcard certificates",
                             vhost.host
                         );
                     }
@@ -428,47 +424,10 @@ impl Config {
         Ok(())
     }
 
-    /// Whether the named issuer publishes DNS-01 challenges (the implicit
-    /// default issuer does not).
-    fn issuer_uses_dns01(&self, name: &str) -> bool {
-        self.acme
-            .as_ref()
-            .and_then(|a| a.issuers.get(name))
-            .is_some_and(|i| i.challenge == AcmeChallenge::Dns01)
-    }
-
     fn validate_acme(&self) -> Result<()> {
         let issuer_defined = |name: &str| {
             self.acme.as_ref().is_some_and(|a| a.issuers.contains_key(name))
         };
-
-        for (name, issuer) in self.acme.as_ref().map(|a| &a.issuers).into_iter().flatten() {
-            match (issuer.challenge, &issuer.dns) {
-                (AcmeChallenge::Dns01, None) => anyhow::bail!("acme.issuers.{name}: challenge dns-01 needs a dns provider"),
-                (AcmeChallenge::Http01, Some(_)) => anyhow::bail!("acme.issuers.{name}: dns provider needs challenge: dns-01"),
-                (AcmeChallenge::Dns01, Some(DnsProvider::Rfc2136 { server, zone, tsig_name, tsig_key, tsig_key_file, tsig_algorithm, propagation_wait, .. })) => {
-                    if server.rsplit_once(':').is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err()) {
-                        anyhow::bail!("acme.issuers.{name}: dns.server must be host:port");
-                    }
-                    if zone.is_empty() || tsig_name.is_empty() {
-                        anyhow::bail!("acme.issuers.{name}: dns.zone and dns.tsig_name are required");
-                    }
-                    if tsig_key.is_some() == tsig_key_file.is_some() {
-                        anyhow::bail!("acme.issuers.{name}: set exactly one of dns.tsig_key and dns.tsig_key_file");
-                    }
-                    if crate::acme::rfc2136::TsigAlgorithm::parse(tsig_algorithm).is_none() {
-                        anyhow::bail!("acme.issuers.{name}: dns.tsig_algorithm must be hmac-sha256, hmac-sha384, or hmac-sha512");
-                    }
-                    parse_duration(propagation_wait).map_err(|e| anyhow::anyhow!("acme.issuers.{name}: dns.propagation_wait: {e}"))?;
-                }
-                (AcmeChallenge::Http01, None) => {}
-            }
-        }
-        for c in self.certificates.iter().filter(|c| c.is_acme()) {
-            if c.host.contains('*') && !self.issuer_uses_dns01(&c.issuer) {
-                anyhow::bail!("certificates '{}': wildcard certificates need an issuer with challenge: dns-01", c.host);
-            }
-        }
 
         // Issuer references must exist ("default" may be implicit).
         for vhost in &self.vhosts {
@@ -491,7 +450,7 @@ impl Config {
             }
             if cert.host.contains('*') {
                 anyhow::bail!(
-                    "certificates '{}': ACME HTTP-01 cannot issue wildcard certificates",
+                    "certificates '{}': ACME cannot issue wildcard certificates",
                     cert.host
                 );
             }
@@ -910,81 +869,6 @@ impl<'de> Deserialize<'de> for HealthCheck {
     }
 }
 
-fn validate_gateway(
-    what: &str,
-    rate_limit: Option<&RateLimitConfig>,
-    headers: Option<&HeaderRules>,
-    rewrite: Option<&RewriteConfig>,
-    auth: Option<&AuthConfig>,
-) -> Result<()> {
-    if let Some(a) = auth {
-        let j = &a.jwt;
-        let sources = [j.secret.is_some(), j.secret_file.is_some(), j.public_key.is_some()].iter().filter(|b| **b).count();
-        if sources != 1 {
-            anyhow::bail!("{what}: auth.jwt needs exactly one of secret, secret_file, public_key");
-        }
-        if let Some(s) = &j.secret {
-            use base64::Engine;
-            if base64::engine::general_purpose::STANDARD.decode(s.trim()).is_err() {
-                anyhow::bail!("{what}: auth.jwt.secret is not base64");
-            }
-        }
-        for (field, path) in [("secret_file", &j.secret_file), ("public_key", &j.public_key)] {
-            if let Some(p) = path {
-                std::fs::metadata(p).map_err(|e| anyhow::anyhow!("{what}: auth.jwt.{field} '{p}': {e}"))?;
-            }
-        }
-        if http::header::HeaderName::from_bytes(j.header.as_bytes()).is_err() {
-            anyhow::bail!("{what}: auth.jwt.header is not a valid header name");
-        }
-        parse_duration(&j.leeway).map_err(|e| anyhow::anyhow!("{what}: auth.jwt.leeway: {e}"))?;
-        for (claim, header) in &j.claim_headers {
-            if claim.is_empty() || http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
-                anyhow::bail!("{what}: auth.jwt.claim_headers: '{header}' is not a valid header name for claim '{claim}'");
-            }
-        }
-    }
-    if let Some(rl) = rate_limit {
-        if rl.requests == 0 {
-            anyhow::bail!("{what}: rate_limit.requests must be at least 1");
-        }
-        parse_duration(&rl.per).map_err(|e| anyhow::anyhow!("{what}: rate_limit.per: {e}"))?;
-        if rl.burst == Some(0) {
-            anyhow::bail!("{what}: rate_limit.burst must be at least 1");
-        }
-    }
-    if let Some(h) = headers {
-        for ops in [&h.request, &h.response] {
-            for (name, value) in &ops.set {
-                if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    anyhow::bail!("{what}: headers: '{name}' is not a valid header name");
-                }
-                if http::header::HeaderValue::from_str(value).is_err() {
-                    anyhow::bail!("{what}: headers: value of '{name}' contains characters not allowed in a header");
-                }
-            }
-            for name in &ops.remove {
-                if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                    anyhow::bail!("{what}: headers: '{name}' is not a valid header name");
-                }
-            }
-        }
-    }
-    if let Some(rw) = rewrite {
-        for (field, value) in [("strip_prefix", &rw.strip_prefix), ("add_prefix", &rw.add_prefix)] {
-            if let Some(v) = value {
-                if !v.starts_with('/') || v.contains(['?', '#']) {
-                    anyhow::bail!("{what}: rewrite.{field} must be a path starting with '/'");
-                }
-            }
-        }
-        if rw.strip_prefix.is_none() && rw.add_prefix.is_none() {
-            anyhow::bail!("{what}: rewrite needs strip_prefix or add_prefix");
-        }
-    }
-    Ok(())
-}
-
 /// Strict duration parser for config values: `500ms`, `10s`, `2m`, `1h`.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -1100,128 +984,6 @@ pub struct Vhost {
     /// and `routes`. Typical on the `"*"` wildcard vhost: IP-direct access
     /// redirect, unknown-host 404, maintenance page.
     pub default_action: Option<DefaultAction>,
-
-    /// Gateway rules for the whole vhost; a route's own rules override them
-    /// field by field.
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitConfig>,
-    #[serde(default)]
-    pub headers: Option<HeaderRules>,
-    #[serde(default)]
-    pub rewrite: Option<RewriteConfig>,
-    #[serde(default)]
-    pub auth: Option<AuthConfig>,
-}
-
-/// Authentication before a request may reach the backend.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct AuthConfig {
-    pub jwt: JwtConfig,
-}
-
-/// Self-contained JWT validation: the key is configured, nothing is fetched.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct JwtConfig {
-    /// Base64 shared secret for HS256/384/512 — or `secret_file` holding it.
-    #[serde(default)]
-    pub secret: Option<String>,
-    #[serde(default)]
-    pub secret_file: Option<String>,
-    /// PEM public key (SPKI) for RS256/384/512 or ES256/384.
-    #[serde(default)]
-    pub public_key: Option<String>,
-    /// Required `iss` claim value.
-    #[serde(default)]
-    pub issuer: Option<String>,
-    /// Value the `aud` claim must equal or contain.
-    #[serde(default)]
-    pub audience: Option<String>,
-    /// Header carrying `Bearer <token>`.
-    #[serde(default = "default_jwt_header")]
-    pub header: String,
-    /// Clock skew tolerated on `exp` and `nbf`.
-    #[serde(default = "default_jwt_leeway")]
-    pub leeway: String,
-    /// claim name → request header to carry it to the backend.
-    #[serde(default)]
-    pub claim_headers: std::collections::BTreeMap<String, String>,
-}
-
-fn default_jwt_header() -> String { "Authorization".into() }
-fn default_jwt_leeway() -> String { "30s".into() }
-
-impl JwtConfig {
-    /// Decoded shared secret, from `secret` or `secret_file`; `None` when a
-    /// public key is configured instead.
-    pub fn secret_material(&self) -> Result<Option<Vec<u8>>> {
-        use base64::Engine;
-        let b64 = match (&self.secret, &self.secret_file) {
-            (Some(s), _) => s.trim().to_owned(),
-            (None, Some(path)) => std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("read secret_file {path}: {e}"))?
-                .trim()
-                .to_owned(),
-            (None, None) => return Ok(None),
-        };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .map_err(|_| anyhow::anyhow!("jwt secret is not base64"))?;
-        Ok(Some(bytes))
-    }
-}
-
-/// Per-client-IP token bucket: `requests` per `per`, with `burst` tokens
-/// available after idle time (defaults to `requests`).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct RateLimitConfig {
-    pub requests: u32,
-    #[serde(default = "default_rate_per")]
-    pub per: String,
-    #[serde(default)]
-    pub burst: Option<u32>,
-}
-
-fn default_rate_per() -> String { "1s".into() }
-
-impl RateLimitConfig {
-    /// (tokens per second, bucket capacity). `per` is validated at load.
-    pub fn limit(&self) -> (f64, f64) {
-        let per = parse_duration(&self.per).unwrap_or(Duration::from_secs(1)).as_secs_f64();
-        let rate = self.requests as f64 / per;
-        (rate, self.burst.unwrap_or(self.requests) as f64)
-    }
-}
-
-/// Header changes on the way to the backend (`request`) and back to the
-/// client (`response`).
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-pub struct HeaderRules {
-    #[serde(default)]
-    pub request: HeaderOps,
-    #[serde(default)]
-    pub response: HeaderOps,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-pub struct HeaderOps {
-    /// Set (replace) these headers to static values.
-    #[serde(default)]
-    pub set: std::collections::BTreeMap<String, String>,
-    /// Remove these headers.
-    #[serde(default)]
-    pub remove: Vec<String>,
-}
-
-/// Path rewriting toward the backend.
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
-pub struct RewriteConfig {
-    /// Remove this leading path segment when present (`/api` turns
-    /// `/api/users` into `/users`).
-    #[serde(default)]
-    pub strip_prefix: Option<String>,
-    /// Prepend this path segment.
-    #[serde(default)]
-    pub add_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1254,16 +1016,6 @@ pub struct Route {
     pub pool: String,
     /// Per-route cache config. Overrides the vhost-level cache config when set.
     pub cache: Option<VhostCacheConfig>,
-
-    /// Route-level gateway rules; each overrides the vhost's when set.
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitConfig>,
-    #[serde(default)]
-    pub headers: Option<HeaderRules>,
-    #[serde(default)]
-    pub rewrite: Option<RewriteConfig>,
-    #[serde(default)]
-    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1354,57 +1106,7 @@ pub struct AcmeIssuer {
 
     /// Per-issuer renewal override; same syntax as the global `renew_before`.
     pub renew_before: Option<String>,
-
-    /// Which challenge this issuer's orders use. `dns-01` needs `dns` and
-    /// allows wildcard hosts.
-    #[serde(default)]
-    pub challenge: AcmeChallenge,
-
-    /// DNS provider for `dns-01`.
-    #[serde(default)]
-    pub dns: Option<DnsProvider>,
 }
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
-pub enum AcmeChallenge {
-    #[default]
-    #[serde(rename = "http-01")]
-    Http01,
-    #[serde(rename = "dns-01")]
-    Dns01,
-}
-
-/// How DNS-01 TXT records are published.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DnsProvider {
-    /// RFC 2136 dynamic update with TSIG, to the zone's primary.
-    Rfc2136 {
-        /// `host:port` of the primary that accepts updates.
-        server: String,
-        /// Zone the challenge names belong to.
-        zone: String,
-        /// TSIG key name, as in the server's key statement.
-        tsig_name: String,
-        /// Base64 key material; or `tsig_key_file` holding it.
-        #[serde(default)]
-        tsig_key: Option<String>,
-        #[serde(default)]
-        tsig_key_file: Option<String>,
-        #[serde(default = "default_tsig_algorithm")]
-        tsig_algorithm: String,
-        /// Time to wait after the record is visible on the primary, for
-        /// secondaries the CA may query.
-        #[serde(default = "default_propagation_wait")]
-        propagation_wait: String,
-        #[serde(default = "default_dns_ttl")]
-        ttl: u32,
-    },
-}
-
-fn default_tsig_algorithm() -> String { "hmac-sha256".into() }
-fn default_propagation_wait() -> String { "10s".into() }
-fn default_dns_ttl() -> u32 { 60 }
 
 impl Default for AcmeIssuer {
     fn default() -> Self {
@@ -1413,8 +1115,6 @@ impl Default for AcmeIssuer {
             directory: default_acme_directory(),
             root_ca: None,
             renew_before: None,
-            challenge: AcmeChallenge::Http01,
-            dns: None,
         }
     }
 }
@@ -1725,73 +1425,6 @@ mod tests {
         assert!(e("", "  - host: cache.example.com\n    cert: /c.pem\n").contains("set together"));
         let cfg = parse("  - address: 0.0.0.0:80\n    tls_mode: terminate\n");
         assert!(err(&cfg).contains("tcp_pool listeners only"));
-    }
-
-    fn acme_cfg(issuer_body: &str, host: &str) -> Config {
-        serde_yml::from_str(&format!(
-            "{POOL}acme:\n  issuers:\n    internal:\n{issuer_body}vhosts:\n  - host: '{host}'\n    pool: dns\n    tls: {{ acme: internal }}\n"
-        ))
-        .expect("yaml parses")
-    }
-
-    #[test]
-    fn dns01_issuer_parses_and_allows_wildcards() {
-        let dns = "      challenge: dns-01\n      dns:\n        type: rfc2136\n        server: ns1.example.test:53\n        zone: example.test\n        tsig_name: keel-acme\n        tsig_key: c2VjcmV0\n";
-        let cfg = acme_cfg(dns, "*.example.test");
-        cfg.validate().expect("wildcard with dns-01 is valid");
-        let issuer = &cfg.acme.as_ref().unwrap().issuers["internal"];
-        assert_eq!(issuer.challenge, AcmeChallenge::Dns01);
-        match &issuer.dns {
-            Some(DnsProvider::Rfc2136 { tsig_algorithm, propagation_wait, ttl, .. }) => {
-                assert_eq!(tsig_algorithm, "hmac-sha256");
-                assert_eq!(propagation_wait, "10s");
-                assert_eq!(*ttl, 60);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-
-        let e = |body: &str, host: &str| acme_cfg(body, host).validate().expect_err("invalid").to_string();
-        assert!(e("      email: a@example.test\n", "*.example.test").contains("need an issuer with challenge: dns-01"));
-        assert!(e("      challenge: dns-01\n", "a.example.test").contains("needs a dns provider"));
-        assert!(e("      dns:\n        type: rfc2136\n        server: ns1:53\n        zone: z\n        tsig_name: k\n        tsig_key: a\n", "a.example.test").contains("needs challenge: dns-01"));
-        assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", ""), "a.example.test").contains("exactly one of"));
-        assert!(e(&dns.replace("ns1.example.test:53", "ns1.example.test"), "a.example.test").contains("host:port"));
-        assert!(e(&dns.replace("        tsig_key: c2VjcmV0\n", "        tsig_key: c2VjcmV0\n        tsig_algorithm: hmac-md5\n"), "a.example.test").contains("tsig_algorithm"));
-    }
-
-    fn gw(vhost_body: &str) -> Config {
-        serde_yml::from_str(&format!("{POOL}vhosts:\n  - host: api.example.test\n    pool: dns\n{vhost_body}")).expect("yaml parses")
-    }
-
-    #[test]
-    fn gateway_blocks_parse_and_validate() {
-        let cfg = gw("    rate_limit: { requests: 10, per: 1m, burst: 20 }\n    headers:\n      request: { set: { X-Env: prod }, remove: [X-Internal] }\n      response: { remove: [Server] }\n    rewrite: { strip_prefix: /api }\n");
-        cfg.validate().expect("valid");
-        let v = &cfg.vhosts[0];
-        assert_eq!(v.rate_limit.as_ref().unwrap().limit(), (10.0 / 60.0, 20.0));
-        assert_eq!(v.headers.as_ref().unwrap().request.set["X-Env"], "prod");
-        assert_eq!(v.rewrite.as_ref().unwrap().strip_prefix.as_deref(), Some("/api"));
-        assert_eq!(gw("    rate_limit: { requests: 5 }\n").vhosts[0].rate_limit.as_ref().unwrap().limit(), (5.0, 5.0));
-
-        let e = |body: &str| gw(body).validate().expect_err("invalid").to_string();
-        assert!(e("    rate_limit: { requests: 0 }\n").contains("requests must be at least 1"));
-        assert!(e("    rate_limit: { requests: 1, per: often }\n").contains("rate_limit.per"));
-        assert!(e("    headers: { request: { set: { 'Bad Name': x } } }\n").contains("not a valid header name"));
-        assert!(e("    headers: { response: { set: { X-A: \"a\\nb\" } } }\n").contains("not allowed in a header"));
-        assert!(e("    rewrite: { strip_prefix: api }\n").contains("starting with '/'"));
-        assert!(e("    rewrite: {}\n").contains("needs strip_prefix or add_prefix"));
-
-        let cfg = gw("    auth:\n      jwt: { secret: c2VjcmV0, issuer: https://i.test, claim_headers: { sub: X-Auth-Subject } }\n");
-        cfg.validate().expect("valid jwt");
-        let j = &cfg.vhosts[0].auth.as_ref().unwrap().jwt;
-        assert_eq!(j.header, "Authorization");
-        assert_eq!(j.leeway, "30s");
-        assert_eq!(j.secret_material().unwrap().unwrap(), b"secret");
-        assert!(e("    auth:\n      jwt: {}\n").contains("exactly one of"));
-        assert!(e("    auth:\n      jwt: { secret: a, public_key: /k.pem }\n").contains("exactly one of"));
-        assert!(e("    auth:\n      jwt: { secret: '***' }\n").contains("not base64"));
-        assert!(e("    auth:\n      jwt: { secret: c2VjcmV0, claim_headers: { sub: 'bad name' } }\n").contains("claim_headers"));
-        assert!(e("    auth:\n      jwt: { public_key: /nonexistent/jwt.pem }\n").contains("auth.jwt.public_key"));
     }
 
     #[test]
