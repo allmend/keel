@@ -81,6 +81,16 @@ fn requested_host(req: &pingora::http::RequestHeader) -> &str {
         .unwrap_or("")
 }
 
+/// `requested_host`, falling back to the caller's sentinel when the request
+/// names no host at all. Callers use `"*"` (the wildcard vhost) or `"_"` (the
+/// cache key), and folding it in here keeps a new caller from keying on "".
+fn requested_host_or<'a>(req: &'a pingora::http::RequestHeader, fallback: &'a str) -> &'a str {
+    match requested_host(req) {
+        "" => fallback,
+        h => h,
+    }
+}
+
 /// One RFC 7239 parameter value: a bare token where that is legal, else a
 /// quoted-string. IPv6 nodes must be quoted because of the brackets and
 /// colons, and `host` is whatever the client sent — unquoted, a Host of
@@ -320,10 +330,7 @@ impl ProxyHttp for KProxy {
             }
         }
 
-        let host = match requested_host(session.req_header()) {
-            "" => "*".to_owned(),
-            h => h.to_owned(),
-        };
+        let host = requested_host_or(session.req_header(), "*").to_owned();
 
         let routing = self.routing.load();
 
@@ -403,10 +410,7 @@ impl ProxyHttp for KProxy {
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
-        let host = match requested_host(ds.req_header()) {
-            "" => "*".to_owned(),
-            h => h.to_owned(),
-        };
+        let host = requested_host_or(ds.req_header(), "*").to_owned();
         let path = ds.req_header().uri.path().to_owned();
         let client_ip: Option<IpAddr> = ds
             .client_addr()
@@ -527,10 +531,7 @@ impl ProxyHttp for KProxy {
         // is set in `upstream_peer`, which pingora calls after this hook.
         let configured = {
             let req = session.req_header();
-            let host = match requested_host(req) {
-                "" => "*",
-                h => h,
-            };
+            let host = requested_host_or(req, "*");
             self.routing.load().cache_config(host, req.uri.path()).is_some()
         };
         if !configured {
@@ -547,10 +548,7 @@ impl ProxyHttp for KProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<CacheKey> {
         let req = session.req_header();
-        let host = match requested_host(req) {
-            "" => "_",
-            h => h,
-        };
+        let host = requested_host_or(req, "_");
         let path = req
             .uri
             .path_and_query()
@@ -973,8 +971,10 @@ fn build_tls_settings(
     settings
 }
 
-/// Required by `TlsSettings::with_callbacks`, which is the file-free way to
-/// build settings; certificate selection happens in the resolver instead.
+/// `with_callbacks` is the only `TlsSettings` constructor that does not demand
+/// certificate files. What it takes is a post-handshake hook, which pingora's
+/// rustls backend never consults for certificate selection — the resolver set
+/// above does that — so this implementation has nothing to do.
 struct NoTlsCallback;
 
 #[async_trait]
@@ -1201,20 +1201,33 @@ impl pingora::apps::ServerApp for ProxyProtocolApp {
         mut stream: pingora::protocols::Stream,
         shutdown: &pingora::server::ShutdownWatch,
     ) -> Option<pingora::protocols::Stream> {
-        match crate::proxy_protocol::read_from_stream(&mut *stream).await {
-            Ok(Some((src, _))) => {
-                let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
-                let _ = digest.peer_addr.set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
-                stream.set_socket_digest(digest);
-            }
-            Ok(None) => {} // LOCAL / UNKNOWN: the socket peer is the client
-            Err(e) => {
-                tracing::debug!(listener = self.listener, error = ?e, "proxy_protocol: connection rejected");
-                crate::metrics::record_proxy_protocol_error(&self.listener);
-                return None;
-            }
-        }
+        apply_proxy_header(&mut *stream, &self.listener).await.ok()?;
         pingora::apps::ServerApp::process_new(&self.inner, stream, shutdown).await
+    }
+}
+
+/// Read the PROXY header and, when it names a client, make that address the
+/// stream's peer. Shared by the plain and TLS listeners so a change to the
+/// digest handling cannot reach one and miss the other.
+async fn apply_proxy_header<S: pingora::protocols::IO + ?Sized>(
+    stream: &mut S,
+    listener: &str,
+) -> Result<(), ()> {
+    match crate::proxy_protocol::read_from_stream(stream).await {
+        Ok(Some((src, _))) => {
+            let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
+            let _ = digest
+                .peer_addr
+                .set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
+            stream.set_socket_digest(digest);
+            Ok(())
+        }
+        Ok(None) => Ok(()), // LOCAL / UNKNOWN: the socket peer is the client
+        Err(e) => {
+            tracing::debug!(listener, error = ?e, "proxy_protocol: connection rejected");
+            crate::metrics::record_proxy_protocol_error(listener);
+            Err(())
+        }
     }
 }
 
@@ -1232,23 +1245,9 @@ impl pingora::listeners::PreTlsProcess for ProxyProtocolPreTls {
         &self,
         stream: &mut pingora::protocols::l4::stream::Stream,
     ) -> pingora::Result<()> {
-        use pingora::protocols::{GetSocketDigest, UniqueID};
-        match crate::proxy_protocol::read_from_stream(stream).await {
-            Ok(Some((src, _))) => {
-                let digest = pingora::protocols::SocketDigest::from_raw_fd(stream.id());
-                let _ = digest
-                    .peer_addr
-                    .set(Some(pingora::protocols::l4::socket::SocketAddr::Inet(src)));
-                stream.set_socket_digest(digest);
-                Ok(())
-            }
-            Ok(None) => Ok(()), // LOCAL / UNKNOWN: the socket peer is the client
-            Err(e) => {
-                tracing::debug!(listener = self.listener, error = ?e, "proxy_protocol: connection rejected");
-                crate::metrics::record_proxy_protocol_error(&self.listener);
-                Err(Error::explain(ErrorType::ConnectProxyFailure, "invalid PROXY protocol header"))
-            }
-        }
+        apply_proxy_header(stream, &self.listener).await.map_err(|_| {
+            Error::explain(ErrorType::ConnectProxyFailure, "invalid PROXY protocol header")
+        })
     }
 }
 

@@ -225,19 +225,28 @@ impl UdpProxyService {
                 self.close_flow(client, flow, None);
             }
         }
-        if !flows.contains_key(&client) && flows.len() >= self.max_flows {
-            // Opening one costs a socket and a task, and the worker's HTTP and
-            // TCP listeners share its descriptors. Existing flows keep working.
-            debug!(pool = self.pool, listener = self.listener, client = %client, flows = flows.len(), "udp: flow limit reached, datagram dropped");
-            crate::metrics::record_udp_error(&self.pool, "flow_limit");
-            return;
-        }
-        if let std::collections::hash_map::Entry::Vacant(e) = flows.entry(client) {
-            let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };
-            e.insert(flow);
-        }
-
-        let flow = flows.get(&client).expect("flow inserted above");
+        // One lookup: the limit is checked in the vacant arm, so a datagram on an
+        // established flow pays a single hash and the "inserted above" invariant
+        // no longer has to hold across three separate lookups.
+        let open = flows.len();
+        let flow = match flows.entry(client) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                if open >= self.max_flows {
+                    // Opening one costs a socket and a task, and the worker's HTTP
+                    // and TCP listeners share its descriptors. Existing flows keep
+                    // working.
+                    debug!(pool = self.pool, listener = self.listener, client = %client, flows = open, "udp: flow limit reached, datagram dropped");
+                    crate::metrics::record_udp_error(&self.pool, "flow_limit");
+                    // The other three drop paths log; an operator investigating
+                    // dropped traffic reads the access log, not just Prometheus.
+                    self.log(client, None, &FlowStats::new(now), Some("flow_limit"));
+                    return;
+                }
+                let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };
+                e.insert(flow)
+            }
+        };
         match flow.upstream.send(data).await {
             Ok(sent) => {
                 flow.stats.record_in(now, sent);

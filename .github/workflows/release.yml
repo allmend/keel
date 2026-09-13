@@ -264,10 +264,10 @@ jobs:
             echo
             echo "Verify with \`sha256sum -c SHA256SUMS\`."
             echo
-            echo "keel binaries for FreeBSD are not yet provided: pingora-core pins a nix"
-            echo "version that does not compile for FreeBSD against current libc. Planned"
-            echo "once upstream updates. keelctl (the remote control CLI) has no such"
-            echo "dependency and ships for FreeBSD, macOS, and Linux."
+            echo "The FreeBSD keel binary is best-effort: the target builds again since"
+            echo "pingora 0.9 moved to a nix release that compiles there, and its build leg"
+            echo "may fail without holding back a release. keelctl ships for FreeBSD, macOS,"
+            echo "and Linux."
           } > notes.md
 
       - name: Create release

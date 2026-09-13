@@ -410,6 +410,7 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
 /// Handles one plain-TCP join request from a new node.
 async fn handle_join(
     mut stream: TcpStream,
+    deadline: tokio::time::Instant,
     expected_secret: &str,
     ca: &Ca,
     raft: Arc<ClusterRaft>,
@@ -419,7 +420,7 @@ async fn handle_join(
         // Only the unauthenticated read is bounded. Everything after the AEAD
         // open is work for a peer that has proven it holds the secret, and the
         // promotion at the end of this function legitimately takes minutes.
-        let buf = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream, MAX_JOIN_FRAME))
+        let buf = tokio::time::timeout_at(deadline, read_frame(&mut stream, MAX_JOIN_FRAME))
             .await
             .map_err(|_| {
                 anyhow::anyhow!("join request not received within {}s", HANDSHAKE_TIMEOUT.as_secs())
@@ -639,12 +640,15 @@ impl ClusterService {
                                 // deadline, so a peer that connects and stalls cannot
                                 // hold the slot. The peer RPC session that follows a
                                 // successful handshake is long-lived and is not bounded.
-                                let limit = HANDSHAKE_TIMEOUT;
+                                // One deadline for the whole unauthenticated phase. A fresh
+                                // timeout per step would let a peer that dribbles a byte late in
+                                // the peek hold a slot for twice the stated budget.
+                                let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
                                 // Peek first byte: 0x16 = TLS ClientHello, otherwise join (JSON).
                                 let mut peek = [0u8; 1];
-                                match tokio::time::timeout(limit, stream.peek(&mut peek)).await {
+                                match tokio::time::timeout_at(deadline, stream.peek(&mut peek)).await {
                                     Ok(Ok(1)) if peek[0] == 0x16 => {
-                                        match tokio::time::timeout(limit, acceptor2.accept(stream)).await {
+                                        match tokio::time::timeout_at(deadline, acceptor2.accept(stream)).await {
                                             Ok(Ok(tls)) => handle_peer(tls, raft2).await,
                                             Ok(Err(e)) => warn!(peer = %peer_addr, error = %e, "cluster: TLS accept error"),
                                             Err(_) => warn!(peer = %peer_addr, "cluster: TLS handshake timed out"),
@@ -652,10 +656,11 @@ impl ClusterService {
                                     }
                                     Ok(Ok(_)) => {
                                         if let Some(ref ca_arc) = ca2 {
-                                            // Not wrapped in `limit`: handle_join issues certs and
-                                            // then waits for the joiner's log to catch up before
-                                            // promoting it to voter. It bounds its own read.
-                                            handle_join(stream, &secret2, ca_arc, raft2).await;
+                                            // Not deadlined as a whole: handle_join issues certs
+                                            // and then waits for the joiner's log to catch up before
+                                            // promoting it to voter. It applies `deadline` to its
+                                            // own unauthenticated read.
+                                            handle_join(stream, deadline, &secret2, ca_arc, raft2).await;
                                         } else {
                                             warn!(peer = %peer_addr, "cluster: plain join but no CA (not bootstrap node)");
                                         }

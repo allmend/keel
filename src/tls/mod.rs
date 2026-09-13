@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_pem_is_rejected_and_unsupported_keys_only_lose_the_rustls_view() {
+    fn bad_pem_is_rejected_but_a_mismatched_key_is_not_caught_until_handshake() {
         assert!(CertPair::from_pem(b"nope", b"nope", "x").is_err());
         let (c, _) = pem_pair("a.example");
         let (_, other_key) = pem_pair("b.example");
