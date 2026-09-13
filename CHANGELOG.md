@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.15.0] — 2026-09-13
+
 ### Added
 
 - **PROXY protocol on `tls: true` listeners.** The header is read before the
@@ -17,6 +21,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   connection; pingora 0.9's pre-TLS callback is what makes it possible. Such
   listeners get their own proxy service, so a TLS listener without
   `proxy_protocol` still never demands a header.
+- **HTTP/2 on TLS listeners.** The listeners advertise `h2` by ALPN, so an
+  h2-capable client no longer falls back to HTTP/1.1 over HTTPS. They offered
+  no ALPN at all before, on either TLS backend.
 - **FreeBSD binaries again.** `x86_64-unknown-freebsd` builds now that pingora
   0.9 moved `nix` 0.24 → 0.31; the old pin did not compile against modern
   libc's FreeBSD kevent ABI. Releases carry a FreeBSD keel binary alongside
@@ -52,6 +59,34 @@ Versioning: [Semantic Versioning](https://semver.org/).
   stricter request-target and header validation applies. See pingora's
   0.9.0 release notes.
 - Minimum supported Rust is now 1.85 (1.88 for some pingora crates).
+
+### Fixed
+
+- **HTTP/2 requests could not be routed to a vhost.** The name arrives in
+  `:authority` on h2, and every site that resolved it read the `Host` header
+  alone, so such requests fell through to the wildcard vhost — a 502 where
+  none is configured. Routing, the vhost label, the cache rule lookup and the
+  cache key all consider the authority now.
+- **Cached entries did not distinguish http from https.** A vhost served on
+  both ports shared them, so an origin answering by `X-Forwarded-Proto` could
+  have its http response served to https clients. The scheme is part of the
+  cache key.
+- **`Forwarded` header values were not quoted.** An IPv6 client produced
+  `for=2001:db8::1`, which RFC 7239 requires bracketed and quoted, and the
+  `host` parameter carried the client's Host verbatim — so a Host of
+  `x;for=1.2.3.4` could add parameters to a header the backend trusts.
+- **`RUST_LOG` could not raise Keel's own log level.** A `keel=info`
+  directive was appended after reading the variable and won, making every
+  `debug!` in Keel unreachable. `RUST_LOG` now governs when set.
+- **Unauthenticated handshakes had no deadline.** A peer that connected to the
+  cluster port or the remote-control listener and sent nothing held the
+  connection indefinitely. Each pre-authentication step is bounded now (10s
+  cluster, 5s control); established peer sessions are unaffected.
+- **The UDP flow table had no limit.** Each flow costs an upstream socket and
+  a task, so a flood from spoofed source addresses could exhaust a worker's
+  descriptors, which its HTTP and TCP listeners share. `keel.udp_max_flows`
+  (default 8192) bounds it; refusals count in
+  `keel_udp_errors_total{reason="flow_limit"}`.
 
 ---
 
@@ -659,7 +694,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/allmend/keel/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/allmend/keel/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/allmend/keel/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/allmend/keel/compare/v0.13.1...v0.13.2

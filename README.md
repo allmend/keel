@@ -24,7 +24,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
 ## Features
 
-- HTTP/1.1 + HTTP/2 reverse proxy
+- HTTP/1.1 + HTTP/2 reverse proxy — h2 offered over TLS by ALPN
 - Virtual host routing (SNI + Host header)
 - Path-based routing
 - Load balancing — round robin, weighted, consistent hash, least-conn
