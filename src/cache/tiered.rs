@@ -52,13 +52,23 @@ impl Storage for TieredStore {
         purge_type: PurgeType,
         trace: &SpanHandle,
     ) -> pingora::Result<PurgeOutcome> {
-        // Both tiers are asked; the entry is gone if either held it.
+        // Both tiers are asked, and the weakest outcome wins: if either still
+        // holds the entry as stale, the eviction manager must keep tracking it.
         let r1 = self.l1.purge(target, purge_type, trace).await?;
         let r2 = self.l2.purge(target, purge_type, trace).await?;
-        Ok(match (r1, r2) {
-            (PurgeOutcome::NotFound, PurgeOutcome::NotFound) => PurgeOutcome::NotFound,
-            _ => PurgeOutcome::Purged(None),
-        })
+        Ok(combine(r1, r2))
+    }
+
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        trace: &SpanHandle,
+    ) -> pingora::Result<PurgeOutcome> {
+        // Without this the default would delete from both tiers, losing the
+        // body a revalidation could have reused.
+        let r1 = self.l1.expire(target, trace).await?;
+        let r2 = self.l2.expire(target, trace).await?;
+        Ok(combine(r1, r2))
     }
 
     async fn update_meta(
@@ -75,6 +85,17 @@ impl Storage for TieredStore {
     fn support_streaming_partial_write(&self) -> bool { false }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) { self }
+}
+
+/// One outcome for two tiers. `Expired` outranks `Purged` because the entry
+/// still exists somewhere, and the eviction manager stops tracking what it is
+/// told was purged.
+fn combine(a: PurgeOutcome, b: PurgeOutcome) -> PurgeOutcome {
+    match (a, b) {
+        (PurgeOutcome::NotFound, PurgeOutcome::NotFound) => PurgeOutcome::NotFound,
+        (PurgeOutcome::Expired, _) | (_, PurgeOutcome::Expired) => PurgeOutcome::Expired,
+        _ => PurgeOutcome::Purged(None),
+    }
 }
 
 struct TieredMissHandler {

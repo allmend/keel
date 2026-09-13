@@ -5,9 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::cache::{
-    eviction::{lru::Manager, EvictionManager},
+    eviction::{lru::Manager, CacheEntryKey, CacheEntryKeyRef, EvictionManager},
     key::{CacheHashKey, CompactCacheKey},
-    eviction::{CacheEntryKey, CacheEntryKeyRef},
     storage::{HandleHit, HandleMiss, HitHandler, MissHandler, MissFinishType, PurgeOutcome, PurgeTarget, PurgeType},
     CacheMeta, CacheKey, Storage,
 };
@@ -265,13 +264,25 @@ impl Storage for DiskStore {
         let key = target.key();
         let hash = key.combined();
         let path = self.object_path(&hash);
-        self.eviction.remove(CacheEntryKeyRef::from_entry_id(key, None));
+        // The entry leaves the eviction manager only once its file is gone.
+        // Dropping it first and then failing to unlink would leave a file
+        // nothing tracks, so nothing would ever evict it.
         match fs::remove_file(&path).await {
-            Ok(_) => Ok(PurgeOutcome::Purged(None)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PurgeOutcome::NotFound),
+            Ok(_) => {
+                self.eviction.remove(CacheEntryKeyRef::from_entry_id(key, None));
+                Ok(PurgeOutcome::Purged(None))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.eviction.remove(CacheEntryKeyRef::from_entry_id(key, None));
+                Ok(PurgeOutcome::NotFound)
+            }
             Err(e) => {
                 warn!(error = %e, "disk cache: purge failed");
-                Ok(PurgeOutcome::NotFound)
+                Err(pingora::Error::because(
+                    pingora::ErrorType::InternalError,
+                    "disk cache purge",
+                    e,
+                ))
             }
         }
     }

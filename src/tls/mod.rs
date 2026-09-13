@@ -413,8 +413,8 @@ mod tests {
         assert!(CertPair::from_pem(b"nope", b"nope", "x").is_err());
         let (c, _) = pem_pair("a.example");
         let (_, other_key) = pem_pair("b.example");
-        // OpenSSL parses cert and key independently; rustls builds a key too.
-        // Mismatch is caught at handshake time, not here — both views exist.
+        // Building the key does not check that it matches the certificate;
+        // rustls catches that at handshake time, not at load.
         let pair = CertPair::from_pem(&c, &other_key, "x").unwrap();
         assert_eq!(pair.rustls.cert.len(), 1);
     }
