@@ -53,6 +53,11 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
 In the roadmap: HTTP/3.
 
+On hold since v0.14.0, after shipping earlier: API gateway rules (per-IP rate
+limiting, JWT auth, header and path rules) and ACME DNS-01, which is what
+wildcard issuance needs. Both were withdrawn rather than left half-owned and
+may return — see [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## Tech stack
@@ -157,6 +162,9 @@ vhosts:
       acme: true      # HTTP-01 challenge; renews automatically
 ```
 
+HTTP-01 is the only challenge, so ACME does not issue wildcards. A wildcard
+vhost serves a certificate you supply with `tls.cert`/`tls.key`.
+
 See [docs/acme.md](docs/acme.md) for named issuers (multiple CAs side by
 side), renewal tuning, and certificates for TCP/passthrough backends.
 
@@ -230,6 +238,13 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 ## Status
 
 Keel is at v0.14.0, alpha quality. Core proxy, TLS + ACME (HTTP-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, and protocol health checks with passive detection are implemented and working. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+
+v0.14.0 withdrew the API gateway rules and ACME DNS-01 (see above). Upgrading
+from 0.12.x or 0.13.x: delete `rate_limit`, `headers`, `rewrite`, and
+`auth.jwt` from your vhosts and routes, and `challenge`/`dns` from your ACME
+issuers. Keel ignores unknown keys rather than refusing them, so a config that
+keeps them starts normally with the rule no longer applied — the one case it
+does refuse is a wildcard vhost with `tls.acme`.
 
 ---
 

@@ -92,7 +92,9 @@ Failed issuance retries with exponential backoff (1 minute, doubling to a 6-hour
 
 - **Port 80 must reach Keel** for the hostname being issued. The CA fetches `http://<host>/.well-known/acme-challenge/<token>`, and Keel answers on any plain (non-TLS) listener, ahead of redirects and vhost routing.
 - **Resolvable DNS.** The CA resolves the hostname itself — public resolvers for a public CA, or whatever DNS an internal CA uses.
-- **No wildcards.** HTTP-01 cannot issue `*.example.com`. Use your own wildcard certificate for a wildcard vhost.
+- **No wildcards.** HTTP-01 cannot issue `*.example.com`. Use your own wildcard certificate for a wildcard vhost; a wildcard host with `tls.acme` is refused at load.
+
+DNS-01 (RFC 2136 + TSIG), which could issue wildcards, shipped in v0.10.0 and was withdrawn in v0.14.0. A leftover `challenge:` or `dns:` key on an issuer is ignored, and that issuer uses HTTP-01.
 
 ---
 
