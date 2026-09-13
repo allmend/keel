@@ -10,6 +10,33 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.14.0] — 2026-09-13
+
+Two features are withdrawn for now. Both may return; see the removal commits
+for the code.
+
+### Removed
+
+- **API gateway rules — BREAKING.** `rate_limit`, `headers`, `rewrite`, and
+  `auth.jwt` on vhosts and routes are gone, together with the
+  `keel_rate_limited_total` and `keel_auth_failures_total` metrics and
+  `docs/gateway.md`. Remove those keys from your
+  config before upgrading: they are unknown keys now, and Keel ignores unknown
+  keys rather than rejecting them, so a config that still carries them loads
+  and simply stops rate-limiting and authenticating. Until they return, put
+  rate limiting and authentication in front of Keel or in the backend.
+- **ACME DNS-01 and wildcard issuance — BREAKING.**
+  `acme.issuers.<name>.challenge` and `.dns` (RFC 2136 dynamic update with
+  TSIG) are gone; HTTP-01 is the only challenge. A wildcard vhost with
+  `tls.acme` is now rejected at load, since HTTP-01 cannot issue wildcards.
+  Wildcard vhost routing and wildcard SNI certificate selection are
+  unchanged: supply the certificate yourself with `tls.cert`/`tls.key`, or a
+  `certificates:` entry pointing at your own files. A leftover `challenge:` or
+  `dns:` key on an issuer is likewise ignored, and that issuer falls back to
+  HTTP-01 — which needs port 80 to reach Keel for every host it issues.
+
+---
+
 ## [0.13.3] — 2026-09-11
 
 ### Fixed
@@ -587,7 +614,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.13.3...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/allmend/keel/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/allmend/keel/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/allmend/keel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/allmend/keel/compare/v0.13.0...v0.13.1
