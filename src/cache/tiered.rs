@@ -3,8 +3,7 @@ use std::any::Any;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::cache::{
-    key::CompactCacheKey,
-    storage::{HandleMiss, HitHandler, MissHandler, MissFinishType, PurgeType},
+    storage::{HandleMiss, HitHandler, MissHandler, MissFinishType, PurgeOutcome, PurgeTarget, PurgeType},
     CacheMeta, CacheKey, MemCache, Storage,
 };
 use pingora::cache::trace::SpanHandle;
@@ -49,13 +48,17 @@ impl Storage for TieredStore {
 
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: PurgeTarget<'_>,
         purge_type: PurgeType,
         trace: &SpanHandle,
-    ) -> pingora::Result<bool> {
-        let r1 = self.l1.purge(key, purge_type, trace).await?;
-        let r2 = self.l2.purge(key, purge_type, trace).await?;
-        Ok(r1 || r2)
+    ) -> pingora::Result<PurgeOutcome> {
+        // Both tiers are asked; the entry is gone if either held it.
+        let r1 = self.l1.purge(target, purge_type, trace).await?;
+        let r2 = self.l2.purge(target, purge_type, trace).await?;
+        Ok(match (r1, r2) {
+            (PurgeOutcome::NotFound, PurgeOutcome::NotFound) => PurgeOutcome::NotFound,
+            _ => PurgeOutcome::Purged(None),
+        })
     }
 
     async fn update_meta(

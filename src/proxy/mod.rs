@@ -523,7 +523,14 @@ impl ProxyHttp for KProxy {
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        Ok(CacheKey::new(host.as_bytes().to_vec(), path.as_bytes().to_vec(), ""))
+        // 0.9 hashes `primary` alone, so the two components are length-framed
+        // rather than concatenated: without it "ex.com" + "/a/b" and "ex.com/a"
+        // + "/b" would collide.
+        let mut primary = Vec::with_capacity(4 + host.len() + path.len());
+        primary.extend_from_slice(&(host.len() as u32).to_be_bytes());
+        primary.extend_from_slice(host.as_bytes());
+        primary.extend_from_slice(path.as_bytes());
+        Ok(CacheKey::new(primary, ""))
     }
 
     fn response_cache_filter(

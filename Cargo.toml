@@ -17,7 +17,7 @@ path = "src/main.rs"
 # Control protocol shared with keelctl
 keel-control = { path = "crates/keel-control" }
 # Proxy framework
-pingora = { version = "0.8", features = ["lb", "openssl", "cache"] }
+pingora = { version = "0.9", features = ["lb", "openssl", "cache"] }
 async-trait = "0.1"
 
 # CLI

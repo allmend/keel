@@ -8,6 +8,27 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Pingora 0.8.1 → 0.9.0.** Keel's cache storage backends follow the new
+  `Storage` API: `purge` takes a `PurgeTarget` and reports a `PurgeOutcome`
+  instead of a bool, and the eviction manager tracks `CacheEntryKey` rather
+  than `CompactCacheKey`. `CacheKey::new` lost its namespace parameter, so
+  Keel now frames the host and path into the primary key itself
+  (length-prefixed, so `ex.com` + `/a/b` cannot collide with `ex.com/a` +
+  `/b`).
+- **Disk cache entries written by earlier versions are unreachable** after
+  this upgrade, because the cache key is computed differently. They are never
+  read and nothing deletes them, since the eviction manager's state lives in
+  memory: clear `cache.disk.path` when upgrading. The memory tier is
+  per-process and unaffected.
+- Upstream behaviour inherited from pingora 0.9: hop-by-hop and
+  Connection-nominated headers are stripped from upstream requests by
+  default, HTTP/2 server limits are bounded rather than unbounded, and
+  stricter request-target and header validation applies. See pingora's
+  0.9.0 release notes.
+- Minimum supported Rust is now 1.85 (1.88 for some pingora crates).
+
 ---
 
 ## [0.14.0] — 2026-09-13

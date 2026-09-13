@@ -7,7 +7,8 @@ use bytes::Bytes;
 use pingora::cache::{
     eviction::{lru::Manager, EvictionManager},
     key::{CacheHashKey, CompactCacheKey},
-    storage::{HandleHit, HandleMiss, HitHandler, MissHandler, MissFinishType, PurgeType},
+    eviction::{CacheEntryKey, CacheEntryKeyRef},
+    storage::{HandleHit, HandleMiss, HitHandler, MissHandler, MissFinishType, PurgeOutcome, PurgeTarget, PurgeType},
     CacheMeta, CacheKey, Storage,
 };
 use pingora::cache::trace::SpanHandle;
@@ -172,9 +173,13 @@ impl HandleMiss for DiskMiss {
         }
 
         // Drive eviction: remove any keys the LRU decides to evict.
-        let evicted = self.store.eviction.admit(self.compact_key.clone(), size, self.fresh_until);
+        let evicted = self.store.eviction.admit(
+            CacheEntryKey::key_only(self.compact_key.clone()),
+            size,
+            self.fresh_until,
+        );
         for key in evicted {
-            let evict_hash = key.combined();
+            let evict_hash = key.key().combined();
             let _ = fs::remove_file(self.store.object_path(&evict_hash)).await;
         }
 
@@ -224,8 +229,8 @@ impl Storage for DiskStore {
             range_end: body_len,
         };
 
-        let compact = key.to_compact();
-        self.eviction.access(&compact, body_len, meta.fresh_until());
+        let entry = CacheEntryKey::key_only(key.to_compact());
+        self.eviction.access(&entry, body_len, meta.fresh_until());
         Ok(Some((meta, Box::new(hit))))
     }
 
@@ -251,19 +256,22 @@ impl Storage for DiskStore {
 
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: PurgeTarget<'_>,
         _purge_type: PurgeType,
         _trace: &SpanHandle,
-    ) -> pingora::Result<bool> {
+    ) -> pingora::Result<PurgeOutcome> {
+        // One file per logical key, so an Active and an Exact target resolve to
+        // the same entry here.
+        let key = target.key();
         let hash = key.combined();
         let path = self.object_path(&hash);
-        self.eviction.remove(key);
+        self.eviction.remove(CacheEntryKeyRef::from_entry_id(key, None));
         match fs::remove_file(&path).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(_) => Ok(PurgeOutcome::Purged(None)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PurgeOutcome::NotFound),
             Err(e) => {
                 warn!(error = %e, "disk cache: purge failed");
-                Ok(false)
+                Ok(PurgeOutcome::NotFound)
             }
         }
     }
