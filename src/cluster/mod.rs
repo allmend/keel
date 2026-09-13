@@ -27,8 +27,11 @@ pub type ClusterRaft = Raft<TypeConfig>;
 
 // Wire-frame limits — every length-prefixed read is capped before allocating so a
 // peer-supplied length cannot drive a multi-gigabyte allocation (DoS).
-/// How long an unauthenticated peer has to complete its handshake — the TLS
-/// accept, or the whole join exchange — before the connection is dropped.
+/// How long an unauthenticated peer has to get past the first step: the
+/// first-byte peek, the TLS accept, or the join request itself. It must not
+/// cover anything after that — a joiner's promotion waits up to
+/// PROMOTE_TIMEOUT for log catch-up, and cancelling it leaves the node a
+/// learner for good.
 pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Join requests/responses are small JSON (secret + node id, or a few PEMs).
@@ -413,7 +416,14 @@ async fn handle_join(
 ) {
     let result = async {
         let key = join_key(expected_secret);
-        let buf = read_frame(&mut stream, MAX_JOIN_FRAME).await?;
+        // Only the unauthenticated read is bounded. Everything after the AEAD
+        // open is work for a peer that has proven it holds the secret, and the
+        // promotion at the end of this function legitimately takes minutes.
+        let buf = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream, MAX_JOIN_FRAME))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("join request not received within {}s", HANDSHAKE_TIMEOUT.as_secs())
+            })??;
 
         // Successful AEAD decryption proves the peer holds the shared secret. On
         // failure, still send a sealed rejection: a genuine joiner with the wrong
@@ -642,9 +652,10 @@ impl ClusterService {
                                     }
                                     Ok(Ok(_)) => {
                                         if let Some(ref ca_arc) = ca2 {
-                                            if tokio::time::timeout(limit, handle_join(stream, &secret2, ca_arc, raft2)).await.is_err() {
-                                                warn!(peer = %peer_addr, "cluster: join exchange timed out");
-                                            }
+                                            // Not wrapped in `limit`: handle_join issues certs and
+                                            // then waits for the joiner's log to catch up before
+                                            // promoting it to voter. It bounds its own read.
+                                            handle_join(stream, &secret2, ca_arc, raft2).await;
                                         } else {
                                             warn!(peer = %peer_addr, "cluster: plain join but no CA (not bootstrap node)");
                                         }
