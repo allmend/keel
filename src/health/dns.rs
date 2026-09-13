@@ -185,6 +185,67 @@ mod tests {
         assert_eq!(parse_response(&[0; 5], 7, 1), Err("short response".to_owned()));
     }
 
+    /// Deterministic xorshift. A fixed seed keeps any failure reproducible and
+    /// costs no dev-dependency; the property asserted is survival, not values.
+    struct Fuzz(u64);
+
+    impl Fuzz {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 24) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let len = self.below(max);
+            (0..len).map(|_| self.byte()).collect()
+        }
+    }
+
+    #[test]
+    fn parse_response_survives_arbitrary_and_mutated_input() {
+        // A probe parses whatever the resolver — or anything that can answer
+        // before it — puts on the wire.
+        let mut f = Fuzz(0x0bad_c0de_0bad_c0de);
+        for _ in 0..10_000 {
+            let buf = f.bytes(120);
+            if let Ok(addrs) = parse_response(&buf, 7, 1) {
+                assert!(addrs.iter().all(|a| a.is_ipv4()), "A query returned a non-A answer");
+            }
+        }
+
+        // Mutating a valid response reaches the record walk, which uniform noise
+        // rarely gets past.
+        let q = build_query(7, "example.com", 1);
+        let valid = response(&q, 0, &[[93, 184, 216, 34], [10, 0, 0, 1]]);
+        for _ in 0..10_000 {
+            let mut buf = valid.clone();
+            match f.below(3) {
+                0 => {
+                    let i = f.below(buf.len());
+                    buf[i] = f.byte();
+                }
+                1 => {
+                    let cut = f.below(buf.len() + 1);
+                    buf.truncate(cut);
+                }
+                _ => {
+                    let i = f.below(buf.len() + 1);
+                    buf.insert(i, f.byte());
+                }
+            }
+            let _ = parse_response(&buf, 7, 1);
+        }
+    }
+
     #[tokio::test]
     async fn udp_probe_against_a_fake_resolver() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();

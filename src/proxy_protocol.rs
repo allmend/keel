@@ -259,6 +259,83 @@ mod tests {
         (client, pingora::protocols::l4::stream::Stream::from(server))
     }
 
+
+    /// Deterministic xorshift. A fixed seed keeps a failure reproducible and
+    /// costs no dev-dependency; these tests assert the parser survives input it
+    /// never sees in the fixtures, not that it produces particular values.
+    struct Fuzz(u64);
+
+    impl Fuzz {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 24) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let len = self.below(max);
+            (0..len).map(|_| self.byte()).collect()
+        }
+    }
+
+    #[test]
+    fn parse_survives_arbitrary_bytes() {
+        let mut f = Fuzz(0x5eed_1234_dead_beef);
+        for _ in 0..20_000 {
+            let buf = f.bytes(140);
+            if let Ok(h) = parse(&buf) {
+                assert!(h.consumed <= buf.len(), "consumed {} of {}", h.consumed, buf.len());
+            }
+        }
+    }
+
+    #[test]
+    fn parse_survives_mutated_valid_headers() {
+        // Corrupting headers the parser accepts reaches branches uniform noise
+        // almost never hits: the v2 length field, the v1 field split, family
+        // and command bytes.
+        let mut body = vec![203, 0, 113, 42, 10, 0, 0, 1];
+        body.extend_from_slice(&12345u16.to_be_bytes());
+        body.extend_from_slice(&80u16.to_be_bytes());
+        let seeds: Vec<Vec<u8>> = vec![
+            b"PROXY TCP4 203.0.113.42 10.0.0.1 12345 80\r\n".to_vec(),
+            b"PROXY TCP6 2001:db8::1 2001:db8::2 1 2\r\n".to_vec(),
+            b"PROXY UNKNOWN\r\n".to_vec(),
+            v2(1, 1, &body),
+            v2(1, 2, &[0u8; 36]),
+            v2(0, 0, &[1, 2, 3]),
+        ];
+        let mut f = Fuzz(0x1234_5678_9abc_def0);
+        for _ in 0..20_000 {
+            let mut buf = seeds[f.below(seeds.len())].clone();
+            match f.below(3) {
+                0 if !buf.is_empty() => {
+                    let i = f.below(buf.len());
+                    buf[i] = f.byte();
+                }
+                1 => {
+                    let cut = f.below(buf.len() + 1);
+                    buf.truncate(cut);
+                }
+                _ => {
+                    let i = f.below(buf.len() + 1);
+                    buf.insert(i, f.byte());
+                }
+            }
+            if let Ok(h) = parse(&buf) {
+                assert!(h.consumed <= buf.len(), "consumed {} of {}", h.consumed, buf.len());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_peer_that_sends_nothing_times_out() {
         let (_client, mut stream) = accepted_pair().await;

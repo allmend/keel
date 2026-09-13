@@ -48,6 +48,44 @@ pub fn rcode_name(rcode: u16) -> String {
 mod tests {
     use super::*;
 
+    /// Deterministic xorshift. A fixed seed keeps any failure reproducible and
+    /// costs no dev-dependency; the property asserted is survival, not values.
+    struct Fuzz(u64);
+
+    impl Fuzz {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 24) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let len = self.below(max);
+            (0..len).map(|_| self.byte()).collect()
+        }
+    }
+
+    #[test]
+    fn skip_name_survives_arbitrary_bytes() {
+        // Pointers are counted, not chased, so a pointer near the end may report
+        // a position past the buffer — every caller bounds-checks what it reads
+        // next. The property here is only that walking a name always returns.
+        let mut f = Fuzz(0xfeed_face_1234_5678);
+        for _ in 0..20_000 {
+            let buf = f.bytes(80);
+            let pos = f.below(buf.len() + 4);
+            let _ = skip_name(&buf, pos);
+        }
+    }
+
     #[test]
     fn names_round_trip() {
         assert_eq!(encode_name("example.com."), b"\x07example\x03com\x00");
