@@ -47,9 +47,9 @@ keel:
 
 On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
-`udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. `udp_max_flows` caps how many flows one worker holds at once — each costs an upstream socket and a task, and the worker's HTTP and TCP listeners share its descriptors. Both must be at least 1. See [UDP proxying](udp-proxying.md).
+`udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. `udp_max_flows` caps how many flows each UDP listener holds at once — each costs an upstream socket and a task, and the worker's HTTP and TCP listeners share its descriptors, so a worker's ceiling is this value times the number of `udp_pool` listeners. Both must be at least 1. See [UDP proxying](udp-proxying.md).
 
-Changing `workers` or `udp_flow_timeout_seconds` requires a process restart. All other settings can be changed via hot reload.
+Changing `workers`, `udp_flow_timeout_seconds`, or `udp_max_flows` requires a process restart. All other settings can be changed via hot reload.
 
 ---
 
@@ -400,6 +400,7 @@ What requires a process restart:
 - Listener ports (`listeners[].address`)
 - Worker count (`keel.workers`)
 - Process user/group (`keel.user`, `keel.group`)
+- UDP flow settings (`keel.udp_flow_timeout_seconds`, `keel.udp_max_flows`) — read once when the UDP services are built
 
 Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
 

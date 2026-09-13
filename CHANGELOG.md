@@ -8,6 +8,23 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A joining cluster node was never promoted to voter.** The handshake
+  deadline added in 0.15.0 wrapped the whole join exchange, including the
+  promotion that waits for the new learner's log to catch up — so any catch-up
+  longer than 10s left the node a permanent learner. The bootstrap node stayed
+  the only voter and a three-node cluster ran on quorum 1 of 1, losing config
+  writes if that node died. The deadline now covers only the unauthenticated
+  read.
+- Documentation contradictions from 0.15.0: the PROXY protocol section of
+  [virtual-hosts.md](docs/virtual-hosts.md) still said the option was
+  unavailable on `tls: true` listeners, and the 0.15.0 entry below claimed no
+  ALPN was offered while the same release began advertising h2.
+- `keel.udp_max_flows` is documented as what it is: a per-listener cap read at
+  startup, so a worker's ceiling is that value times the number of `udp_pool`
+  listeners, and changing it needs a restart like the other UDP settings.
+
 ---
 
 ## [0.15.1] — 2026-09-13
@@ -58,7 +75,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   probe, control-plane client CNs), so builds still need it. The certificate
   store keeps one rustls view instead of two: a key rustls cannot use is now
   rejected at load rather than silently served to proxy listeners only. TLS
-  1.2 stays the floor and no ALPN is offered, both as before.
+  1.2 stays the floor, as before; ALPN advertises h2, which these listeners
+  did not do on either backend until this release (see above).
 - **Pingora 0.8.1 → 0.9.0.** Keel's cache storage backends follow the new
   `Storage` API: `purge` takes a `PurgeTarget` and reports a `PurgeOutcome`
   instead of a bool, and the eviction manager tracks `CacheEntryKey` rather

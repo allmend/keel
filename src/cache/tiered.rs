@@ -64,8 +64,10 @@ impl Storage for TieredStore {
         target: PurgeTarget<'_>,
         trace: &SpanHandle,
     ) -> pingora::Result<PurgeOutcome> {
-        // Without this the default would delete from both tiers, losing the
-        // body a revalidation could have reused.
+        // The inherited default would purge both tiers. This keeps L1's body
+        // for a revalidation; L2 implements no expire of its own, so its copy
+        // is still deleted. Unreachable today — `is_purge` is never overridden,
+        // so pingora never calls expire.
         let r1 = self.l1.expire(target, trace).await?;
         let r2 = self.l2.expire(target, trace).await?;
         Ok(combine(r1, r2))

@@ -554,10 +554,11 @@ pub struct KeelConfig {
     #[serde(default = "default_udp_flow_timeout")]
     pub udp_flow_timeout_seconds: u64,
 
-    /// Most UDP flows one worker will hold open at once. A flow costs an
-    /// upstream socket and a task, so an unbounded table lets a datagram
-    /// flood from spoofed sources exhaust the worker's descriptors — which
-    /// its HTTP and TCP listeners share.
+    /// Most UDP flows each `udp_pool` listener will hold open at once (a
+    /// worker runs one service per such listener). A flow costs an upstream
+    /// socket and a task, so an unbounded table lets a datagram flood from
+    /// spoofed sources exhaust the worker's descriptors — which its HTTP and
+    /// TCP listeners share.
     #[serde(default = "default_udp_max_flows")]
     pub udp_max_flows: usize,
 }
