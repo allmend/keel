@@ -1,0 +1,40 @@
+# Every push to main and every pull request. The release pipeline builds
+# artifacts; this is the gate that says the code still works, so a regression
+# is caught before a tag exists rather than after.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Pingora's tree needs cmake (libz-ng-sys) and keel links OpenSSL for
+      # X509 parsing. Both are usually present on the runner image; installing
+      # them explicitly keeps the job from depending on that.
+      - name: Build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends libssl-dev pkg-config cmake
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
