@@ -24,6 +24,9 @@ use crate::config::RemoteControlConfig;
 use crate::control::ca::ControlCa;
 use crate::control::Dispatch;
 
+/// How long a client has to complete the TLS handshake after connecting.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct RemoteControlServer {
     pub cfg: RemoteControlConfig,
     pub dispatch: Arc<Dispatch>,
@@ -99,10 +102,18 @@ impl RemoteControlServer {
                     let acceptor = tokio_rustls::TlsAcceptor::from(tls.load_full());
                     let dispatch = Arc::clone(&self.dispatch);
                     tokio::spawn(async move {
-                        let tls_stream = match acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
+                        // An operator that connects and stalls must not hold a
+                        // slot on the master's runtime indefinitely.
+                        let handshake =
+                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream));
+                        let tls_stream = match handshake.await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
                                 warn!(peer = %peer, error = %e, "control: TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!(peer = %peer, "control: TLS handshake timed out");
                                 return;
                             }
                         };

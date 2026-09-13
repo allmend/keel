@@ -27,6 +27,10 @@ pub type ClusterRaft = Raft<TypeConfig>;
 
 // Wire-frame limits — every length-prefixed read is capped before allocating so a
 // peer-supplied length cannot drive a multi-gigabyte allocation (DoS).
+/// How long an unauthenticated peer has to complete its handshake — the TLS
+/// accept, or the whole join exchange — before the connection is dropped.
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Join requests/responses are small JSON (secret + node id, or a few PEMs).
 pub(crate) const MAX_JOIN_FRAME: usize = 64 * 1024; // 64 KiB
 /// Raft AppendEntries / InstallSnapshot can be larger; still bounded.
@@ -621,23 +625,32 @@ impl ClusterService {
                             let ca2 = ca.clone();
 
                             tokio::spawn(async move {
+                                // Everything before a peer is authenticated gets a
+                                // deadline, so a peer that connects and stalls cannot
+                                // hold the slot. The peer RPC session that follows a
+                                // successful handshake is long-lived and is not bounded.
+                                let limit = HANDSHAKE_TIMEOUT;
                                 // Peek first byte: 0x16 = TLS ClientHello, otherwise join (JSON).
                                 let mut peek = [0u8; 1];
-                                match stream.peek(&mut peek).await {
-                                    Ok(1) if peek[0] == 0x16 => {
-                                        match acceptor2.accept(stream).await {
-                                            Ok(tls) => handle_peer(tls, raft2).await,
-                                            Err(e) => warn!(peer = %peer_addr, error = %e, "cluster: TLS accept error"),
+                                match tokio::time::timeout(limit, stream.peek(&mut peek)).await {
+                                    Ok(Ok(1)) if peek[0] == 0x16 => {
+                                        match tokio::time::timeout(limit, acceptor2.accept(stream)).await {
+                                            Ok(Ok(tls)) => handle_peer(tls, raft2).await,
+                                            Ok(Err(e)) => warn!(peer = %peer_addr, error = %e, "cluster: TLS accept error"),
+                                            Err(_) => warn!(peer = %peer_addr, "cluster: TLS handshake timed out"),
                                         }
                                     }
-                                    Ok(_) => {
+                                    Ok(Ok(_)) => {
                                         if let Some(ref ca_arc) = ca2 {
-                                            handle_join(stream, &secret2, ca_arc, raft2).await;
+                                            if tokio::time::timeout(limit, handle_join(stream, &secret2, ca_arc, raft2)).await.is_err() {
+                                                warn!(peer = %peer_addr, "cluster: join exchange timed out");
+                                            }
                                         } else {
                                             warn!(peer = %peer_addr, "cluster: plain join but no CA (not bootstrap node)");
                                         }
                                     }
-                                    Err(e) => warn!(peer = %peer_addr, error = %e, "cluster: peek error"),
+                                    Ok(Err(e)) => warn!(peer = %peer_addr, error = %e, "cluster: peek error"),
+                                    Err(_) => warn!(peer = %peer_addr, "cluster: handshake timed out"),
                                 }
                             });
                         }
