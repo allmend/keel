@@ -196,6 +196,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Fuzz;
 
     #[test]
     fn v1_examples_from_the_spec() {
@@ -259,32 +260,6 @@ mod tests {
         (client, pingora::protocols::l4::stream::Stream::from(server))
     }
 
-
-    /// Deterministic xorshift. A fixed seed keeps a failure reproducible and
-    /// costs no dev-dependency; these tests assert the parser survives input it
-    /// never sees in the fixtures, not that it produces particular values.
-    struct Fuzz(u64);
-
-    impl Fuzz {
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn byte(&mut self) -> u8 {
-            (self.next() >> 24) as u8
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-        fn bytes(&mut self, max: usize) -> Vec<u8> {
-            let len = self.below(max);
-            (0..len).map(|_| self.byte()).collect()
-        }
-    }
 
     #[test]
     fn parse_survives_arbitrary_bytes() {

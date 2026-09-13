@@ -129,3 +129,29 @@ impl HandleMiss for TieredMissHandler {
         Ok(l1_result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Telling the eviction manager an entry was purged makes it stop tracking
+    // it, so a tier that kept the entry stale must win over one that deleted it.
+    #[test]
+    fn expired_outranks_purged_in_either_position() {
+        use PurgeOutcome::{Expired, NotFound, Purged};
+        assert_eq!(combine(Expired, Purged(None)), Expired);
+        assert_eq!(combine(Purged(None), Expired), Expired);
+        assert_eq!(combine(Expired, NotFound), Expired);
+        assert_eq!(combine(NotFound, Expired), Expired);
+        assert_eq!(combine(Expired, Expired), Expired);
+    }
+
+    #[test]
+    fn not_found_only_when_neither_tier_held_the_entry() {
+        use PurgeOutcome::{NotFound, Purged};
+        assert_eq!(combine(NotFound, NotFound), NotFound);
+        assert_eq!(combine(Purged(None), NotFound), Purged(None));
+        assert_eq!(combine(NotFound, Purged(None)), Purged(None));
+        assert_eq!(combine(Purged(None), Purged(None)), Purged(None));
+    }
+}

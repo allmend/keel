@@ -12,6 +12,8 @@ mod metrics;
 mod process;
 mod proxy;
 mod proxy_protocol;
+#[cfg(test)]
+mod testutil;
 mod tls;
 mod udp;
 mod vhost;

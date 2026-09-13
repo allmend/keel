@@ -139,6 +139,7 @@ pub fn parse_response(buf: &[u8], id: u16, qtype: u16) -> Result<Vec<IpAddr>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Fuzz;
 
     /// A response to `query` with the given RCODE and A answers, using a
     /// compression pointer for the answer names like real servers do.
@@ -183,31 +184,6 @@ mod tests {
         cut.truncate(cut.len() - 2);
         assert_eq!(parse_response(&cut, 7, 1), Err("truncated rdata".to_owned()));
         assert_eq!(parse_response(&[0; 5], 7, 1), Err("short response".to_owned()));
-    }
-
-    /// Deterministic xorshift. A fixed seed keeps any failure reproducible and
-    /// costs no dev-dependency; the property asserted is survival, not values.
-    struct Fuzz(u64);
-
-    impl Fuzz {
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn byte(&mut self) -> u8 {
-            (self.next() >> 24) as u8
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-        fn bytes(&mut self, max: usize) -> Vec<u8> {
-            let len = self.below(max);
-            (0..len).map(|_| self.byte()).collect()
-        }
     }
 
     #[test]

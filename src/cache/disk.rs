@@ -320,3 +320,71 @@ impl Storage for DiskStore {
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) { self }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::Fuzz;
+
+    #[test]
+    fn entries_round_trip() {
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"internal", b"header", b"body"),
+            (&[], &[], &[]),
+            (b"i", &[], b"body only"),
+            (&[], b"h", &[]),
+        ];
+        for (i, h, b) in cases {
+            let (di, dh, db) = decode_entry(&encode_entry(i, h, b)).expect("round trip");
+            assert_eq!((di.as_slice(), dh.as_slice(), db.as_slice()), (*i, *h, *b));
+        }
+    }
+
+    #[test]
+    fn decode_survives_arbitrary_bytes() {
+        // Anything in a shard directory reaches this parser: a partial write, a
+        // file truncated by a full disk, or an unrelated file someone dropped in.
+        let mut f = Fuzz(0xd15c_0000_d15c_0000);
+        for _ in 0..20_000 {
+            let buf = f.bytes(64);
+            if let Some((i, h, b)) = decode_entry(&buf) {
+                // The framing is canonical, so whatever decodes must re-encode
+                // to the exact same bytes.
+                assert_eq!(encode_entry(&i, &h, &b), buf);
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_is_rejected_before_the_body_and_only_shortens_it_after() {
+        let full = encode_entry(b"internal", b"header", b"0123456789");
+        let prefix = 4 + b"internal".len() + 4 + b"header".len();
+        for cut in 0..full.len() {
+            match decode_entry(&full[..cut]) {
+                None => assert!(cut < prefix, "rejected a decodable prefix at {cut}"),
+                Some((i, h, b)) => {
+                    assert!(cut >= prefix, "decoded a short prefix at {cut}");
+                    assert_eq!(i, b"internal");
+                    assert_eq!(h, b"header");
+                    assert_eq!(b.len(), cut - prefix, "body should be the truncated tail");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paths_shard_by_the_first_two_hash_characters() {
+        let eviction: &'static Manager<16> =
+            Box::leak(Box::new(Manager::<16>::with_capacity(1024, 16)));
+        let store = DiskStore::new("/var/cache/keel", eviction);
+        let hash = "abcdef0123456789";
+        assert_eq!(
+            store.object_path(hash),
+            PathBuf::from("/var/cache/keel/ab/abcdef0123456789.keel")
+        );
+        assert_eq!(
+            store.temp_path(hash),
+            PathBuf::from("/var/cache/keel/ab/abcdef0123456789.keel.tmp")
+        );
+    }
+}
