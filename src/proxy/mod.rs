@@ -70,6 +70,17 @@ pub struct KProxy {
     acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
+/// The name the client asked for: the `Host` header, or HTTP/2's `:authority`
+/// when there is none. h2 carries the name only in the authority, so reading
+/// the header alone sent every h2 request to the wildcard vhost.
+fn requested_host(req: &pingora::http::RequestHeader) -> &str {
+    req.headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri.authority().map(|a| a.as_str()))
+        .unwrap_or("")
+}
+
 /// One RFC 7239 parameter value: a bare token where that is legal, else a
 /// quoted-string. IPv6 nodes must be quoted because of the brackets and
 /// colons, and `host` is whatever the client sent — unquoted, a Host of
@@ -309,13 +320,10 @@ impl ProxyHttp for KProxy {
             }
         }
 
-        let host = session
-            .req_header()
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("*")
-            .to_owned();
+        let host = match requested_host(session.req_header()) {
+            "" => "*".to_owned(),
+            h => h.to_owned(),
+        };
 
         let routing = self.routing.load();
 
@@ -395,11 +403,10 @@ impl ProxyHttp for KProxy {
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
-        let host = ds
-            .get_header("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("*")
-            .to_owned();
+        let host = match requested_host(ds.req_header()) {
+            "" => "*".to_owned(),
+            h => h.to_owned(),
+        };
         let path = ds.req_header().uri.path().to_owned();
         let client_ip: Option<IpAddr> = ds
             .client_addr()
@@ -520,7 +527,10 @@ impl ProxyHttp for KProxy {
         // is set in `upstream_peer`, which pingora calls after this hook.
         let configured = {
             let req = session.req_header();
-            let host = req.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("*");
+            let host = match requested_host(req) {
+                "" => "*",
+                h => h,
+            };
             self.routing.load().cache_config(host, req.uri.path()).is_some()
         };
         if !configured {
@@ -537,11 +547,10 @@ impl ProxyHttp for KProxy {
         _ctx: &mut Self::CTX,
     ) -> pingora::Result<CacheKey> {
         let req = session.req_header();
-        let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("_");
+        let host = match requested_host(req) {
+            "" => "_",
+            h => h,
+        };
         let path = req
             .uri
             .path_and_query()
@@ -958,10 +967,9 @@ fn build_tls_settings(
                 std::process::exit(1);
             });
     settings.set_cert_resolver(cert_store.rustls_resolver());
-    // No ALPN, matching what these listeners offered on the OpenSSL backend.
-    // Advertising h2 here would route every HTTP/2 request to the wildcard
-    // vhost: h2 carries the name in `:authority`, and vhost resolution reads
-    // the `Host` header. Offer h2 only once that reads the authority too.
+    // Safe now that vhost resolution falls back to `:authority`; the OpenSSL
+    // backend advertised no ALPN at all, so HTTPS was HTTP/1.1 only.
+    settings.enable_h2();
     settings
 }
 
@@ -1640,5 +1648,31 @@ mod tests {
     fn vary_names_are_split_and_lowercased() {
         let r = resp(&[("vary", "Accept-Encoding, Accept-Language"), ("vary", "X-Tenant")]);
         assert_eq!(vary_names(&r), ["accept-encoding", "accept-language", "x-tenant"]);
+    }
+
+    // `build` normalizes an absolute-form target to its path, so the h2 shape
+    // (authority, no Host header) has to be set on the URI directly.
+    fn req_with(headers: &[(&str, &str)], uri: &str) -> pingora::http::RequestHeader {
+        let mut r = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
+        r.set_uri(uri.parse::<http::Uri>().unwrap());
+        for (k, v) in headers {
+            r.insert_header(k.to_string(), *v).unwrap();
+        }
+        r
+    }
+
+    #[test]
+    fn the_requested_host_comes_from_the_header_or_the_authority() {
+        // HTTP/1.1: the Host header.
+        assert_eq!(requested_host(&req_with(&[("host", "a.example")], "/x")), "a.example");
+        // HTTP/2: no Host header, the name is in :authority (the request URI).
+        assert_eq!(requested_host(&req_with(&[], "https://b.example/x")), "b.example");
+        // Both: the header wins, as it does for HTTP/1.1 proxies.
+        assert_eq!(
+            requested_host(&req_with(&[("host", "a.example")], "https://b.example/x")),
+            "a.example"
+        );
+        // Neither: callers substitute their own fallback.
+        assert_eq!(requested_host(&req_with(&[], "/x")), "");
     }
 }
