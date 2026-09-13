@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.15.2] — 2026-09-13
+
 ### Fixed
 
 - **A joining cluster node was never promoted to voter.** The handshake
@@ -24,6 +28,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - `keel.udp_max_flows` is documented as what it is: a per-listener cap read at
   startup, so a worker's ceiling is that value times the number of `udp_pool`
   listeners, and changing it needs a restart like the other UDP settings.
+
+- The cluster handshake budget was applied once per step, so an
+  unauthenticated peer could hold a slot for twice the stated 10s. One
+  deadline now covers the whole pre-authentication phase.
+- A UDP datagram refused by `udp_max_flows` recorded a metric but wrote no
+  access-log entry, unlike every other drop path.
+- The PROXY protocol digest handling was duplicated between the plain and TLS
+  listeners, where a fix to one could silently miss the other.
+- Release notes claimed FreeBSD binaries were not provided, in the same page
+  that lists the FreeBSD tarball.
 
 ---
 
@@ -730,7 +744,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/allmend/keel/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/allmend/keel/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/allmend/keel/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/allmend/keel/compare/v0.13.3...v0.14.0
