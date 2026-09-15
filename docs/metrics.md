@@ -1,7 +1,7 @@
 # Metrics Reference
 
 Keel exposes Prometheus-format metrics at `GET /metrics` on
-`metrics.address` (default `127.0.0.1:9090`; see
+`metrics.address` (default `127.0.0.1:10790`; see
 [Configuration](configuration.md#metrics)). Each node exposes its own
 metrics; there is no cluster aggregation — use your Prometheus setup's
 federation if needed.

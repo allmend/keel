@@ -78,7 +78,7 @@ cd keel
 docker compose up --build
 
 curl http://localhost:8080          # round-robins across backend1/2/3
-curl http://localhost:9090/metrics  # Prometheus metrics
+curl http://localhost:10790/metrics  # Prometheus metrics
 
 # Control commands
 docker compose exec keel keel status

@@ -8,6 +8,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** the metrics endpoint default moved from `127.0.0.1:9090` to
+  `127.0.0.1:10790`. Port 9090 is Prometheus's own default, so a Keel node on
+  the same host as a Prometheus server collided with it. 10790 sits next to the
+  remote control port (10789) and outside the 9100-9999 exporter range, so both
+  Keel-owned ports are adjacent and neither clashes with a common exporter.
+  Configs that set `metrics.address` explicitly are unaffected. Configs that
+  omit it move to the new port: update the scrape target, and the published
+  container port if you map it (`EXPOSE` and the compose mapping changed to
+  match).
+
 ---
 
 ## [0.15.2] — 2026-09-13

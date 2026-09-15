@@ -53,7 +53,7 @@ The original `Host` value is still forwarded upstream in `X-Forwarded-Host`, so 
 
 Metrics expose backend addresses, pool and vhost names, and traffic volumes. Access is restricted by default to limit what this reveals about the infrastructure.
 
-- The default bind is `127.0.0.1:9090`. To scrape from another host, set `metrics.address: 0.0.0.0:9090` and firewall the port, or run a local scrape agent against loopback.
+- The default bind is `127.0.0.1:10790`. To scrape from another host, set `metrics.address: 0.0.0.0:10790` and firewall the port, or run a local scrape agent against loopback.
 - Only `GET /metrics` is served. Any other method or path returns `404`.
 
 ---
@@ -133,6 +133,6 @@ A Raft snapshot that fails to deserialize is returned as a storage error and sur
 | Requirement | Action |
 |---|---|
 | Cluster mode needs a secret | Set `cluster.secret` in `keel.yaml` or pass `--secret`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
-| Metrics bind to loopback by default | To scrape from another host, set `metrics.address: 0.0.0.0:9090` explicitly and firewall the port. |
+| Metrics bind to loopback by default | To scrape from another host, set `metrics.address: 0.0.0.0:10790` explicitly and firewall the port. |
 | Workers need a user to drop to | Startup fails if `keel.user` / `keel.group` cannot be resolved. Create the user and group, or point the fields at an existing account. |
 | All cluster nodes must speak the same join protocol | Run the same Keel build across the cluster when joining nodes. |
