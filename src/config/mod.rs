@@ -665,7 +665,7 @@ impl Default for MetricsConfig {
 // Localhost by default — metrics expose backend addresses, pool/vhost names, and
 // traffic volumes. Operators that scrape remotely set 0.0.0.0 explicitly and are
 // expected to firewall the port (or run a local agent scraping 127.0.0.1).
-fn default_metrics_address() -> String { "127.0.0.1:9090".into() }
+fn default_metrics_address() -> String { "127.0.0.1:10790".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pool {
@@ -1238,6 +1238,16 @@ mod tests {
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    #[test]
+    fn metrics_defaults_to_loopback_off_the_prometheus_port() {
+        // 9090 is Prometheus's own default, so a node colocated with a
+        // Prometheus server collided with it; 10790 sits next to the remote
+        // control port (10789) and outside the 9100-9999 exporter range.
+        let yaml = "pools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
+        let cfg = serde_yml::from_str::<Config>(yaml).unwrap();
+        assert_eq!(cfg.metrics.address, "127.0.0.1:10790");
     }
 
     #[test]

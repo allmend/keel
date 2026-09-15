@@ -12,7 +12,7 @@ ARG TARGETARCH
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY dist/linux-${TARGETARCH}/keel /keel
 
-EXPOSE 80 443 9090
+EXPOSE 80 443 10790
 
 ENTRYPOINT ["/keel"]
 CMD ["--config", "/etc/keel/keel.yaml"]

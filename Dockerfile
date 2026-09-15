@@ -23,7 +23,7 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/keel /usr/local/bin/keel
 
-EXPOSE 80 443 9090
+EXPOSE 80 443 10790
 
 ENTRYPOINT ["/usr/local/bin/keel"]
 CMD ["--config", "/etc/keel/keel.yaml"]

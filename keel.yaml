@@ -18,7 +18,7 @@ listeners:
   #   proxy_protocol: true
 
 metrics:
-  address: 0.0.0.0:9090
+  address: 0.0.0.0:10790
 
 access_log:
   enabled: true
