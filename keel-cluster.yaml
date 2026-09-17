@@ -26,11 +26,10 @@ cache:
 # Bootstrap first node:  keel --config keel-cluster.yaml --cluster --bootstrap --secret <secret>
 # Join an existing node: keel --config keel-cluster.yaml --cluster --join 10.0.0.1:7654 --secret <secret>
 cluster:
-  addr: 0.0.0.0:7654        # RPC listen address for peer connections
+  addr: 10.0.0.1:7654       # this node's reachable address: bound locally and announced to peers
   secret: change-me-in-production
-  # Bring your own CA instead of the auto-generated one:
-  # ca_cert: /etc/keel/cluster-ca.crt
-  # ca_key:  /etc/keel/cluster-ca.key
+  # The bootstrap node generates the cluster CA. ca_cert / ca_key are
+  # accepted but not used: bringing your own CA is not implemented.
 
 pools:
   web:

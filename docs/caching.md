@@ -15,6 +15,8 @@ cache:
 
 Stores objects in process memory using LRU eviction. Fast, no I/O, lost on restart.
 
+Each worker process has its own memory cache of the configured size, so total memory use can reach `memory` × number of workers, and an object cached by one worker is a miss in the others.
+
 ### Disk only
 
 ```yaml
@@ -24,7 +26,9 @@ cache:
     size: 10G
 ```
 
-Stores objects as files. Layout: `{path}/{hash[0:2]}/{hash}.keel`. The directory is created on first write. Objects are evicted by LRU when total size approaches `size`.
+Stores objects as files. Layout: `{path}/{hash[0:2]}/{hash}.keel`. The directory is created on first write. Every worker reads the same directory, so an object written by one worker is a hit in all of them.
+
+Eviction is tracked per worker process: each worker counts only the objects it wrote itself against `size` and evicts by LRU from those. Total disk use can therefore reach `size` × number of workers. Files left from a previous run are served on lookup but are not counted or evicted.
 
 ### Tiered (memory + disk)
 
@@ -41,7 +45,7 @@ When both tiers are configured:
 - Reads check L1 (memory) first. On a hit, no disk I/O occurs.
 - On an L1 miss, L2 (disk) is checked.
 - On a full cache miss, the response is written to both tiers simultaneously. Subsequent requests find the object in L1.
-- If an L2 write fails (disk full, I/O error), L1 still stores the response. The failure is logged and does not affect the response.
+- If an L2 write fails (disk full, I/O error), L1 still stores the response. The failure is not logged and does not affect the response.
 
 This is the recommended production configuration. Memory absorbs the hot working set; disk holds everything else.
 

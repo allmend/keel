@@ -7,7 +7,7 @@ Standalone mode is a first-class deployment target. A single Keel node reads its
 Use cluster mode when you need:
 - Fault tolerance — traffic continues if a node fails
 - Coordinated config changes across nodes
-- Distributed drain — drain a backend on all nodes simultaneously
+- ACME certificates issued once and served by every node
 
 ---
 
@@ -47,7 +47,7 @@ The `--secret` flag sets the shared secret that joining nodes must present. You 
 
 ```yaml
 cluster:
-  addr: 0.0.0.0:7654
+  addr: 10.0.0.1:7654
   secret: mysecret
 ```
 
@@ -70,6 +70,8 @@ keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mysecret
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
 
+Only the bootstrap node can admit new nodes: it is the only process that holds the cluster CA, and it holds it in memory. `--join` must point at the bootstrap node's `cluster.addr`, including the port; any other member logs `plain join but no CA (not bootstrap node)` and the joiner keeps retrying.
+
 A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
 
 If the join target is not reachable yet — the normal case when all nodes are started together by a service manager or orchestrator — the joiner retries with exponential backoff (1s doubling up to 30s) indefinitely, logging each attempt. Errors that retrying cannot fix are fatal and terminate the process so the supervisor notices: a wrong shared secret, a protocol mismatch, or an explicit rejection from the cluster.
@@ -80,7 +82,13 @@ on the wire — the join request and the response (which carries the new node's 
 key and the CA) are both AEAD-encrypted. A passive eavesdropper on the network
 segment cannot read them, and a peer without the secret cannot decrypt or forge them.
 
-The `--join` address is only used once at startup. After a node has joined the cluster, it reconnects to peers on restart using the addresses stored in Raft state.
+### Restarts
+
+Raft state — log, membership, and the cluster CA — is held in memory only; nothing is written to disk. A node does not rejoin on its own after a restart:
+
+- A restarted member must be started with `--join` again, pointing at the bootstrap node. It receives the current state from the leader after joining.
+- A restarted bootstrap node started with `--bootstrap` generates a new cluster CA and forms a new single-node cluster. The other nodes hold certificates from the previous CA and cannot communicate with it; restart them with `--join` pointing at the new bootstrap node.
+- After a full cluster restart, each node starts from its local `keel.yaml` and every backend is active. ACME certificates are recovered from disk (see [ACME certificates in cluster mode](#acme-certificates-in-cluster-mode)).
 
 ---
 
@@ -88,41 +96,30 @@ The `--join` address is only used once at startup. After a node has joined the c
 
 ```yaml
 cluster:
-  addr: 0.0.0.0:7654       # RPC listen address for peer connections
-  node_id: 1               # optional; derived from addr hash if omitted
+  addr: 10.0.0.1:7654      # this node's peer address: bound locally and announced to the cluster
+  node_id: 1               # optional; derived from addr if omitted
   secret: change-me-in-production
 ```
 
 | Field | Default | Notes |
 |---|---|---|
-| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections |
+| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections, and the address this node announces to the other nodes |
 | `node_id` | derived | Must be unique across the cluster |
 | `secret` | none | Shared secret for join authentication |
-| `ca_cert` | none | BYO CA certificate path |
-| `ca_key` | none | BYO CA key path |
+| `ca_cert` | none | Accepted but not used; see [Cluster CA](#cluster-ca) |
+| `ca_key` | none | Accepted but not used |
 
-If `node_id` is omitted, Keel derives one from a hash of the `addr` value. Explicitly set `node_id` if multiple nodes bind to the same address (e.g. behind a NAT where the bind address isn't unique).
+`addr` is used both to bind the peer listener and as the address other nodes connect to, so it must be an address the other nodes can reach, such as `10.0.0.1:7654`. The default `0.0.0.0:7654` is not reachable from another host.
+
+If `node_id` is omitted, Keel derives it from a hash of the `addr` string. Nodes with the same `addr` string — including every node left at the default — derive the same `node_id`. Set a unique `addr` on every node, or set `node_id` explicitly.
 
 ---
 
-## Bring your own CA
+## Cluster CA
 
-Instead of letting Keel generate a cluster CA, you can provide your own:
+The bootstrap node generates the cluster CA at startup and keeps it in memory. Joining nodes receive their node certificate from it.
 
-```bash
-keel --config keel.yaml --cluster --bootstrap --ca-cert /etc/keel/ca.crt --ca-key /etc/keel/ca.key
-```
-
-Or in `keel.yaml`:
-
-```yaml
-cluster:
-  addr: 0.0.0.0:7654
-  ca_cert: /etc/keel/cluster-ca.crt
-  ca_key: /etc/keel/cluster-ca.key
-```
-
-Joining nodes receive their certificate from this CA. The CA private key only needs to be present on the bootstrap node at startup; it is not required on follower nodes.
+Bringing your own CA is not implemented. The `--ca-cert` / `--ca-key` flags and the `cluster.ca_cert` / `cluster.ca_key` fields are accepted and ignored; the bootstrap node always generates its own CA.
 
 ---
 
@@ -136,33 +133,29 @@ To push a new config to the entire cluster:
 keel config push keel.yaml
 ```
 
-This reads the local file, submits it to the leader as a Raft log entry, waits for quorum commit, and confirms once all nodes have applied it. If the cluster has no quorum the command fails.
+This reads the local file and commits its text as a Raft log entry. The command returns once a quorum has committed the entry; each node applies it when the entry reaches its state machine.
 
-Config push requires quorum. During a network partition or leader election, `keel config push` will block or fail. Traffic on individual nodes is unaffected.
+- **Send it to the leader.** Raft accepts writes only on the leader, and `config push` is not forwarded: sent to a follower, the command fails. `keel cluster status` shows the leader.
+- **One file.** The file's text is pushed as is. `include:` globs and `--conf-dir` fragments are not expanded, so a split config is pushed without its fragments.
+- **No validation before commit.** The text is not validated before it is committed. Each node parses it when applying; a node that cannot parse it logs `cluster: invalid config YAML` and keeps its current config.
+- **Quorum.** Without quorum the commit cannot happen: during a network partition or leader election the command blocks or fails. Traffic on individual nodes is unaffected.
 
-Changes that can be pushed:
-- Pool membership and weights
-- Health check parameters
-- Virtual host routing rules
-- TLS certificate paths
+A pushed config is applied the same way as a local [hot reload](configuration.md#hot-reload):
 
-Changes that require restarting each node individually:
-- Listener ports
-- Worker count
+- Applied: virtual host routing rules, TLS certificates, backends removed from a pool (they drain).
+- Not applied until restart: backends added to a pool, weights, algorithms, `health_check`, `passive`, listeners, and the `keel`, `cache`, `access_log`, `metrics`, `acme` and `control` sections.
 
 ---
 
 ## Drain in cluster mode
 
-Backend drain in cluster mode commits to the Raft log and is applied on all nodes:
+`keel backend drain` applies to the node that receives the command only. It is not committed to the Raft log and needs no quorum:
 
 ```bash
 keel backend drain 10.0.0.1:8080 --wait
 ```
 
-All nodes immediately stop routing new requests to the backend. The drain completes when all nodes report zero active connections to it. Progress is streamed to the terminal.
-
-Drain requires quorum to commit the initial drain command. If a network partition occurs mid-drain, the drain freezes — no new connections are sent to the backend, and existing connections are held until the partition heals or the cluster regains quorum.
+That node stops routing new connections to the backend; `--wait` streams that node's connection count. The other nodes keep sending traffic to the backend. To drain a backend cluster-wide, run the command on every node (locally or with `keelctl` against each node's endpoint).
 
 ---
 
@@ -232,7 +225,7 @@ validate, so the CA's requests are answered by whichever node they reach.
 
 ## Remote control
 
-With `control.remote` configured, every node serves [keelctl](keelctl.md) connections over mTLS; commands that change cluster state (`config push`, `stepdown`) are forwarded to the leader internally, so any node works as the endpoint across failovers. Each node's control CA is independent — share the `ca_dir` contents across nodes to use one keelconfig for the whole cluster.
+With `control.remote` configured, every node serves [keelctl](keelctl.md) connections over mTLS. `cluster stepdown` sent to a follower is forwarded to the leader; `config push` is not and must reach the leader. Other commands answer for the node that receives them. The control CA is replicated through the Raft log, so one keelconfig authenticates to every node — see [Remote control](keelctl.md#cluster-mode).
 
 ---
 
@@ -241,7 +234,7 @@ With `control.remote` configured, every node serves [keelctl](keelctl.md) connec
 During a network partition:
 
 - Each node continues forwarding traffic with its last known config. No quorum is needed to serve requests.
-- Config changes (including drain) require Raft quorum. Commands issued during a partition are rejected or blocked.
+- Config pushes and membership changes require Raft quorum. Commands issued during a partition are rejected or blocked. Drain is local to each node and unaffected.
 - When the partition heals, nodes catch up via Raft log replay. Any committed changes during the partition (from the quorum partition) are applied to the other nodes.
 
 This is an intentional AP/CP split: Keel is always available for traffic, and always consistent for config writes.
@@ -259,7 +252,7 @@ Output:
 ```
 Cluster:
   Node ID:   12345678
-  Role:      Leader
+  Role:      leader
   Term:      4
   Leader:    12345678
   Committed: 42

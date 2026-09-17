@@ -30,7 +30,9 @@ Log files are created in `dir` when the first request arrives for each vhost. Th
 
 Files are named with a sortable prefix (`access_`) followed by the vhost hostname. This makes them easy to list, grep, and feed to logrotate.
 
-Keel does not rotate log files itself. Use logrotate or a similar tool. The filenames are stable and logrotate-friendly — after rotation, Keel creates a new file on the next request.
+Requests whose entry has a non-null `error` are written a second time to `error_<vhost>.log` in the same directory.
+
+Keel does not rotate log files itself. Each worker opens a file on its first entry and keeps it open for the life of the process; neither a reload nor a signal reopens it. After logrotate renames a file, Keel keeps writing to the renamed file. Use logrotate's `copytruncate` (the files are opened in append mode), or restart Keel after rotation.
 
 ---
 
@@ -96,10 +98,11 @@ When `error` is non-null, it contains one of these short strings:
 
 | Value | Meaning |
 |---|---|
-| `no_route` | No vhost matched the request's `Host` header |
+| `no_route` | The request was not routed to a pool: no vhost or route matched, or Keel answered the request itself (see below) |
 | `no_backend` | Pool exists but no healthy backend was available |
-| `upstream_connect` | Keel could not establish a connection to the backend |
-| `upstream_timeout` | Backend did not respond within the timeout |
+| `upstream_connect` | Proxying to the selected backend failed — a connect failure, a timeout, or an error after the connection was established |
+
+Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` redirects and `default_action` responses — are logged before a vhost is resolved: `vhost`, `method` and `uri` are empty, `error` is `no_route`, `status` is the status Keel sent, and the entry goes to `access_unknown.log` and `error_unknown.log`.
 
 ---
 

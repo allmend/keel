@@ -16,7 +16,7 @@
 
 > ⚠️ **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not production-ready yet — feedback welcome.
 
-Keel is a fast, modern, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, runtime pool management, automatic TLS, true config hot-swap — from a single static binary.
+Keel is a fast, modern, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, automatic TLS, certificate hot-swap, routing changes without restart — from a single binary.
 
 Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
@@ -39,7 +39,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Health checks — `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, and `tls` probes; status/body matching, port override, failure reason in `keel status`
 - Passive detection — backends ejected after consecutive upstream failures, re-admitted on a timer; never the last one
 - Backend drain with live connection tracking
-- Config hot reload (SIGHUP or `keel config reload`)
+- Config hot reload (SIGHUP or `keel config reload`) — vhost routing, certificates, backend removal
 - TLS certificate hot-swap
 - Two-tier HTTP cache (memory L1 + disk L2)
 - Prometheus metrics (`/metrics`)
@@ -64,7 +64,7 @@ may return — see [CHANGELOG.md](CHANGELOG.md).
 
 Rust · [Pingora](https://github.com/cloudflare/pingora) · Tokio · rustls + OpenSSL · [openraft](https://github.com/databendlabs/openraft) · Prometheus
 
-Single static binary. Async multithreaded, CPU balanced across cores. Minimal attack surface.
+Single binary (links OpenSSL dynamically). Async multithreaded, CPU balanced across cores. Minimal attack surface.
 
 ---
 
@@ -209,10 +209,10 @@ Three-node cluster with shared-secret bootstrap:
 keel --config keel.yaml --cluster --bootstrap --secret mytoken
 
 # Node 2, 3 — join
-keel --config keel.yaml --cluster --join 10.0.0.1 --secret mytoken
+keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mytoken
 ```
 
-All inter-node traffic is mTLS and the join exchange itself is encrypted with a key derived from the shared secret. The cluster CA is generated automatically, or bring your own. Joining nodes retry with backoff (safe to start all nodes at once) and are promoted to Raft voters once caught up. Config changes — and ACME certificates — are committed via Raft and applied on every node; `keel cluster stepdown` removes a node gracefully, refusing (without `--force`) when the remaining nodes would lose quorum.
+All inter-node traffic is mTLS and the join exchange itself is encrypted with a key derived from the shared secret. The cluster CA is generated automatically by the bootstrap node. Joining nodes retry with backoff (safe to start all nodes at once) and are promoted to Raft voters once caught up. Pushed configs (`keel config push`, sent to the leader) and ACME certificates are committed via Raft and applied on every node; drain and reload act per node; `keel cluster stepdown` removes a node gracefully, refusing (without `--force`) when the remaining nodes would lose quorum.
 
 ---
 

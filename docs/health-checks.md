@@ -200,6 +200,8 @@ backend's certificates so a healthy renewal cycle never trips it, and read
 Independently of the active probe, every pool watches its real traffic. A
 backend whose upstream connections (HTTP and TCP) or UDP replies fail
 `failures` times in a row is ejected for `eject_for`, then re-admitted.
+Each worker process counts its own failures and ejects on its own, so with
+several workers a backend can be ejected in some workers and not others.
 This catches a backend that dies between probe rounds, and it works for
 pools without a `health_check` block at all. On by default.
 
@@ -259,4 +261,4 @@ The transitions are logged at `warn` (unhealthy, with the reason) and `info`
   is re-admitted on schedule.
 - Backend selection consults the health state at selection time, so a flip
   takes effect on the next request, connection, or UDP flow.
-- Changing `health_check` requires a restart.
+- Changing `health_check` or `passive` requires a restart; a reload keeps the running checks and rules.

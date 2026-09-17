@@ -188,9 +188,10 @@ makes no assumption that the stream contains TLS.
 
 ## Session affinity
 
-With `algorithm: consistent_hash`, the hash key is the client `IP:port`, so a
-client keeps reaching the same backend while the pool composition is stable.
-Round robin, random, and least-connections apply per connection.
+With `algorithm: consistent_hash`, the hash key is the client `IP:port`.
+Every new TCP connection uses a new source port, so affinity holds for the
+life of one connection; a client's next connection can reach a different
+backend. Round robin, random, and least-connections apply per connection.
 
 ## Drain
 
@@ -220,7 +221,7 @@ Metrics (see the [metrics reference](metrics.md) for the full list):
 |---|---|---|
 | `keel_tcp_connections_total` | counter | `pool`, `backend` |
 | `keel_tcp_bytes_in_total` / `keel_tcp_bytes_out_total` | counter | `pool`, `backend` |
-| `keel_tcp_errors_total` | counter | `pool`, `reason` (`no_backend`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown`) |
+| `keel_tcp_errors_total` | counter | `pool`, `reason` (`no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown`) |
 | `keel_active_connections` | gauge | `pool`, `backend` — shared with HTTP |
 | `keel_backend_healthy`, `keel_backend_drain_state` | gauge | `pool`, `backend` — shared with HTTP |
 

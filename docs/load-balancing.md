@@ -28,13 +28,15 @@ Use as an alternative to round-robin when strict ordering doesn't matter and you
 
 ### least_connections
 
-Routes each request to the backend with the fewest active connections at the time the request arrives. Respects weights.
+Routes each request to the backend with the fewest active connections at the time the request arrives. Weights are ignored. Each worker process counts only the connections it opened itself.
 
 Use for workloads where requests have variable processing time — long-lived connections or slow backends will receive fewer new requests automatically.
 
 ### consistent_hash
 
-Hashes a property of the request (typically client IP) to select a backend. The same client always reaches the same backend as long as the pool composition doesn't change. Respects weights.
+Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights.
+
+At L4 every new TCP connection uses a new source port, so affinity holds per connection (TCP) or per flow (UDP), not per client.
 
 Use when backend-side caching or session affinity matters and you cannot use cookies.
 
@@ -42,7 +44,7 @@ Use when backend-side caching or session affinity matters and you cannot use coo
 
 ## Weighted backends
 
-All algorithms support per-backend weights. A backend with `weight: 2` receives twice as many requests as one with `weight: 1`.
+`round_robin`, `random` and `consistent_hash` support per-backend weights. A backend with `weight: 2` receives twice as many requests as one with `weight: 1`. `least_connections` ignores weights.
 
 ```yaml
 pools:
@@ -65,8 +67,9 @@ Weight defaults to `1` if omitted.
 
 A pool with a `health_check` block is probed continuously and unhealthy
 backends are excluded from selection until they recover. Probe types are
-`tcp`, `udp`, and `http`; thresholds, timeouts, a port override, and the
-status output are described in [Health checks](health-checks.md).
+`tcp`, `udp`, `http`, `dns`, `ntp`, `icmp` and `tls`; thresholds, timeouts, a
+port override, and the status output are described in
+[Health checks](health-checks.md).
 
 ```yaml
 pools:
@@ -113,9 +116,9 @@ Drain complete (22s elapsed).
 
 Drain identifies the backend across all pools — you do not specify a pool name. If the address appears in multiple pools it is drained from all of them simultaneously.
 
-After drain completes the backend is in the `Removed` state. To bring it back, update `keel.yaml` and reload config, or in cluster mode use `keel config push`.
+After drain completes the backend is in the `Removed` state until Keel restarts. There is no command to return it to service, and neither a config reload nor `keel config push` re-activates it — a restart does, since drain state is not persisted.
 
-In cluster mode, drain is committed to the Raft log and applied on all nodes. All nodes stop sending new requests to the backend. The drain is not considered complete until all nodes report zero active connections. See [Cluster](cluster.md).
+In cluster mode, drain applies to the node that receives the command only. See [Cluster](cluster.md#drain-in-cluster-mode).
 
 ---
 

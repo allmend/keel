@@ -49,7 +49,7 @@ On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets
 
 `udp_flow_timeout_seconds` is the idle time after which a UDP flow (one client `ip:port` on a `udp_pool` listener) expires and releases its backend; it must be at least 1. `udp_max_flows` caps how many flows each UDP listener holds at once — each costs an upstream socket and a task, and the worker's HTTP and TCP listeners share its descriptors, so a worker's ceiling is this value times the number of `udp_pool` listeners. Both must be at least 1. See [UDP proxying](udp-proxying.md).
 
-Changing `workers`, `udp_flow_timeout_seconds`, or `udp_max_flows` requires a process restart. All other settings can be changed via hot reload.
+Every setting in the `keel` section requires a process restart. See [Hot reload](#hot-reload) for what reloads live.
 
 ---
 
@@ -107,7 +107,7 @@ metrics:
 |---|---|---|
 | `address` | string | `127.0.0.1:10790` |
 
-Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. Every exposed metric is listed in the [metrics reference](metrics.md).
+Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. With more than one worker, the endpoint is served by a single worker and shows that worker's numbers only — see [Metrics](metrics.md). Every exposed metric is listed in the [metrics reference](metrics.md).
 
 > **Security:** metrics expose backend addresses, pool/vhost names, and traffic
 > volumes. The default binds to `127.0.0.1` so they are not world-readable. To
@@ -298,22 +298,20 @@ Required in cluster mode. Omit for standalone.
 
 ```yaml
 cluster:
-  addr: 0.0.0.0:7654
+  addr: 10.0.0.1:7654   # bound locally and announced to the other nodes
   node_id: 1            # optional; derived from addr hash if absent
   secret: change-me
-  # ca_cert: /etc/keel/cluster-ca.crt   # BYO CA
-  # ca_key:  /etc/keel/cluster-ca.key
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `addr` | string | `0.0.0.0:7654` | RPC listen address for peer connections |
-| `node_id` | integer | derived | Raft node ID; must be unique per cluster |
+| `addr` | string | `0.0.0.0:7654` | Peer listen address, also announced to the other nodes — must be reachable from them |
+| `node_id` | integer | derived | Raft node ID; must be unique per cluster. Derived from the `addr` string, so nodes with the same `addr` get the same ID |
 | `secret` | string | none | Shared secret for join authentication |
-| `ca_cert` | string | none | BYO CA certificate path |
-| `ca_key` | string | none | BYO CA key path |
+| `ca_cert` | string | none | Accepted but not used |
+| `ca_key` | string | none | Accepted but not used |
 
-See [Cluster](cluster.md) for bootstrap, join, and CA options.
+See [Cluster](cluster.md) for bootstrap, join, and restarts.
 
 ---
 
@@ -365,7 +363,8 @@ Merge rules:
 - `vhosts`: appended in load order
 - `listeners`: appended in load order
 - `certificates`: appended in load order
-- `keel`, `metrics`, `access_log`, `include`, `cluster`, `acme`: root file only; error if present in included files
+- `keel`, `metrics`, `access_log`, `include`, `cluster`, `acme`, `control`: root file only; error if present in included files
+- Any other top-level key in an included file (for example `cache`) is ignored
 
 Example layout:
 
@@ -390,17 +389,19 @@ On `SIGHUP` or `keel config reload`, all files including conf.d fragments are re
 Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections. The master forwards the signal to every worker and re-reads the config itself, so a worker it restarts later starts from the current config. If the new config fails to load, the master logs the error and retains the previous one for that purpose.
 
 What reloads without restart:
+- Virtual host rules: hosts, routes and the pools they reference, `forwarded_headers`, cache rules, `redirect_http`, `default_action`
+- TLS certificates: certificate files of vhosts and `certificates:` entries are re-read
 - Backends removed from a pool — they are moved to `draining`
-- Health check parameters
-- Virtual host routing rules
-- TLS certificates
 
 What requires a process restart:
-- Backends added to a pool, and backend weight changes — both are logged as a warning and otherwise ignored
-- Listener ports (`listeners[].address`)
-- Worker count (`keel.workers`)
-- Process user/group (`keel.user`, `keel.group`)
-- UDP flow settings (`keel.udp_flow_timeout_seconds`, `keel.udp_max_flows`) — read once when the UDP services are built
+- Backends added to a pool — logged as a warning (`hot reload: new backend requires restart to take effect`) and otherwise ignored
+- Backend weights and pool algorithms — ignored without a log line
+- Pools added to or removed from the config. A new pool has no backends until restart, so a route to it fails with `no_backend`; the backends of a removed pool are not drained
+- `health_check` and `passive` settings — the running checks and rules keep their startup values
+- ACME: hosts, issuers and `certificates:` entries added on reload are not issued until restart
+- `cache` storage, `access_log`, `metrics` and `control`
+- Listeners (`listeners[]`)
+- Every setting in the `keel` section, including worker count, user/group and the UDP flow settings
 
 Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
 

@@ -84,7 +84,7 @@ The directory holding it remains owned by root, mode `0750` with group `keel.gro
 
 ## The remote control listener runs as root
 
-The `control.remote` mTLS listener is bound and served by the master process, which keeps root privileges. TLS handshakes, client-certificate verification and command parsing for that port therefore run privileged, and the control CA in `ca_dir` is read as root. Everything else follows the process model: the master binds ports and reads certificates, and the unprivileged workers handle all proxied traffic.
+The `control.remote` mTLS listener is bound and served by the master process, which keeps root privileges. TLS handshakes, client-certificate verification and command parsing for that port therefore run privileged, and the control CA in `ca_dir` is read as root. Everything else follows the process model: the master binds ports, and the unprivileged workers load TLS certificates and handle all proxied traffic.
 
 The listener belongs to the master because a control command answers for the whole instance. Each worker holds only its own connection counts, health results and drain state, and when every worker bound the port, all but one failed with `control: remote listener failed`.
 
@@ -97,7 +97,8 @@ Leave `control.remote` unset to avoid this entirely. The local Unix socket runs 
 | Proxy listeners | yes | unprivileged worker |
 | Local control socket | yes | unprivileged worker (its own socket) / root master (instance socket) |
 | `control.remote` listener | yes | root master |
-| Signals, config files, certificates | no | root master |
+| Signals, config files | no | root master |
+| TLS certificates and keys | no | unprivileged worker |
 
 ---
 

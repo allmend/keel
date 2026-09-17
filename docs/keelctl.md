@@ -81,10 +81,11 @@ The keelconfig is resolved in order:
 
 ## Cluster mode
 
-Every node with `control.remote` configured listens; commands that change
-cluster state (`config push`, `stepdown`) are forwarded to the leader
-internally, so the endpoint does not need to be the leader and keeps working
-across failovers.
+Every node with `control.remote` configured listens. `cluster stepdown`
+sent to a follower is forwarded to the leader. `config push` is not
+forwarded: send it to the leader's endpoint, or it fails. `status`,
+`backend list`, `backend drain` and `config reload` act on the node that
+receives them only.
 
 The control CA is cluster-wide. When a cluster forms, the leader commits
 its control CA (certificate and key) to the Raft log; every node, including

@@ -2,7 +2,7 @@
 
 Keel routes incoming requests to backend pools based on the HTTP `Host` header. Each entry in `vhosts` defines one virtual host.
 
-Vhosts are evaluated in the order they appear in config. The first match wins.
+Vhosts are matched by host name, not by their position in the config: exact host first, then a one-label wildcard, then `*` (see below). Several entries with the same `host` are merged into one route list; when two of them define the same path prefix, the entry that appears first wins.
 
 ## Host matching
 
@@ -69,7 +69,7 @@ Certificate files are PEM-encoded. The `cert` file should contain the full chain
 
 TLS certificates hot-swap on config reload (`SIGHUP` or `keel config reload`). No connections are dropped during a certificate rotation.
 
-Vhosts with no `tls` block serve plain HTTP even on a TLS listener (SNI will fail to match). All vhosts on a TLS listener should have TLS configured.
+On a TLS listener the certificate is chosen by SNI: exact host, then a one-label wildcard, then the certificate of a `*` vhost. A client asking for a host with no matching certificate gets the `*` certificate if one exists; otherwise the handshake fails. All vhosts served on a TLS listener should have TLS configured.
 
 ---
 
@@ -88,7 +88,7 @@ Headers set:
 
 `mode: replace` (default) — Keel overwrites any existing forwarded headers with the direct client's IP. Use this when Keel is the first proxy that clients connect to. Prevents clients from spoofing `X-Forwarded-For`.
 
-`mode: append` — Keel preserves any forwarded headers from upstream and appends the direct client's IP. Use this when Keel sits behind another trusted proxy (e.g. a cloud load balancer) and you want to preserve the original client IP chain. Use `trusted_proxies` to restrict which upstream addresses are trusted.
+`mode: append` — when the direct client's address is inside `trusted_proxies`, Keel keeps the incoming `X-Forwarded-For` chain, appends the direct client's IP, and takes `X-Real-IP` from the first address in the chain. Use this when Keel sits behind another trusted proxy (e.g. a cloud load balancer). A direct client outside `trusted_proxies` is treated as in `replace` mode.
 
 `mode: off` — Keel removes all forwarded headers from the upstream request. Use this when backends should not receive client IP information.
 
@@ -113,7 +113,7 @@ vhosts:
       mode: off              # strip all forwarded headers
 ```
 
-When `mode: append` is set without `trusted_proxies`, Keel appends to whatever `X-Forwarded-For` value arrives, including values injected by clients. Only use `append` without `trusted_proxies` on listeners that are not reachable by untrusted clients.
+When `mode: append` is set without `trusted_proxies`, no client is trusted and every request is handled as in `replace` mode.
 
 Forwarded header configuration defaults to `mode: replace` if the `forwarded_headers` key is absent.
 
