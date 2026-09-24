@@ -1233,8 +1233,6 @@ pub struct ClusterConfig {
     pub advertise: Option<String>,
 
     pub secret: Option<String>,
-    pub ca_cert: Option<String>,
-    pub ca_key: Option<String>,
 }
 
 fn default_cluster_addr() -> String { "0.0.0.0:7654".into() }
@@ -1251,6 +1249,15 @@ mod tests {
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    #[test]
+    fn cluster_ca_files_are_not_settings() {
+        for key in ["ca_cert", "ca_key"] {
+            let yaml = format!("{POOL}cluster:\n  addr: 10.0.0.1:7654\n  {key}: /etc/keel/ca.pem\n");
+            let err = serde_yml::from_str::<Config>(&yaml).expect_err("CA files must be refused").to_string();
+            assert!(err.contains(key), "error names the option: {err}");
+        }
     }
 
     #[test]

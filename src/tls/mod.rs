@@ -197,6 +197,20 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
 /// Client configuration that accepts any backend certificate: wire
 /// encryption without backend authentication (NLB behaviour), the default
 /// for re-encrypting TCP listeners and for TLS health probes.
+/// Common Name of the client certificate a TLS peer presented, if any.
+pub fn peer_common_name(conn: &rustls::ServerConnection) -> Option<String> {
+    let der = conn.peer_certificates()?.first()?;
+    let cert = openssl::x509::X509::from_der(der.as_ref()).ok()?;
+    let cn = cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()?
+        .data()
+        .to_string()
+        .ok()?;
+    Some(cn)
+}
+
 pub fn insecure_client_config() -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(

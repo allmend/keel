@@ -8,6 +8,24 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Any member admits new nodes.** The bootstrap node commits the cluster CA
+  to Raft, so every member holds it and issues node certificates to joining
+  nodes; a member that is not the leader forwards the membership change to the
+  leader. `--join` takes the announced address of any member.
+
+### Changed
+
+- **BREAKING:** `--ca-cert`, `--ca-key`, `cluster.ca_cert` and
+  `cluster.ca_key` are refused. Keel always generates the cluster CA.
+
+### Security
+
+- **A peer speaks only for its own node.** A Raft message or stepdown whose
+  sender is not the node named by the peer's certificate (`keel-node-<id>`)
+  is refused and logged.
+
 ---
 
 ## [0.17.0] — 2026-09-24

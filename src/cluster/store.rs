@@ -11,7 +11,7 @@ use openraft::{
 };
 
 use crate::cluster::types::{
-    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterState, NodeId, TypeConfig, ControlCaPair};
+    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, NodeId, TypeConfig, ControlCaPair};
 
 // Log store
 
@@ -137,6 +137,7 @@ struct StateMachineData {
     certs_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<CertMap>>>,
     challenges_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>>,
     control_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>>,
+    cluster_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,6 +158,10 @@ impl StateMachine {
 
     pub fn set_control_ca_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>) {
         self.0.write().unwrap().control_ca_tx = Some(tx);
+    }
+
+    pub fn set_cluster_ca_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>) {
+        self.0.write().unwrap().cluster_ca_tx = Some(tx);
     }
 }
 
@@ -257,6 +262,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             }
                             ClientResponse::ok()
                         }
+                        ClientRequest::SetClusterCa { cert_pem, key_pem } => {
+                            d.state.cluster_ca = Some((cert_pem, key_pem));
+                            if let Some(tx) = &d.cluster_ca_tx {
+                                let _ = tx.send(d.state.cluster_ca.clone());
+                            }
+                            ClientResponse::ok()
+                        }
                     };
                     responses.push(resp);
                 }
@@ -304,6 +316,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
         if let Some(tx) = &d.control_ca_tx {
             let _ = tx.send(d.state.control_ca.clone());
+        }
+        if let Some(tx) = &d.cluster_ca_tx {
+            let _ = tx.send(d.state.cluster_ca.clone());
         }
         if let (Some(tx), Some(yaml)) = (&d.config_tx, &d.state.config_yaml) {
             let _ = tx.send(Some(yaml.clone()));

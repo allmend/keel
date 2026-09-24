@@ -310,8 +310,6 @@ cluster:
 | `addr` | string | `0.0.0.0:7654` | Peer listen address |
 | `advertise` | string | `addr` | Address announced to the other nodes. Required when `addr` is unspecified (`0.0.0.0`, `::`) |
 | `secret` | string | none | Shared secret for join authentication |
-| `ca_cert` | string | none | Accepted but not used |
-| `ca_key` | string | none | Accepted but not used |
 
 Unknown keys under `cluster:` are refused. The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity).
 

@@ -56,7 +56,7 @@ one, because the join listener would otherwise hand a cluster identity to any pe
 that can reach the port. Use a high-entropy token, e.g. `openssl rand -hex 32`.
 A weak secret can be brute-forced offline from a captured join exchange.
 
-On bootstrap, Keel generates a cluster CA and issues a node certificate. All inter-node communication uses mTLS with this CA.
+On bootstrap, Keel generates a cluster CA, issues its own node certificate, and commits the CA to Raft so every member holds it. All inter-node communication uses mTLS with this CA.
 
 ---
 
@@ -70,7 +70,7 @@ keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mysecret
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
 
-Only the bootstrap node can admit new nodes: it is the only process that holds the cluster CA, and it holds it in memory. `--join` must point at the bootstrap node's `cluster.addr`, including the port; any other member logs `plain join but no CA (not bootstrap node)` and the joiner keeps retrying.
+Any member admits new nodes: `--join` takes the announced address of any member, including the port. The member issues the node certificate from the replicated cluster CA; membership changes happen on the leader, so a member that is not the leader forwards the join there. A join that arrives before the bootstrap node has committed the CA — in the first seconds of a new cluster — is closed with `join before the cluster CA is committed` logged, and the joiner retries.
 
 A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
 
@@ -86,7 +86,7 @@ segment cannot read them, and a peer without the secret cannot decrypt or forge 
 
 Raft state — log, membership, and the cluster CA — is held in memory only; nothing is written to disk. A node does not rejoin on its own after a restart:
 
-- A restarted member must be started with `--join` again, pointing at the bootstrap node. It rejoins under its node ID (see [Node identity](#node-identity)) and receives the current state from the leader.
+- A restarted member must be started with `--join` again, pointing at any member. It rejoins under its node ID (see [Node identity](#node-identity)) and receives the current state from the leader.
 - A restarted bootstrap node started with `--bootstrap` generates a new cluster CA and forms a new single-node cluster. The other nodes hold certificates from the previous CA and cannot communicate with it; restart them with `--join` pointing at the new bootstrap node.
 - After a full cluster restart, each node starts from its local `keel.yaml` and every backend is active. ACME certificates are recovered from disk (see [ACME certificates in cluster mode](#acme-certificates-in-cluster-mode)).
 
@@ -106,8 +106,6 @@ cluster:
 | `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections |
 | `advertise` | `addr` | Address this node announces to the other nodes |
 | `secret` | none | Shared secret for join authentication |
-| `ca_cert` | none | Accepted but not used; see [Cluster CA](#cluster-ca) |
-| `ca_key` | none | Accepted but not used |
 
 The other nodes connect to `advertise`, or to `addr` when `advertise` is not set, so that address must be reachable from them. An unspecified address (`0.0.0.0`, `::`) can be bound but not reached: cluster mode refuses to start when the announced address is unspecified, naming `cluster.advertise`. Unknown keys under `cluster:` are refused.
 
@@ -133,9 +131,11 @@ To give a copied machine an identity of its own, delete `node_id` from its state
 
 ## Cluster CA
 
-The bootstrap node generates the cluster CA at startup and keeps it in memory. Joining nodes receive their node certificate from it.
+The bootstrap node generates the cluster CA once and commits its certificate and key to Raft. Every member holds the CA in memory, so every member can issue node certificates to joining nodes; a node that joins later receives it with the rest of the replicated state.
 
-Bringing your own CA is not implemented. The `--ca-cert` / `--ca-key` flags and the `cluster.ca_cert` / `cluster.ca_key` fields are accepted and ignored; the bootstrap node always generates its own CA.
+Each node certificate names its node: `CN=keel-node-<id>`. A peer request that names a sender — Raft messages carry the sender's vote, a stepdown names the node leaving — is refused unless the sender is the node the certificate names, so a member cannot speak for another member.
+
+Keel always generates the cluster CA; bringing your own is not supported, and `--ca-cert`, `--ca-key`, `cluster.ca_cert` and `cluster.ca_key` are refused. The cluster CA cannot be rotated in place.
 
 ---
 

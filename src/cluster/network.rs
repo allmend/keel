@@ -30,11 +30,20 @@ pub enum RpcRequest {
     /// Ask the receiving node (must be the leader) to remove `node_id` from
     /// the cluster membership. Sent by a follower that is stepping down.
     StepDown { node_id: NodeId },
+    /// Ask the receiving node (must be the leader) to admit a joining node.
+    /// Sent by the member that received the join; it issues the certificate.
+    Join { node_id: NodeId, addr: String },
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct StepDownReply {
     pub message: String,
+}
+
+/// The leader's answer to a forwarded join: admitted, or refused with a reason.
+#[derive(Serialize, Deserialize)]
+pub struct JoinReply {
+    pub refused: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +123,22 @@ pub(crate) async fn send_stepdown(
         .await
         .map_err(|e| anyhow::anyhow!("stepdown request to leader at {addr} failed: {e}"))?;
     Ok(reply.message)
+}
+
+/// Forward a join to the leader over the mTLS peer channel. `Ok(Err(reason))`
+/// is a refusal from the leader; `Err` means the leader could not be asked.
+pub(crate) async fn send_join(
+    leader_addr: &str,
+    tls: Arc<rustls::ClientConfig>,
+    node_id: NodeId,
+    addr: String,
+) -> anyhow::Result<Result<(), String>> {
+    let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let reply: JoinReply = net
+        .call(&RpcRequest::Join { node_id, addr })
+        .await
+        .map_err(|e| anyhow::anyhow!("join request to leader at {leader_addr} failed: {e}"))?;
+    Ok(reply.refused.map_or(Ok(()), Err))
 }
 
 impl RaftNetwork<TypeConfig> for ClusterNetwork {

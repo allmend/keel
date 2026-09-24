@@ -165,18 +165,27 @@ impl ClusterHandle {
 struct Ca {
     issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
+    key_pem: String,
 }
 
 impl Ca {
     fn generate() -> Result<Self> {
         let key = KeyPair::generate()?;
+        let key_pem = key.serialize_pem();
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.distinguished_name.push(rcgen::DnType::CommonName, "Keel Cluster CA");
         let cert = params.self_signed(&key)?;
         let cert_pem = cert.pem();
         let issuer = Issuer::new(params, key);
-        Ok(Self { issuer, cert_pem })
+        Ok(Self { issuer, cert_pem, key_pem })
+    }
+
+    /// The CA as committed to Raft.
+    fn from_pems(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        let key = KeyPair::from_pem(key_pem).context("parse cluster CA key")?;
+        let issuer = Issuer::from_ca_cert_pem(cert_pem, key).map_err(|e| anyhow::anyhow!("parse cluster CA cert: {e}"))?;
+        Ok(Self { issuer, cert_pem: cert_pem.to_owned(), key_pem: key_pem.to_owned() })
     }
 
     fn issue_node_cert(&self, node_id: NodeId) -> Result<(String, String)> {
@@ -369,8 +378,29 @@ async fn join_with_retry(
 
 // Peer RPC listener
 
+/// Node ID in a node certificate's Common Name, `keel-node-<id>`.
+fn node_id_from_cn(cn: &str) -> Option<NodeId> {
+    cn.strip_prefix("keel-node-")?.parse().ok()
+}
+
+/// The node a request claims to come from, when it names one. A peer speaks
+/// only for itself: Raft messages carry the sender's vote, and a node steps
+/// only itself down. A forwarded join names the joiner, not the sender.
+fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
+    match req {
+        RpcRequest::AppendEntries(r) => r.vote.leader_id().voted_for(),
+        RpcRequest::Vote(r) => r.vote.leader_id().voted_for(),
+        RpcRequest::InstallSnapshot(r) => r.vote.leader_id().voted_for(),
+        RpcRequest::StepDown { node_id } => Some(*node_id),
+        RpcRequest::Join { .. } => None,
+    }
+}
+
 /// Dispatches one mTLS peer connection to the Raft node.
 async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: Arc<ClusterRaft>) {
+    // Any certificate from the cluster CA passes the handshake; the node ID it
+    // names is what a request may claim to come from.
+    let peer_id = crate::tls::peer_common_name(stream.get_ref().1).as_deref().and_then(node_id_from_cn);
     let (mut read_half, write_half) = tokio::io::split(stream);
     let mut write_half = write_half;
 
@@ -379,7 +409,17 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
         Err(_) => return,
     };
 
-    let resp_bytes = match serde_json::from_slice::<RpcRequest>(&buf) {
+    let request = serde_json::from_slice::<RpcRequest>(&buf);
+    let impersonates = request.as_ref().ok().and_then(claimed_sender).filter(|claimed| Some(*claimed) != peer_id);
+    let request = match impersonates {
+        Some(claimed) => {
+            warn!(claimed, certificate = ?peer_id, "cluster: peer request refused: sender does not match its certificate");
+            Err(format!("request from node {claimed} with the certificate of node {peer_id:?}"))
+        }
+        None => request.map_err(|e| e.to_string()),
+    };
+
+    let resp_bytes = match request {
         Ok(RpcRequest::AppendEntries(req)) => match raft.append_entries(req).await {
             Ok(r) => serde_json::to_vec(&RpcResponse::<_> { ok: Some(r), err: None }).unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e.to_string()) }).unwrap(),
@@ -400,9 +440,15 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             .unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
         },
-        Err(e) => {
-            serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e.to_string()) }).unwrap()
+        Ok(RpcRequest::Join { node_id, addr }) => {
+            let refused = admit_joiner(Arc::clone(&raft), node_id, addr).await.err();
+            serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::JoinReply { refused }),
+                err: None,
+            })
+            .unwrap()
         }
+        Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e) }).unwrap(),
     };
 
     let len = resp_bytes.len() as u32;
@@ -418,12 +464,12 @@ async fn handle_join(
     expected_secret: &str,
     ca: &Ca,
     raft: Arc<ClusterRaft>,
+    peer_tls: Arc<rustls::ClientConfig>,
 ) {
     let result = async {
         let key = join_key(expected_secret);
         // Only the unauthenticated read is bounded. Everything after the AEAD
-        // open is work for a peer that has proven it holds the secret, and the
-        // promotion at the end of this function legitimately takes minutes.
+        // open is work for a peer that has proven it holds the secret.
         let buf = tokio::time::timeout_at(deadline, read_frame(&mut stream, MAX_JOIN_FRAME))
             .await
             .map_err(|_| {
@@ -447,19 +493,24 @@ async fn handle_join(
 
         let req: JoinRequest = serde_json::from_slice(&plaintext)?;
 
-        let admitted = admit_known_id(&raft, req.node_id, &req.addr).await;
+        // Membership changes happen on the leader; any other member forwards
+        // the join there and issues the certificate itself. A leader that
+        // cannot be asked is not a refusal: close without an answer, and the
+        // joiner retries.
+        let m = raft.metrics().borrow().clone();
+        let admitted = if m.current_leader == Some(m.id) {
+            admit_joiner(Arc::clone(&raft), req.node_id, req.addr.clone()).await
+        } else {
+            let leader_addr = m.current_leader.and_then(|l| {
+                m.membership_config.membership().nodes().find(|(id, _)| **id == l).map(|(_, n)| n.addr.clone())
+            });
+            let Some(leader_addr) = leader_addr else {
+                anyhow::bail!("join from node {} while no leader is known; the joiner retries", req.node_id);
+            };
+            crate::cluster::network::send_join(&leader_addr, peer_tls, req.node_id, req.addr.clone()).await?
+        };
         let envelope = match admitted.and_then(|()| ca.issue_node_cert(req.node_id).map_err(|e| e.to_string())) {
             Ok((cert_pem, key_pem)) => {
-                // Add the joining node as a learner — non-blocking.
-                let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
-                let added = when_membership_free(deadline, || {
-                    raft.add_learner(req.node_id, BasicNode { addr: req.addr.clone() }, false)
-                })
-                .await;
-                match added {
-                    Ok(_) => info!(node_id = req.node_id, addr = req.addr, "cluster: node joined"),
-                    Err(e) => warn!(node_id = req.node_id, error = %e, "cluster: adding learner failed"),
-                }
                 JoinEnvelope::Ok(JoinResponse {
                     ca_cert_pem: ca.cert_pem.clone(),
                     node_cert_pem: cert_pem,
@@ -472,18 +523,10 @@ async fn handle_join(
             }
         };
 
-        let joined = matches!(envelope, JoinEnvelope::Ok(_));
         let resp = join_seal(&key, &serde_json::to_vec(&envelope)?)?;
         stream.write_all(&(resp.len() as u32).to_be_bytes()).await?;
         stream.write_all(&resp).await?;
         stream.flush().await?;
-
-        // Promote the joiner to voter once it has its certs and its log has
-        // caught up. Without promotion the bootstrap node stays the only voter
-        // forever and the documented quorum model (3 nodes = 2 of 3) never holds.
-        if joined {
-            promote_to_voter(raft, req.node_id, req.addr).await;
-        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -491,6 +534,22 @@ async fn handle_join(
     if let Err(e) = result {
         error!(error = %e, "cluster: join handler error");
     }
+}
+
+/// Leader side of a join, whichever member received it: check a known node
+/// ID, add the joiner as a learner, and promote it to voter in the background
+/// once its log has caught up. Without promotion the bootstrap node stays the
+/// only voter and the quorum model (3 nodes = 2 of 3) never holds. `Err` is a
+/// refusal, sent to the joiner.
+async fn admit_joiner(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String) -> std::result::Result<(), String> {
+    admit_known_id(&raft, node_id, &addr).await?;
+    let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
+    when_membership_free(deadline, || raft.add_learner(node_id, BasicNode { addr: addr.clone() }, false))
+        .await
+        .map_err(|e| format!("cannot add node {node_id} as learner: {e}"))?;
+    info!(node_id, addr, "cluster: node joined");
+    tokio::spawn(promote_to_voter(raft, node_id, addr));
+    Ok(())
 }
 
 /// How long the leader waits for a member's registered address to answer
@@ -625,6 +684,7 @@ pub struct ClusterService {
     certs_tx: Arc<watch::Sender<crate::cluster::types::CertMap>>,
     challenges_tx: Arc<watch::Sender<crate::cluster::types::ChallengeMap>>,
     control_ca_tx: Arc<watch::Sender<crate::cluster::types::ControlCaPair>>,
+    cluster_ca_tx: Arc<watch::Sender<crate::cluster::types::ClusterCaPair>>,
 }
 
 #[async_trait]
@@ -659,6 +719,8 @@ impl ClusterService {
             );
         }
 
+        // The bootstrap node generates the cluster CA and commits it to Raft
+        // below; every member then issues node certificates from that copy.
         let (ca_cert_pem, node_cert_pem, node_key_pem, ca) = if opts.bootstrap {
             let ca = Ca::generate().context("CA generation failed")?;
             let (cert, key) = ca.issue_node_cert(opts.node_id)?;
@@ -681,13 +743,14 @@ impl ClusterService {
         sm.set_certs_tx(Arc::clone(&self.certs_tx));
         sm.set_challenges_tx(Arc::clone(&self.challenges_tx));
         sm.set_control_ca_tx(Arc::clone(&self.control_ca_tx));
+        sm.set_cluster_ca_tx(Arc::clone(&self.cluster_ca_tx));
 
         let log_store = LogStore::default();
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
 
         let client_tls = build_client_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
         *self.tls_slot.lock().await = Some(Arc::clone(&client_tls));
-        let net_factory = ClusterNetworkFactory { tls: client_tls };
+        let net_factory = ClusterNetworkFactory { tls: Arc::clone(&client_tls) };
 
         let raft = Arc::new(
             Raft::new(opts.node_id, raft_config, net_factory, log_store, sm.clone())
@@ -703,6 +766,9 @@ impl ClusterService {
                 warn!(error = %e, "cluster: initialize (may already be initialized)");
             }
             info!(node_id = opts.node_id, "cluster: bootstrapped as leader");
+            if let Some(ca) = &ca {
+                tokio::spawn(commit_cluster_ca(Arc::clone(&raft), ca.cert_pem.clone(), ca.key_pem.clone()));
+            }
         }
 
         // Publish the raft handle so ControlServer can use it.
@@ -716,7 +782,7 @@ impl ClusterService {
 
         info!(addr = opts.cluster_addr, "cluster: peer listener ready");
 
-        let ca: Option<Arc<Ca>> = ca.map(Arc::new);
+        let cluster_ca_rx = self.cluster_ca_tx.subscribe();
 
         loop {
             tokio::select! {
@@ -729,7 +795,8 @@ impl ClusterService {
                             let raft2 = Arc::clone(&raft);
                             let acceptor2 = acceptor.clone();
                             let secret2 = secret.clone();
-                            let ca2 = ca.clone();
+                            let ca_pems = cluster_ca_rx.borrow().clone();
+                            let peer_tls = Arc::clone(&client_tls);
 
                             tokio::spawn(async move {
                                 // Everything before a peer is authenticated gets a
@@ -750,17 +817,15 @@ impl ClusterService {
                                             Err(_) => warn!(peer = %peer_addr, "cluster: TLS handshake timed out"),
                                         }
                                     }
-                                    Ok(Ok(_)) => {
-                                        if let Some(ref ca_arc) = ca2 {
-                                            // Not deadlined as a whole: handle_join issues certs
-                                            // and then waits for the joiner's log to catch up before
-                                            // promoting it to voter. It applies `deadline` to its
-                                            // own unauthenticated read.
-                                            handle_join(stream, deadline, &secret2, ca_arc, raft2).await;
-                                        } else {
-                                            warn!(peer = %peer_addr, "cluster: plain join but no CA (not bootstrap node)");
-                                        }
-                                    }
+                                    Ok(Ok(_)) => match ca_pems.map(|(cert, key)| Ca::from_pems(&cert, &key)) {
+                                        // Not deadlined as a whole: a join may wait for the
+                                        // leader. handle_join applies `deadline` to its own
+                                        // unauthenticated read.
+                                        Some(Ok(ca)) => handle_join(stream, deadline, &secret2, &ca, raft2, peer_tls).await,
+                                        Some(Err(e)) => error!(error = %e, "cluster: replicated cluster CA unusable"),
+                                        // Closing makes the joiner retry.
+                                        None => warn!(peer = %peer_addr, "cluster: join before the cluster CA is committed"),
+                                    },
                                     Ok(Err(e)) => warn!(peer = %peer_addr, error = %e, "cluster: peek error"),
                                     Err(_) => warn!(peer = %peer_addr, "cluster: handshake timed out"),
                                 }
@@ -792,6 +857,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let challenges_tx = Arc::new(challenges_tx);
     let (control_ca_tx, control_ca_rx) = watch::channel(None);
     let control_ca_tx = Arc::new(control_ca_tx);
+    let cluster_ca_tx = Arc::new(watch::channel(None).0);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
@@ -809,6 +875,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         certs_tx,
         challenges_tx,
         control_ca_tx,
+        cluster_ca_tx,
     };
 
     (handle, service)
@@ -851,6 +918,26 @@ pub async fn push_challenge(
         .await
         .map_err(|e| anyhow::anyhow!("challenge push failed: {e:?}"))?;
     Ok(resp.log_id.index)
+}
+
+/// Commit the cluster CA once, from the bootstrap node. Retried until this
+/// node is leader and the entry commits: joiners retry until it has.
+async fn commit_cluster_ca(raft: Arc<ClusterRaft>, cert_pem: String, key_pem: String) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let entry = ClientRequest::SetClusterCa { cert_pem: cert_pem.clone(), key_pem: key_pem.clone() };
+        match raft.client_write(entry).await {
+            Ok(_) => {
+                info!("cluster: cluster CA committed; every member can admit joiners");
+                return;
+            }
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                error!(error = %e, "cluster: cannot commit the cluster CA; no node can admit joiners");
+                return;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+    }
 }
 
 /// Commit the control CA so every node serves and issues from the same one.
@@ -1065,7 +1152,45 @@ async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_key, join_open, join_seal};
+    use super::{claimed_sender, join_key, join_open, join_seal, node_id_from_cn, Ca};
+    use crate::cluster::network::RpcRequest;
+    use openraft::raft::{AppendEntriesRequest, VoteRequest};
+    use openraft::Vote;
+
+    #[test]
+    fn node_id_comes_from_the_certificate_name() {
+        assert_eq!(node_id_from_cn("keel-node-16015459039218506576"), Some(16015459039218506576));
+        assert_eq!(node_id_from_cn("keel-node-x"), None);
+        assert_eq!(node_id_from_cn("keel-control"), None);
+    }
+
+    #[test]
+    fn requests_name_their_sender_except_a_forwarded_join() {
+        let vote = RpcRequest::Vote(VoteRequest::new(Vote::new(3, 7), None));
+        assert_eq!(claimed_sender(&vote), Some(7));
+        let append = RpcRequest::AppendEntries(AppendEntriesRequest {
+            vote: Vote::new_committed(3, 9),
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        });
+        assert_eq!(claimed_sender(&append), Some(9));
+        assert_eq!(claimed_sender(&RpcRequest::StepDown { node_id: 4 }), Some(4));
+        assert_eq!(claimed_sender(&RpcRequest::Join { node_id: 5, addr: "10.0.0.5:7654".into() }), None);
+    }
+
+    #[test]
+    fn a_replicated_ca_issues_node_certificates() {
+        let ca = Ca::generate().unwrap();
+        let copy = Ca::from_pems(&ca.cert_pem, &ca.key_pem).unwrap();
+        let (cert_pem, _) = copy.issue_node_cert(42).unwrap();
+        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes())).next().unwrap().unwrap();
+        let cert = openssl::x509::X509::from_der(der.as_ref()).unwrap();
+        let ca_cert = openssl::x509::X509::from_pem(ca.cert_pem.as_bytes()).unwrap();
+        assert!(cert.verify(&ca_cert.public_key().unwrap()).unwrap(), "signed by the original CA");
+        let cn = cert.subject_name().entries_by_nid(openssl::nid::Nid::COMMONNAME).next().unwrap();
+        assert_eq!(cn.data().to_string().unwrap(), "keel-node-42");
+    }
 
     #[test]
     fn join_roundtrip_same_secret() {

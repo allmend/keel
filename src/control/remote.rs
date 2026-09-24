@@ -117,7 +117,7 @@ impl RemoteControlServer {
                                 return;
                             }
                         };
-                        let cn = client_cn(&tls_stream).unwrap_or_else(|| "unknown".into());
+                        let cn = crate::tls::peer_common_name(tls_stream.get_ref().1).unwrap_or_else(|| "unknown".into());
                         let audit = format!("{cn}@{peer}");
                         if let Err(e) =
                             crate::control::handle_connection(tls_stream, dispatch, Some(audit))
@@ -200,22 +200,6 @@ async fn sync_control_ca(
 
 /// CN of the verified client certificate (the operator name from
 /// `keel credentials create <name>`).
-fn client_cn(
-    stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> Option<String> {
-    let (_, conn) = stream.get_ref();
-    let der = conn.peer_certificates()?.first()?;
-    let cert = openssl::x509::X509::from_der(der.as_ref()).ok()?;
-    let cn = cert
-        .subject_name()
-        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-        .next()?
-        .data()
-        .to_string()
-        .ok()?;
-    Some(cn)
-}
-
 fn build_server_tls(
     cert_pem: &str,
     key_pem: &str,

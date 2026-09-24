@@ -35,6 +35,9 @@ pub enum ClientRequest {
     /// Replicate the control CA (cert + key) so one keelconfig authenticates
     /// to every node and `keel credentials create` works on any of them.
     SetControlCa { cert_pem: String, key_pem: String },
+    /// Replicate the cluster CA (cert + key), committed once by the bootstrap
+    /// node, so every member can issue certificates to joining nodes.
+    SetClusterCa { cert_pem: String, key_pem: String },
 }
 
 /// host → (cert PEM, key PEM). Replicated ACME certificates.
@@ -46,6 +49,9 @@ pub type ChallengeMap = BTreeMap<String, String>;
 
 /// (cert PEM, key PEM) of the cluster-wide control CA, once one is committed.
 pub type ControlCaPair = Option<(String, String)>;
+
+/// (cert PEM, key PEM) of the cluster CA, once the bootstrap node committed it.
+pub type ClusterCaPair = Option<(String, String)>;
 
 /// Response from the state machine after applying a log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,4 +82,7 @@ pub struct ClusterState {
     /// The control CA shared by every node's remote control listener.
     #[serde(default)]
     pub control_ca: ControlCaPair,
+    /// The cluster CA every member issues node certificates from.
+    #[serde(default)]
+    pub cluster_ca: ClusterCaPair,
 }

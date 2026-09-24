@@ -29,8 +29,6 @@ cluster:
   addr: 0.0.0.0:7654        # bind address for peer connections
   advertise: 10.0.0.1:7654  # address the other nodes connect to (node ID: generated, see keel.state_dir)
   secret: change-me-in-production
-  # The bootstrap node generates the cluster CA. ca_cert / ca_key are
-  # accepted but not used: bringing your own CA is not implemented.
 
 pools:
   web:

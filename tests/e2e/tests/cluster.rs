@@ -1,7 +1,9 @@
 //! Three-node cluster: formation and voter promotion, config push through the
 //! leader, remote control over mTLS on every node, stepdown and the quorum
 //! probe, and node identity — an ID generated once and kept, a node that moves
-//! to a new address, and a copied state directory.
+//! to a new address, and a copied state directory. node2 joins through the
+//! bootstrap node and node3 through node2, so every stack admits one node
+//! through a follower, which holds the replicated cluster CA.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -20,8 +22,8 @@ fn ip(node: &str) -> String {
     format!("172.29.83.1{}", &node[4..])
 }
 
-fn join_args() -> String {
-    format!("--cluster --join {}:7654 --secret {SECRET}", ip("node1"))
+fn join_args(target: &str) -> String {
+    format!("--cluster --join {}:7654 --secret {SECRET}", ip(target))
 }
 
 fn compose() -> String {
@@ -39,10 +41,10 @@ services:
 "#,
     );
     for node in NODES {
-        let role = if node == "node1" {
-            format!("--cluster --bootstrap --secret {SECRET}")
-        } else {
-            join_args()
+        let role = match node {
+            "node1" => format!("--cluster --bootstrap --secret {SECRET}"),
+            "node2" => join_args("node1"),
+            _ => join_args("node2"),
         };
         let command: Vec<String> =
             format!("--config /etc/keel/keel.yaml {role}").split(' ').map(|a| format!("\"{a}\"")).collect();
@@ -61,7 +63,7 @@ services:
         ));
     }
     // node4 waits for a node ID file before it starts keel, so a test can
-    // give it a copy of another node's state first.
+    // give it a copy of another node's state first. It joins through node2.
     s.push_str(&format!(
         r#"  node4:
     image: {{image}}
@@ -71,7 +73,7 @@ services:
     volumes: ["./node4.yaml:/etc/keel/keel.yaml:ro"]
     networks: {{ net: {{ ipv4_address: 172.29.83.14 }} }}
 "#,
-        join = join_args()
+        join = join_args("node2")
     ));
     s
 }
@@ -376,5 +378,24 @@ fn a_copied_state_directory_is_refused() -> Result<()> {
     assert!(line.contains(&format!("{}:7654", ip("node2"))), "refusal names the member's address: {line}");
     assert!(line.contains("172.29.83.14:7654"), "refusal names the joiner's address: {line}");
     assert_eq!(cluster.members("node1")?, cluster.all_ids(), "membership unchanged");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_follower_admits_a_joiner() -> Result<()> {
+    let cluster = Cluster::up("cluster-follower-join")?;
+    assert_ne!(cluster.leader()?, "node2", "node2 is a follower");
+
+    // A fresh identity for node4, which joins through node2.
+    let id: u64 = 4_242_424_242;
+    let out = cluster.stack.exec("node4", &["sh", "-c", &format!("mkdir -p /var/lib/keel && echo {id} > {NODE_ID_FILE}")])?;
+    anyhow::ensure!(out.status.success(), "write node ID on node4: {}", String::from_utf8_lossy(&out.stderr));
+
+    wait_until("node4 a voter", Duration::from_secs(90), || {
+        let members = cluster.membership("node1")?;
+        let voter = members.get(&id).is_some_and(|(role, addr)| role == "voter" && addr == "172.29.83.14:7654");
+        Ok((voter && members.len() == 4).then_some(()))
+    })?;
     Ok(())
 }

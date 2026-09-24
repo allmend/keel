@@ -6,7 +6,7 @@ This page describes the security properties of Keel's proxy and cluster code: wh
 
 ## Encrypted cluster join
 
-The join handshake between a new node and the bootstrap node runs over plain TCP, before any mTLS identity exists. Its response carries the cluster CA certificate and the new node's freshly issued private key, which must not travel in cleartext.
+The join handshake between a new node and the member it joins through runs over plain TCP, before any mTLS identity exists. Its response carries the cluster CA certificate and the new node's freshly issued private key, which must not travel in cleartext.
 
 Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. The key is derived from the shared secret (`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh random nonce. The secret itself is never sent on the wire; successful decryption on the receiving side proves the peer holds it. A peer without the secret cannot read a captured exchange or forge a join request or response.
 
@@ -17,6 +17,14 @@ keel --config keel.yaml --cluster --bootstrap --secret "$(openssl rand -hex 32)"
 ```
 
 See [Cluster](cluster.md) for the full join flow.
+
+---
+
+## Peer identity
+
+Every node's certificate is issued by the cluster CA and names the node: `CN=keel-node-<id>`. The handshake proves a peer holds a certificate from the cluster CA; beyond that, each request that names a sender — a Raft message's vote, a stepdown's node — must name the node its certificate belongs to, or it is refused and logged. A member's certificate therefore cannot vote, replicate, or step down in another member's name.
+
+The cluster CA's key is committed to Raft and held in memory by every member, so any member can admit joiners. A compromised member holds the key.
 
 ---
 

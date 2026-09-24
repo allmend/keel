@@ -55,14 +55,6 @@ struct Cli {
     #[arg(long)]
     secret: Option<String>,
 
-    /// Path to cluster CA certificate (BYO CA mode)
-    #[arg(long)]
-    ca_cert: Option<String>,
-
-    /// Path to cluster CA key (BYO CA mode)
-    #[arg(long)]
-    ca_key: Option<String>,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -329,4 +321,22 @@ fn cli_backend_add(address: &str, pool: &str) -> Result<()> {
         "Live backend addition is not supported in standalone mode.\n\
          Add '{address}' to pool '{pool}' in keel.yaml and run 'keel config reload'."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn own_ca_flags_are_refused() {
+        for flag in ["--ca-cert", "--ca-key"] {
+            let err = Cli::try_parse_from(["keel", "--cluster", "--bootstrap", flag, "ca.pem"])
+                .err()
+                .expect("flag must be refused")
+                .to_string();
+            assert!(err.contains(flag), "error names the flag: {err}");
+        }
+    }
 }
