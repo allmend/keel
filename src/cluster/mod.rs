@@ -1,3 +1,4 @@
+pub mod identity;
 pub mod network;
 pub mod store;
 pub mod types;
@@ -121,7 +122,10 @@ fn join_open(key: &ring::aead::LessSafeKey, framed: &[u8]) -> Option<Vec<u8>> {
 
 pub struct ClusterOpts {
     pub node_id: NodeId,
+    /// Peer listener bind address.
     pub cluster_addr: String,
+    /// Address announced to the other nodes (`cluster.advertise`, or the bind address).
+    pub advertise: String,
     pub secret: Option<String>,
     pub bootstrap: bool,
     pub join: Option<String>,
@@ -443,7 +447,8 @@ async fn handle_join(
 
         let req: JoinRequest = serde_json::from_slice(&plaintext)?;
 
-        let envelope = match ca.issue_node_cert(req.node_id) {
+        let admitted = admit_known_id(&raft, req.node_id, &req.addr).await;
+        let envelope = match admitted.and_then(|()| ca.issue_node_cert(req.node_id).map_err(|e| e.to_string())) {
             Ok((cert_pem, key_pem)) => {
                 // Add the joining node as a learner — non-blocking.
                 let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
@@ -461,7 +466,10 @@ async fn handle_join(
                     node_key_pem: key_pem,
                 })
             }
-            Err(e) => JoinEnvelope::Err { message: e.to_string() },
+            Err(message) => {
+                warn!(node_id = req.node_id, addr = req.addr, "cluster: join rejected: {message}");
+                JoinEnvelope::Err { message }
+            }
         };
 
         let joined = matches!(envelope, JoinEnvelope::Ok(_));
@@ -482,6 +490,53 @@ async fn handle_join(
 
     if let Err(e) = result {
         error!(error = %e, "cluster: join handler error");
+    }
+}
+
+/// How long the leader waits for a member's registered address to answer
+/// before it treats a joiner with that member's node ID as the member, moved.
+const REGISTERED_ADDR_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A node ID that is already a member, arriving from another address, is
+/// either that node readdressed or a copy of its state directory. If the
+/// registered address still answers it is a copy, and the join is refused.
+/// Otherwise the old member is removed, so the node joins again as a learner
+/// at its new address and is promoted once its log has caught up — never
+/// re-admitted as a voter under a changed address.
+async fn admit_known_id(raft: &ClusterRaft, node_id: NodeId, addr: &str) -> std::result::Result<(), String> {
+    let m = raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership();
+    let Some(old) = membership.nodes().find(|(id, _)| **id == node_id).map(|(_, n)| n.addr.clone()) else {
+        return Ok(());
+    };
+    if old == addr {
+        return Ok(());
+    }
+
+    let answers = tokio::time::timeout(REGISTERED_ADDR_PROBE, TcpStream::connect(&old))
+        .await
+        .is_ok_and(|r| r.is_ok());
+    if answers {
+        return Err(format!(
+            "node ID {node_id} is a member at {old}, which still answers; {addr} holds a copy of its state directory"
+        ));
+    }
+
+    let ids = std::collections::BTreeSet::from([node_id]);
+    let change = if membership.voter_ids().any(|v| v == node_id) {
+        openraft::ChangeMembers::RemoveVoters(ids)
+    } else {
+        openraft::ChangeMembers::RemoveNodes(ids)
+    };
+    let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
+    let removed = when_membership_free(deadline, || raft.change_membership(change.clone(), false));
+    match tokio::time::timeout_at(deadline, removed).await {
+        Ok(Ok(_)) => {
+            info!(node_id, old, new = addr, "cluster: member moved to a new address; joins again as learner");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(format!("cannot remove node ID {node_id} at {old}: {e}")),
+        Err(_) => Err(format!("removing node ID {node_id} at {old} did not commit; no quorum?")),
     }
 }
 
@@ -612,7 +667,7 @@ impl ClusterService {
         } else {
             let join_addr = opts.join.as_ref().unwrap();
             let Some((ca_pem, cert, key)) =
-                join_with_retry(join_addr, &secret, opts.node_id, &opts.cluster_addr, shutdown)
+                join_with_retry(join_addr, &secret, opts.node_id, &opts.advertise, shutdown)
                     .await?
             else {
                 // Shutdown requested while still trying to join.
@@ -642,7 +697,7 @@ impl ClusterService {
 
         if opts.bootstrap {
             let mut members = BTreeMap::new();
-            members.insert(opts.node_id, BasicNode { addr: opts.cluster_addr.clone() });
+            members.insert(opts.node_id, BasicNode { addr: opts.advertise.clone() });
             if let Err(e) = raft.initialize(members).await {
                 // AlreadyInitialized is harmless on restart
                 warn!(error = %e, "cluster: initialize (may already be initialized)");

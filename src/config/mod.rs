@@ -561,6 +561,11 @@ pub struct KeelConfig {
     /// TCP listeners share.
     #[serde(default = "default_udp_max_flows")]
     pub udp_max_flows: usize,
+
+    /// Directory for state Keel creates and keeps across restarts: the node
+    /// ID today. Written by the unprivileged process after the drop.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: String,
 }
 
 impl Default for KeelConfig {
@@ -573,9 +578,12 @@ impl Default for KeelConfig {
             grace_period_seconds: default_grace_period(),
             udp_flow_timeout_seconds: default_udp_flow_timeout(),
             udp_max_flows: default_udp_max_flows(),
+            state_dir: default_state_dir(),
         }
     }
 }
+
+fn default_state_dir() -> String { "/var/lib/keel".into() }
 
 fn default_grace_period() -> u64 { 10 }
 fn default_udp_flow_timeout() -> u64 { 30 }
@@ -1210,14 +1218,19 @@ impl Default for AccessLogConfig {
 fn default_access_log_enabled() -> bool { true }
 fn default_access_log_dir() -> String { "/var/log/keel".into() }
 
+// Unknown keys are refused here: `node_id` is not a setting (the node ID is
+// generated on first start), and a misspelt `advertise` would otherwise leave
+// the node announcing its bind address.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Peer RPC listen address. Default: 0.0.0.0:7654
     #[serde(default = "default_cluster_addr")]
     pub addr: String,
 
-    /// This node's Raft node ID. Derived from addr hash if not set.
-    pub node_id: Option<u64>,
+    /// Address other nodes use to reach this one. Defaults to `addr`; required
+    /// when `addr` is unspecified (0.0.0.0 or ::).
+    pub advertise: Option<String>,
 
     pub secret: Option<String>,
     pub ca_cert: Option<String>,
@@ -1238,6 +1251,23 @@ mod tests {
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    #[test]
+    fn cluster_node_id_is_not_a_setting() {
+        let yaml = format!("{POOL}cluster:\n  addr: 10.0.0.1:7654\n  node_id: 1\n");
+        let err = serde_yml::from_str::<Config>(&yaml).expect_err("node_id must be refused").to_string();
+        assert!(err.contains("node_id"), "error names the option: {err}");
+    }
+
+    #[test]
+    fn cluster_advertise_and_state_dir_parse() {
+        let yaml = format!("{POOL}keel:\n  state_dir: /srv/keel\ncluster:\n  addr: 0.0.0.0:7654\n  advertise: 10.0.0.1:7654\n");
+        let cfg: Config = serde_yml::from_str(&yaml).expect("yaml parses");
+        assert_eq!(cfg.keel.state_dir, "/srv/keel");
+        assert_eq!(cfg.cluster.unwrap().advertise.as_deref(), Some("10.0.0.1:7654"));
+        let cfg: Config = serde_yml::from_str(POOL).expect("yaml parses");
+        assert_eq!(cfg.keel.state_dir, "/var/lib/keel");
     }
 
     #[test]

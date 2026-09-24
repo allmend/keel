@@ -79,7 +79,11 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
         .with_context(|| format!("master: cannot set group on {}", socket_dir.display()))?;
     info!(dir = %socket_dir.display(), "master: control socket directory ready (root-owned)");
 
-    let mut dirs = vec![crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket)];
+    let mut dirs = vec![
+        crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket),
+        // The node ID is created here on first start, after the drop.
+        std::path::PathBuf::from(&cfg.keel.state_dir),
+    ];
     if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.as_ref()) {
         dirs.push(std::path::PathBuf::from(&remote.ca_dir));
     }

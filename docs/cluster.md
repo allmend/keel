@@ -86,7 +86,7 @@ segment cannot read them, and a peer without the secret cannot decrypt or forge 
 
 Raft state — log, membership, and the cluster CA — is held in memory only; nothing is written to disk. A node does not rejoin on its own after a restart:
 
-- A restarted member must be started with `--join` again, pointing at the bootstrap node. It receives the current state from the leader after joining.
+- A restarted member must be started with `--join` again, pointing at the bootstrap node. It rejoins under its node ID (see [Node identity](#node-identity)) and receives the current state from the leader.
 - A restarted bootstrap node started with `--bootstrap` generates a new cluster CA and forms a new single-node cluster. The other nodes hold certificates from the previous CA and cannot communicate with it; restart them with `--join` pointing at the new bootstrap node.
 - After a full cluster restart, each node starts from its local `keel.yaml` and every backend is active. ACME certificates are recovered from disk (see [ACME certificates in cluster mode](#acme-certificates-in-cluster-mode)).
 
@@ -96,22 +96,38 @@ Raft state — log, membership, and the cluster CA — is held in memory only; n
 
 ```yaml
 cluster:
-  addr: 10.0.0.1:7654      # this node's peer address: bound locally and announced to the cluster
-  node_id: 1               # optional; derived from addr if omitted
+  addr: 0.0.0.0:7654         # bind address for Raft peer connections
+  advertise: 10.0.0.1:7654   # address the other nodes connect to
   secret: change-me-in-production
 ```
 
 | Field | Default | Notes |
 |---|---|---|
-| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections, and the address this node announces to the other nodes |
-| `node_id` | derived | Must be unique across the cluster |
+| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections |
+| `advertise` | `addr` | Address this node announces to the other nodes |
 | `secret` | none | Shared secret for join authentication |
 | `ca_cert` | none | Accepted but not used; see [Cluster CA](#cluster-ca) |
 | `ca_key` | none | Accepted but not used |
 
-`addr` is used both to bind the peer listener and as the address other nodes connect to, so it must be an address the other nodes can reach, such as `10.0.0.1:7654`. The default `0.0.0.0:7654` is not reachable from another host.
+The other nodes connect to `advertise`, or to `addr` when `advertise` is not set, so that address must be reachable from them. An unspecified address (`0.0.0.0`, `::`) can be bound but not reached: cluster mode refuses to start when the announced address is unspecified, naming `cluster.advertise`. Unknown keys under `cluster:` are refused.
 
-If `node_id` is omitted, Keel derives it from a hash of the `addr` string. Nodes with the same `addr` string — including every node left at the default — derive the same `node_id`. Set a unique `addr` on every node, or set `node_id` explicitly.
+---
+
+## Node identity
+
+Each node has a random 64-bit node ID. It is generated on first start and stored in `node_id` in `keel.state_dir` (default `/var/lib/keel/node_id`); every later start, reboot, or upgrade reads it back. The ID is not a setting. A `node_id` file that cannot be read or parsed stops the node from starting — Keel never picks a new ID in its place. Started as root, Keel creates the state directory and assigns it to `keel.user` before dropping privileges.
+
+`keel cluster status` shows each member's ID and address, and the node's own ID. The node certificate carries it as `CN=keel-node-<id>`.
+
+A join with an ID that is already a member is handled by where it comes from:
+
+| Join comes from | Result |
+|---|---|
+| The member's registered address | The node rejoins (a restart) |
+| Another address, and the registered address still answers | Refused: the joiner holds a copy of the member's state directory — a cloned VM or a copied disk. It exits with `join rejected: node ID … is a member at …, which still answers; … holds a copy of its state directory` |
+| Another address, and the registered address does not answer | The node has moved. The leader removes the old member; the node joins again as a learner at its new address and is promoted to voter once its log has caught up |
+
+To give a copied machine an identity of its own, delete `node_id` from its state directory before it first starts.
 
 ---
 

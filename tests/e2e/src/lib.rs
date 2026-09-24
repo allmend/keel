@@ -128,6 +128,29 @@ impl Stack {
         Ok(stack)
     }
 
+    /// Replace a file the stack was created with (a node's config, say);
+    /// the node reads it on its next start.
+    pub fn write_file(&self, file: &str, content: &str) -> Result<()> {
+        std::fs::write(self.dir.join(file), content).with_context(|| format!("write {file}"))
+    }
+
+    /// Move a stopped service to another address on the stack's network.
+    pub fn set_ip(&self, service: &str, ip: &str) -> Result<()> {
+        let out = self.compose(&["ps", "--all", "--quiet", service])?;
+        let container = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let network = format!("{}_net", self.project);
+        for args in [
+            vec!["network", "disconnect", network.as_str(), container.as_str()],
+            vec!["network", "connect", "--ip", ip, network.as_str(), container.as_str()],
+        ] {
+            let out = Command::new("docker").args(&args).output().context("cannot run docker")?;
+            if !out.status.success() {
+                bail!("docker {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+            }
+        }
+        Ok(())
+    }
+
     fn compose(&self, args: &[&str]) -> Result<Output> {
         let out = Command::new("docker")
             .args(["compose", "--project-name", &self.project, "--file"])

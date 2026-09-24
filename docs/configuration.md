@@ -33,6 +33,7 @@ keel:
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
   grace_period_seconds: 10   # graceful shutdown: time for in-flight requests
   udp_flow_timeout_seconds: 30   # idle time before a UDP flow expires
+  state_dir: /var/lib/keel   # state kept across restarts: the node ID
 ```
 
 | Field | Type | Default |
@@ -44,6 +45,7 @@ keel:
 | `grace_period_seconds` | integer | `10` |
 | `udp_flow_timeout_seconds` | integer | `30` |
 | `udp_max_flows` | integer | `8192` |
+| `state_dir` | string | `/var/lib/keel` |
 
 On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
@@ -298,18 +300,20 @@ Required in cluster mode. Omit for standalone.
 
 ```yaml
 cluster:
-  addr: 10.0.0.1:7654   # bound locally and announced to the other nodes
-  node_id: 1            # optional; derived from addr hash if absent
+  addr: 0.0.0.0:7654         # bind address for peer connections
+  advertise: 10.0.0.1:7654   # address the other nodes connect to
   secret: change-me
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `addr` | string | `0.0.0.0:7654` | Peer listen address, also announced to the other nodes — must be reachable from them |
-| `node_id` | integer | derived | Raft node ID; must be unique per cluster. Derived from the `addr` string, so nodes with the same `addr` get the same ID |
+| `addr` | string | `0.0.0.0:7654` | Peer listen address |
+| `advertise` | string | `addr` | Address announced to the other nodes. Required when `addr` is unspecified (`0.0.0.0`, `::`) |
 | `secret` | string | none | Shared secret for join authentication |
 | `ca_cert` | string | none | Accepted but not used |
 | `ca_key` | string | none | Accepted but not used |
+
+Unknown keys under `cluster:` are refused. The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity).
 
 See [Cluster](cluster.md) for bootstrap, join, and restarts.
 

@@ -8,6 +8,26 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`cluster.advertise`**: the address a node announces to the other nodes,
+  separate from the bind address `cluster.addr`, so a node can bind
+  `0.0.0.0:7654` and announce `10.0.0.1:7654`. Cluster mode refuses to start
+  when the announced address is unspecified (`0.0.0.0`, `::`).
+- **Permanent node IDs.** A node generates a random 64-bit ID on first start
+  and keeps it in `keel.state_dir` (default `/var/lib/keel`) across restarts,
+  reboots and upgrades. A join with a member's ID from another address is
+  refused while the member's registered address still answers — the joiner
+  holds a copy of its state directory. When the address does not answer, the
+  node has moved: the old member is removed and the node joins again as a
+  learner at its new address. See [Node identity](docs/cluster.md#node-identity).
+
+### Changed
+
+- **BREAKING:** `cluster.node_id` is not a setting; a config that sets it
+  fails to load, naming the option. Unknown keys under `cluster:` are
+  refused. A node gets its random ID on its first start with this version.
+
 ---
 
 ## [0.16.0] — 2026-09-24

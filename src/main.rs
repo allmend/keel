@@ -218,18 +218,20 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
     let cluster_addr = cluster_cfg
         .map(|c| c.addr.clone())
         .unwrap_or_else(|| "0.0.0.0:7654".to_owned());
+    let advertise = cluster::identity::announce_addr(&cluster_addr, cluster_cfg.and_then(|c| c.advertise.as_deref()))?;
 
-    let node_id = cluster_cfg
-        .and_then(|c| c.node_id)
-        .unwrap_or_else(|| derive_node_id(&cluster_addr));
+    // Read or created after the drop: the state directory belongs to keel.user.
+    let state_dir = std::path::Path::new(&cfg.keel.state_dir);
+    let node_id = cluster::identity::load_or_create_node_id(state_dir)?;
 
     let secret = cli.secret.or_else(|| cluster_cfg.and_then(|c| c.secret.clone()));
 
-    info!(node_id, cluster_addr, "starting keel in cluster mode");
+    info!(node_id, cluster_addr, advertise, "starting keel in cluster mode");
 
     let opts = cluster::ClusterOpts {
         node_id,
         cluster_addr,
+        advertise,
         secret,
         bootstrap: cli.bootstrap,
         join: cli.join,
@@ -237,14 +239,6 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
 
     let (handle, svc) = cluster::new_cluster(opts);
     proxy::run_cluster(&cfg, handle, svc, sockets)
-}
-
-fn derive_node_id(addr: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    addr.hash(&mut h);
-    h.finish()
 }
 
 // Cli commands
