@@ -1,5 +1,6 @@
 pub mod identity;
 pub mod network;
+pub mod persist;
 pub mod store;
 pub mod types;
 
@@ -126,6 +127,10 @@ pub struct ClusterOpts {
     pub cluster_addr: String,
     /// Address announced to the other nodes (`cluster.advertise`, or the bind address).
     pub advertise: String,
+    /// `keel.state_dir`: node ID, certificates, `members.yaml`, and `raft/`.
+    pub state_dir: std::path::PathBuf,
+    /// Forced recovery: keep the stored state, make this node the only member.
+    pub force_new_cluster: bool,
     pub secret: Option<String>,
     pub bootstrap: bool,
     pub join: Option<String>,
@@ -340,7 +345,7 @@ const JOIN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 /// started simultaneously by a supervisor, so "the bootstrap listener is not up
 /// yet" is the normal case, not an error worth dying over.
 async fn join_with_retry(
-    join_addr: &str,
+    targets: &[String],
     secret: &str,
     node_id: NodeId,
     my_addr: &str,
@@ -349,6 +354,8 @@ async fn join_with_retry(
     let mut delay = JOIN_RETRY_INITIAL;
     let mut attempt = 1u32;
     loop {
+        // Several targets (members a node remembers) are tried in turn.
+        let join_addr = &targets[(attempt as usize - 1) % targets.len()];
         match do_join(join_addr, secret, node_id, my_addr).await {
             Ok(certs) => return Ok(Some(certs)),
             Err(JoinError::Fatal(e)) => {
@@ -556,25 +563,26 @@ async fn admit_joiner(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String) -> 
 /// before it treats a joiner with that member's node ID as the member, moved.
 const REGISTERED_ADDR_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// A node ID that is already a member, arriving from another address, is
-/// either that node readdressed or a copy of its state directory. If the
-/// registered address still answers it is a copy, and the join is refused.
-/// Otherwise the old member is removed, so the node joins again as a learner
-/// at its new address and is promoted once its log has caught up — never
-/// re-admitted as a voter under a changed address.
+/// A join under an ID that is already a member comes from that node after it
+/// lost its Raft state (from its registered address), from that node moved to
+/// a new address, or from a copy of its state directory. A copy is told apart
+/// by the registered address still answering, and refused. Otherwise the old
+/// member is removed, so the node joins again as a learner and is promoted once
+/// its log has caught up — never re-admitted as a voter that forgot its log.
 async fn admit_known_id(raft: &ClusterRaft, node_id: NodeId, addr: &str) -> std::result::Result<(), String> {
     let m = raft.metrics().borrow().clone();
     let membership = m.membership_config.membership();
     let Some(old) = membership.nodes().find(|(id, _)| **id == node_id).map(|(_, n)| n.addr.clone()) else {
         return Ok(());
     };
-    if old == addr {
-        return Ok(());
-    }
-
-    let answers = tokio::time::timeout(REGISTERED_ADDR_PROBE, TcpStream::connect(&old))
-        .await
-        .is_ok_and(|r| r.is_ok());
+    // A node with stored state restarts from it and never joins, so a join
+    // under a member's ID means that node lost its state: it must not come
+    // back as a voter that forgot its votes and log. From the same address,
+    // it is that node restarting; from another, it has moved or is a copy.
+    let answers = old != addr
+        && tokio::time::timeout(REGISTERED_ADDR_PROBE, TcpStream::connect(&old))
+            .await
+            .is_ok_and(|r| r.is_ok());
     if answers {
         return Err(format!(
             "node ID {node_id} is a member at {old}, which still answers; {addr} holds a copy of its state directory"
@@ -591,7 +599,7 @@ async fn admit_known_id(raft: &ClusterRaft, node_id: NodeId, addr: &str) -> std:
     let removed = when_membership_free(deadline, || raft.change_membership(change.clone(), false));
     match tokio::time::timeout_at(deadline, removed).await {
         Ok(Ok(_)) => {
-            info!(node_id, old, new = addr, "cluster: member moved to a new address; joins again as learner");
+            info!(node_id, old, new = addr, "cluster: member lost its state or moved; joins again as learner");
             Ok(())
         }
         Ok(Err(e)) => Err(format!("cannot remove node ID {node_id} at {old}: {e}")),
@@ -674,6 +682,136 @@ async fn promote_to_voter(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String)
     }
 }
 
+// Starting from stored state
+
+/// How a node enters the cluster.
+enum Start {
+    /// From its stored Raft state.
+    Restore,
+    /// As the first member of a new cluster.
+    Bootstrap,
+    /// Through one of these members.
+    Join(Vec<String>),
+}
+
+/// Open the node's Raft store. A store that cannot be read is set aside and
+/// replaced with an empty one: the node then rejoins rather than refusing to
+/// start, and its listeners keep serving meanwhile. A node whose stored
+/// address differs from `advertise` has moved: alone, it rewrites its own
+/// membership; with others, it sets the store aside and rejoins as a learner
+/// at the new address. `--force-new-cluster` makes this node the only member.
+fn open_store(opts: &ClusterOpts) -> Result<(Arc<persist::Disk>, persist::Loaded)> {
+    let dir = opts.state_dir.join("raft");
+    let (mut disk, mut loaded) = match persist::Disk::open(&dir) {
+        Ok(opened) => opened,
+        Err(e) => {
+            let aside = persist::set_aside(&dir, "corrupt")?;
+            error!(
+                error = %format!("{e:#}"),
+                aside = %aside.display(),
+                "cluster: Raft store unreadable and set aside; this node rejoins the cluster and keeps serving meanwhile"
+            );
+            persist::Disk::open(&dir)?
+        }
+    };
+
+    let stored_addr = loaded
+        .membership()
+        .and_then(|m| m.nodes().find(|(id, _)| **id == opts.node_id).map(|(_, n)| n.addr.clone()));
+    if let Some(old) = stored_addr.filter(|a| *a != opts.advertise) {
+        let alone = loaded.membership().is_some_and(|m| m.nodes().all(|(id, _)| *id == opts.node_id));
+        if alone {
+            persist::force_single_member(&disk, &mut loaded, opts.node_id, &opts.advertise)?;
+            info!(old, new = opts.advertise, "cluster: announced address changed; membership updated");
+        } else {
+            drop(disk); // releases the store's file lock before the move
+            let aside = persist::set_aside(&dir, "moved")?;
+            info!(
+                old,
+                new = opts.advertise,
+                aside = %aside.display(),
+                "cluster: announced address changed; rejoining the cluster at the new address"
+            );
+            (disk, loaded) = persist::Disk::open(&dir)?;
+        }
+    }
+
+    if opts.force_new_cluster {
+        if loaded.is_empty() {
+            anyhow::bail!("--force-new-cluster keeps this node's stored state, and it has none");
+        }
+        persist::force_single_member(&disk, &mut loaded, opts.node_id, &opts.advertise)?;
+        warn!("cluster: forced recovery: this node is now the only member; other nodes join it with --join");
+    }
+    Ok((disk, loaded))
+}
+
+/// Stored state always wins: a node with a store restarts from it and never
+/// bootstraps again, whatever its flags say. Without a store, members it
+/// remembers mean it lost its state: it rejoins through them, and a node that
+/// was alone starts over as a one-member cluster.
+fn decide_start(opts: &ClusterOpts, loaded: &persist::Loaded) -> Result<Start> {
+    if !loaded.is_empty() {
+        if opts.bootstrap || opts.join.is_some() {
+            info!("cluster: restarting from stored state; --bootstrap and --join are ignored");
+        } else {
+            info!("cluster: restarting from stored state");
+        }
+        return Ok(Start::Restore);
+    }
+    let remembered = identity::read_members(&opts.state_dir)?.unwrap_or_default();
+    let others: Vec<String> = remembered
+        .members
+        .iter()
+        .filter(|m| m.node_id != opts.node_id)
+        .map(|m| m.addr.clone())
+        .collect();
+    if !others.is_empty() {
+        warn!(members = others.len(), "cluster: no Raft state but known members; rejoining as a learner");
+        return Ok(Start::Join(opts.join.iter().cloned().chain(others).collect()));
+    }
+    if !remembered.members.is_empty() {
+        warn!("cluster: no Raft state for this one-member cluster; starting it again: drain state and history are gone");
+        return Ok(Start::Bootstrap);
+    }
+    match (opts.bootstrap, &opts.join) {
+        (true, _) => Ok(Start::Bootstrap),
+        (false, Some(target)) => Ok(Start::Join(vec![target.clone()])),
+        (false, None) => anyhow::bail!("this node has no stored cluster state: start it with --bootstrap or --join"),
+    }
+}
+
+/// Rewrite `members.yaml` whenever the membership changes.
+async fn keep_members_file(raft: Arc<ClusterRaft>, state_dir: std::path::PathBuf) {
+    let mut metrics = raft.metrics();
+    let mut written: Option<identity::MemberList> = None;
+    loop {
+        let list = {
+            let m = metrics.borrow();
+            let membership = m.membership_config.membership();
+            let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+            let members = membership
+                .nodes()
+                .map(|(id, n)| identity::Member {
+                    node_id: *id,
+                    addr: n.addr.clone(),
+                    role: if voters.contains(id) { "voter" } else { "learner" }.to_owned(),
+                })
+                .collect();
+            identity::MemberList { members }
+        };
+        if !list.members.is_empty() && written.as_ref() != Some(&list) {
+            match identity::write_members(&state_dir, &list) {
+                Ok(()) => written = Some(list),
+                Err(e) => warn!(error = %format!("{e:#}"), "cluster: cannot write members.yaml"),
+            }
+        }
+        if metrics.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 // Cluster service
 
 pub struct ClusterService {
@@ -704,10 +842,6 @@ impl ClusterService {
     async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
         let opts = &self.opts;
 
-        if !opts.bootstrap && opts.join.is_none() {
-            anyhow::bail!("cluster mode requires --bootstrap or --join");
-        }
-
         // A non-empty shared secret is mandatory. Without it the join listener would
         // hand a CA-signed mTLS identity to any peer that can reach the cluster port,
         // which is a full cluster takeover. Refuse to start rather than run open.
@@ -719,24 +853,41 @@ impl ClusterService {
             );
         }
 
-        // The bootstrap node generates the cluster CA and commits it to Raft
-        // below; every member then issues node certificates from that copy.
-        let (ca_cert_pem, node_cert_pem, node_key_pem, ca) = if opts.bootstrap {
-            let ca = Ca::generate().context("CA generation failed")?;
-            let (cert, key) = ca.issue_node_cert(opts.node_id)?;
-            let ca_pem = ca.cert_pem.clone();
-            (ca_pem, cert, key, Some(ca))
-        } else {
-            let join_addr = opts.join.as_ref().unwrap();
-            let Some((ca_pem, cert, key)) =
-                join_with_retry(join_addr, &secret, opts.node_id, &opts.advertise, shutdown)
-                    .await?
-            else {
-                // Shutdown requested while still trying to join.
-                return Ok(());
-            };
-            (ca_pem, cert, key, None)
+        let (disk, loaded) = open_store(opts)?;
+        let start = decide_start(opts, &loaded)?;
+
+        let (tls, ca) = match &start {
+            Start::Restore => {
+                let tls = identity::load_node_tls(&opts.state_dir)?.with_context(|| {
+                    format!(
+                        "{} holds Raft state but no node certificate; move the raft/ directory aside to rejoin",
+                        opts.state_dir.display()
+                    )
+                })?;
+                (tls, None)
+            }
+            Start::Bootstrap => {
+                // The cluster CA is committed to Raft below; every member then
+                // issues node certificates from that copy.
+                let ca = Ca::generate().context("CA generation failed")?;
+                let (node_cert_pem, node_key_pem) = ca.issue_node_cert(opts.node_id)?;
+                let tls = identity::NodeTls { ca_cert_pem: ca.cert_pem.clone(), node_cert_pem, node_key_pem };
+                (tls, Some(ca))
+            }
+            Start::Join(targets) => {
+                let Some((ca_cert_pem, node_cert_pem, node_key_pem)) =
+                    join_with_retry(targets, &secret, opts.node_id, &opts.advertise, shutdown).await?
+                else {
+                    // Shutdown requested while still trying to join.
+                    return Ok(());
+                };
+                (identity::NodeTls { ca_cert_pem, node_cert_pem, node_key_pem }, None)
+            }
         };
+        if !matches!(start, Start::Restore) {
+            identity::save_node_tls(&opts.state_dir, &tls)?;
+        }
+        let identity::NodeTls { ca_cert_pem, node_cert_pem, node_key_pem } = tls;
 
         let sm = StateMachine::default();
         sm.set_config_tx(Arc::clone(&self.config_tx));
@@ -744,8 +895,9 @@ impl ClusterService {
         sm.set_challenges_tx(Arc::clone(&self.challenges_tx));
         sm.set_control_ca_tx(Arc::clone(&self.control_ca_tx));
         sm.set_cluster_ca_tx(Arc::clone(&self.cluster_ca_tx));
+        sm.persisted(Arc::clone(&disk), loaded.snapshot.as_ref())?;
 
-        let log_store = LogStore::default();
+        let log_store = LogStore::persisted(disk, &loaded);
         let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
 
         let client_tls = build_client_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
@@ -758,18 +910,13 @@ impl ClusterService {
                 .map_err(|e| anyhow::anyhow!("Raft init: {e:?}"))?,
         );
 
-        if opts.bootstrap {
-            let mut members = BTreeMap::new();
-            members.insert(opts.node_id, BasicNode { addr: opts.advertise.clone() });
-            if let Err(e) = raft.initialize(members).await {
-                // AlreadyInitialized is harmless on restart
-                warn!(error = %e, "cluster: initialize (may already be initialized)");
-            }
+        if let Some(ca) = &ca {
+            let members = BTreeMap::from([(opts.node_id, BasicNode { addr: opts.advertise.clone() })]);
+            raft.initialize(members).await.map_err(|e| anyhow::anyhow!("cluster: initialize: {e}"))?;
             info!(node_id = opts.node_id, "cluster: bootstrapped as leader");
-            if let Some(ca) = &ca {
-                tokio::spawn(commit_cluster_ca(Arc::clone(&raft), ca.cert_pem.clone(), ca.key_pem.clone()));
-            }
+            tokio::spawn(commit_cluster_ca(Arc::clone(&raft), ca.cert_pem.clone(), ca.key_pem.clone()));
         }
+        tokio::spawn(keep_members_file(Arc::clone(&raft), opts.state_dir.clone()));
 
         // Publish the raft handle so ControlServer can use it.
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
@@ -1152,7 +1299,67 @@ async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{claimed_sender, join_key, join_open, join_seal, node_id_from_cn, Ca};
+    use super::{claimed_sender, decide_start, identity, join_key, join_open, join_seal, node_id_from_cn, persist, Ca, ClusterOpts, Start};
+
+    fn opts(name: &str, bootstrap: bool, join: Option<&str>) -> ClusterOpts {
+        let state_dir = std::env::temp_dir().join(format!("keel-start-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        ClusterOpts {
+            node_id: 1,
+            cluster_addr: "0.0.0.0:7654".into(),
+            advertise: "10.0.0.1:7654".into(),
+            state_dir,
+            force_new_cluster: false,
+            secret: Some("s".into()),
+            bootstrap,
+            join: join.map(str::to_owned),
+        }
+    }
+
+    fn remember(opts: &ClusterOpts, ids: &[u64]) {
+        let members = ids
+            .iter()
+            .map(|id| identity::Member { node_id: *id, addr: format!("10.0.0.{id}:7654"), role: "voter".into() })
+            .collect();
+        identity::write_members(&opts.state_dir, &identity::MemberList { members }).unwrap();
+    }
+
+    #[test]
+    fn stored_state_wins_over_the_flags() {
+        let o = opts("restore", true, None);
+        let loaded = persist::Loaded { vote: Some(openraft::Vote::new(1, 1)), ..Default::default() };
+        assert!(matches!(decide_start(&o, &loaded).unwrap(), Start::Restore));
+    }
+
+    #[test]
+    fn a_node_that_lost_its_state_rejoins_through_the_members_it_knew_never_bootstraps() {
+        let o = opts("rejoin", true, None);
+        remember(&o, &[1, 2, 3]);
+        match decide_start(&o, &persist::Loaded::default()).unwrap() {
+            Start::Join(targets) => assert_eq!(targets, vec!["10.0.0.2:7654", "10.0.0.3:7654"]),
+            _ => panic!("must rejoin"),
+        }
+    }
+
+    #[test]
+    fn a_lone_node_that_lost_its_state_starts_over() {
+        let o = opts("alone", false, None);
+        remember(&o, &[1]);
+        assert!(matches!(decide_start(&o, &persist::Loaded::default()).unwrap(), Start::Bootstrap));
+    }
+
+    #[test]
+    fn a_new_node_follows_its_flags() {
+        let empty = persist::Loaded::default();
+        assert!(matches!(decide_start(&opts("new-b", true, None), &empty).unwrap(), Start::Bootstrap));
+        match decide_start(&opts("new-j", false, Some("10.0.0.9:7654")), &empty).unwrap() {
+            Start::Join(targets) => assert_eq!(targets, vec!["10.0.0.9:7654"]),
+            _ => panic!("must join"),
+        }
+        let err = decide_start(&opts("new-none", false, None), &empty).err().expect("no way in").to_string();
+        assert!(err.contains("--bootstrap or --join"), "{err}");
+    }
     use crate::cluster::network::RpcRequest;
     use openraft::raft::{AppendEntriesRequest, VoteRequest};
     use openraft::Vote;

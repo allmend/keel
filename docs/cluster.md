@@ -84,11 +84,29 @@ segment cannot read them, and a peer without the secret cannot decrypt or forge 
 
 ### Restarts
 
-Raft state — log, membership, and the cluster CA — is held in memory only; nothing is written to disk. A node does not rejoin on its own after a restart:
+Each node keeps its Raft state on disk in `raft/store.redb` under `keel.state_dir` (default `/var/lib/keel`): the log, its vote, the committed index, and the latest snapshot. Everything the cluster replicates lives there — pushed config, the cluster and control CAs, ACME certificates and challenges, drain entries. Every write is on disk before Raft counts it.
 
-- A restarted member must be started with `--join` again, pointing at any member. It rejoins under its node ID (see [Node identity](#node-identity)) and receives the current state from the leader.
-- A restarted bootstrap node started with `--bootstrap` generates a new cluster CA and forms a new single-node cluster. The other nodes hold certificates from the previous CA and cannot communicate with it; restart them with `--join` pointing at the new bootstrap node.
-- After a full cluster restart, each node starts from its local `keel.yaml` and every backend is active. ACME certificates are recovered from disk (see [ACME certificates in cluster mode](#acme-certificates-in-cluster-mode)).
+A node with stored state restarts from it: it recovers its membership, catches up from the leader, and takes part in a normal election. It needs neither `--bootstrap` nor `--join`; given either, it logs `restarting from stored state; --bootstrap and --join are ignored` — so a restarted bootstrap node never forms a second cluster, and it keeps the cluster CA. After a full cluster restart the nodes elect a leader among themselves and serve the committed config.
+
+Besides `raft/`, the state directory holds the node's identity: `node_id`, `node.crt`, `node.key` (mode `0600`), `cluster-ca.crt`, and `members.yaml`, the last known members (ID, address, role), rewritten on every membership change.
+
+### Lost or damaged Raft state
+
+A store Keel cannot read stops nothing but the control plane. The node logs `Raft store unreadable and set aside`, moves `raft/` to `raft.corrupt-<time>/` for inspection, and starts: its listeners serve its local config while it rejoins. A node without Raft state rejoins through the members listed in `members.yaml` (and `--join`, if given) — never by bootstrapping, whatever its flags say. The leader removes the old member and adds the node back as a **learner**: it receives the log but does not vote until its log has caught up and it is promoted. A voter that forgot its votes and log could otherwise help elect a leader missing a committed entry.
+
+A node whose `members.yaml` lists only itself was a one-member cluster: it starts a new one, logging that drain state and history are gone.
+
+The same rejoin applies when a node's stored address differs from its `advertise`: it moves `raft/` to `raft.moved-<time>/` and rejoins at the new address under its node ID. A one-member cluster updates its own membership instead.
+
+### Forced recovery
+
+When a majority of the voters is gone for good, the survivors cannot commit anything, including a membership change. Start one survivor with `--force-new-cluster`:
+
+```bash
+keel --config keel.yaml --cluster --force-new-cluster --secret mysecret
+```
+
+It keeps its stored state and makes itself the only member: the committed config, CAs and certificates stay, and it serves writes again. Other nodes join it with `--join` after their `raft/` directory is moved aside. Only use it for members that are gone for good: a member that comes back still holds the old membership and forms a cluster of its own with any peers it can reach.
 
 ---
 

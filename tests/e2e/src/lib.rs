@@ -134,6 +134,21 @@ impl Stack {
         std::fs::write(self.dir.join(file), content).with_context(|| format!("write {file}"))
     }
 
+    /// Run a shell script against one of the stack's named volumes, mounted at
+    /// `/state` — to change a stopped node's stored state.
+    pub fn on_volume(&self, volume: &str, script: &str) -> Result<String> {
+        let image = image()?;
+        let mount = format!("{}_{volume}:/state", self.project);
+        let out = Command::new("docker")
+            .args(["run", "--rm", "-v", &mount, "--entrypoint", "sh", &image, "-c", script])
+            .output()
+            .context("cannot run docker")?;
+        if !out.status.success() {
+            bail!("script on volume {volume}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Move a stopped service to another address on the stack's network.
     pub fn set_ip(&self, service: &str, ip: &str) -> Result<()> {
         let out = self.compose(&["ps", "--all", "--quiet", service])?;

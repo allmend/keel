@@ -17,6 +17,7 @@ These flags are used when starting Keel as a server (no subcommand).
 | `--bootstrap` | false | Bootstrap a new cluster (requires `--cluster`) |
 | `--join <addr>` | none | Join an existing cluster at this address (requires `--cluster`) |
 | `--secret <secret>` | none | Shared secret for cluster join/bootstrap |
+| `--force-new-cluster` | false | Forced recovery: keep this node's Raft state and make it the only member (requires `--cluster`); see [Forced recovery](cluster.md#forced-recovery) |
 
 Examples:
 

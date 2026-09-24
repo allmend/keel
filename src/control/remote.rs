@@ -153,7 +153,9 @@ async fn sync_control_ca(
     mut shutdown: pingora::server::ShutdownWatch,
 ) {
     let mut rx = cluster.control_ca_rx.clone();
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    // Until a CA is committed, followers serve their own: check often, so
+    // credentials work on every node within a second of the cluster forming.
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         let replicated = rx.borrow_and_update().clone();
         match replicated {
@@ -198,8 +200,6 @@ async fn sync_control_ca(
     }
 }
 
-/// CN of the verified client certificate (the operator name from
-/// `keel credentials create <name>`).
 fn build_server_tls(
     cert_pem: &str,
     key_pem: &str,

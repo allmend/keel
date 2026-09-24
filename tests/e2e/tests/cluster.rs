@@ -4,6 +4,10 @@
 //! to a new address, and a copied state directory. node2 joins through the
 //! bootstrap node and node3 through node2, so every stack admits one node
 //! through a follower, which holds the replicated cluster CA.
+//!
+//! Each node reads its flags from `nodeN.args` (so a test can restart it with
+//! others) and keeps `/var/lib/keel` on a named volume (so a test can reach a
+//! stopped node's Raft store).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -26,6 +30,15 @@ fn join_args(target: &str) -> String {
     format!("--cluster --join {}:7654 --secret {SECRET}", ip(target))
 }
 
+/// Start flags: node1 bootstraps, node2 joins through node1, node3 through node2.
+fn start_args(node: &str) -> String {
+    match node {
+        "node1" => format!("--cluster --bootstrap --secret {SECRET}"),
+        "node2" => join_args("node1"),
+        _ => join_args("node2"),
+    }
+}
+
 fn compose() -> String {
     let mut s = String::from(
         r#"
@@ -41,24 +54,16 @@ services:
 "#,
     );
     for node in NODES {
-        let role = match node {
-            "node1" => format!("--cluster --bootstrap --secret {SECRET}"),
-            "node2" => join_args("node1"),
-            _ => join_args("node2"),
-        };
-        let command: Vec<String> =
-            format!("--config /etc/keel/keel.yaml {role}").split(' ').map(|a| format!("\"{a}\"")).collect();
         s.push_str(&format!(
             r#"  {node}:
     image: {{image}}
     init: true
-    command: [{command}]
+    entrypoint: ["sh", "-c", "exec /usr/local/bin/keel --config /etc/keel/keel.yaml $$(cat /etc/keel/args)"]
     environment: [NO_COLOR=1]
-    volumes: ["./{node}.yaml:/etc/keel/keel.yaml:ro"]
+    volumes: ["./{node}.yaml:/etc/keel/keel.yaml:ro", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
     ports: ["80", "10789"]
     networks: {{ net: {{ ipv4_address: {ip} }} }}
 "#,
-            command = command.join(", "),
             ip = ip(node)
         ));
     }
@@ -72,6 +77,10 @@ services:
     environment: [NO_COLOR=1]
     volumes: ["./node4.yaml:/etc/keel/keel.yaml:ro"]
     networks: {{ net: {{ ipv4_address: 172.29.83.14 }} }}
+volumes:
+  node1-state: {{}}
+  node2-state: {{}}
+  node3-state: {{}}
 "#,
         join = join_args("node2")
     ));
@@ -118,9 +127,8 @@ impl Cluster {
     /// against any node.
     fn up(name: &str) -> Result<Cluster> {
         let mut files: Vec<(&str, String)> = vec![("node4.yaml", config("172.29.83.14", ""))];
-        files.extend([("node1.yaml", 1), ("node2.yaml", 2), ("node3.yaml", 3)].map(|(f, i)| {
-            (f, config(&ip(&format!("node{i}")), ""))
-        }));
+        files.extend([("node1.yaml", "node1"), ("node2.yaml", "node2"), ("node3.yaml", "node3")].map(|(f, n)| (f, config(&ip(n), ""))));
+        files.extend([("node1.args", "node1"), ("node2.args", "node2"), ("node3.args", "node3")].map(|(f, n)| (f, start_args(n))));
         let stack = Stack::up(name, &compose(), &files)?;
 
         // The control CA reaches every node through Raft and is written to
@@ -138,8 +146,13 @@ impl Cluster {
         let mut cluster = Cluster { stack, control, ids: BTreeMap::new() };
 
         wait_until("three voters", Duration::from_secs(90), || Ok((cluster.voters("node1")?.len() == 3).then_some(())))?;
+        // Followers adopt the cluster's control CA once the leader has
+        // committed it; until then they reject these credentials.
         for node in NODES {
-            cluster.ids.insert(node.to_owned(), cluster.node_id(node)?);
+            let id = wait_until(&format!("{node} accepts the credentials"), Duration::from_secs(30), || {
+                Ok(cluster.node_id(node).ok())
+            })?;
+            cluster.ids.insert(node.to_owned(), id);
         }
         Ok(cluster)
     }
@@ -201,6 +214,41 @@ impl Cluster {
         let mut ids: Vec<u64> = self.ids.values().copied().collect();
         ids.sort();
         ids
+    }
+
+    /// Restart `node` with other start flags.
+    fn restart_with(&self, node: &str, args: &str) -> Result<()> {
+        self.stack.stop(node)?;
+        self.stack.write_file(&format!("{node}.args"), args)?;
+        self.stack.start(node)
+    }
+
+    fn logged(&self, node: &str, text: &str) -> Result<bool> {
+        Ok(self.stack.logs(node)?.contains(text))
+    }
+
+    /// Push a config with a `pushed.test` vhost answering 418, through the leader.
+    fn push_marker(&self) -> Result<()> {
+        let leader = self.leader()?;
+        let vhost = "  - host: pushed.test\n    default_action:\n      status: 418\n      body: pushed\n";
+        self.request(&leader, &ControlRequest::ConfigPush { yaml: config(&ip(&leader), vhost) })?;
+        Ok(())
+    }
+
+    fn serves_marker(&self, node: &str) -> Result<()> {
+        let addr = self.stack.addr(node, 80)?;
+        wait_until(&format!("pushed vhost on {node}"), Duration::from_secs(60), || {
+            Ok(http_get(addr, "pushed.test", "/").ok().filter(|(s, _)| *s == 418))
+        })?;
+        Ok(())
+    }
+
+    fn wait_for_voters(&self, from: &str, ids: &[u64]) -> Result<()> {
+        let mut want = ids.to_vec();
+        want.sort();
+        wait_until(&format!("voters {want:?}"), Duration::from_secs(90), || {
+            Ok((self.voters(from).ok() == Some(want.clone())).then_some(()))
+        })
     }
 
     fn read_node_id_file(&self, node: &str) -> Result<String> {
@@ -397,5 +445,103 @@ fn a_follower_admits_a_joiner() -> Result<()> {
         let voter = members.get(&id).is_some_and(|(role, addr)| role == "voter" && addr == "172.29.83.14:7654");
         Ok((voter && members.len() == 4).then_some(()))
     })?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn members_file_lists_the_cluster() -> Result<()> {
+    let cluster = Cluster::up("cluster-members")?;
+    let out = cluster.stack.exec("node2", &["cat", "/var/lib/keel/members.yaml"])?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for node in NODES {
+        assert!(text.contains(&cluster.id(node).to_string()), "{node} listed:\n{text}");
+        assert!(text.contains(&format!("{}:7654", ip(node))), "{node}'s address listed:\n{text}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_node_restarts_from_its_stored_state_without_join() -> Result<()> {
+    let cluster = Cluster::up("cluster-restore")?;
+    cluster.restart_with("node3", &format!("--cluster --secret {SECRET}"))?;
+    wait_until("node3 restored", Duration::from_secs(60), || Ok(cluster.logged("node3", "restarting from stored state")?.then_some(())))?;
+    cluster.wait_for_voters("node1", &cluster.all_ids())?;
+    assert_eq!(cluster.node_id("node3")?, cluster.id("node3"));
+    assert!(!cluster.logged("node1", "lost its state")?, "node3 did not have to rejoin");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_full_cluster_restart_recovers_membership_and_config() -> Result<()> {
+    let cluster = Cluster::up("cluster-full-restart")?;
+    cluster.push_marker()?;
+    cluster.serves_marker("node3")?;
+
+    for node in NODES {
+        cluster.stack.stop(node)?;
+    }
+    for node in NODES {
+        cluster.stack.start(node)?;
+    }
+    cluster.wait_for_voters("node2", &cluster.all_ids())?;
+    for node in NODES {
+        cluster.serves_marker(node)?;
+        assert_eq!(cluster.node_id(node)?, cluster.id(node), "{node} kept its ID");
+    }
+    // node1 still carries --bootstrap: stored state wins, no second cluster.
+    assert!(cluster.logged("node1", "--bootstrap and --join are ignored")?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_damaged_store_is_set_aside_and_the_node_rejoins_without_losing_committed_entries() -> Result<()> {
+    let cluster = Cluster::up("cluster-damaged")?;
+    cluster.push_marker()?;
+    cluster.serves_marker("node3")?;
+
+    cluster.stack.stop("node3")?;
+    cluster.stack.on_volume("node3-state", "printf 'not a store' > /state/raft/store.redb")?;
+    cluster.stack.start("node3")?;
+
+    // Traffic first: node3 serves from its local config while it rejoins.
+    let addr = cluster.stack.addr("node3", 80)?;
+    wait_until("node3 serving", Duration::from_secs(60), || {
+        Ok(http_get(addr, "e2e.test", "/").ok().filter(|(s, _)| *s == 200))
+    })?;
+    assert!(cluster.logged("node3", "Raft store unreadable")?);
+    let listing = cluster.stack.on_volume("node3-state", "ls /state")?;
+    assert!(listing.contains("raft.corrupt-"), "store kept for inspection: {listing}");
+
+    cluster.wait_for_voters("node1", &cluster.all_ids())?;
+    assert_eq!(cluster.node_id("node3")?, cluster.id("node3"), "node3 kept its ID");
+    assert!(cluster.logged("node1", "lost its state or moved")?, "rejoined through remove and learner");
+    cluster.serves_marker("node3")?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn forced_recovery_makes_the_survivor_the_only_member() -> Result<()> {
+    let cluster = Cluster::up("cluster-force")?;
+    cluster.push_marker()?;
+    cluster.serves_marker("node1")?;
+
+    cluster.stack.stop("node2")?;
+    cluster.stack.stop("node3")?;
+    cluster.restart_with("node1", &format!("--cluster --force-new-cluster --secret {SECRET}"))?;
+
+    let id = cluster.id("node1");
+    cluster.wait_for_voters("node1", &[id])?;
+    wait_until("node1 leads", Duration::from_secs(30), || {
+        Ok((cluster.status("node1")?["leader_id"].as_u64() == Some(id)).then_some(()))
+    })?;
+    assert_eq!(cluster.members("node1")?, vec![id], "the others are gone from the membership");
+    cluster.serves_marker("node1")?;
+    // Writes commit again.
+    cluster.request("node1", &ControlRequest::ConfigPush { yaml: config(&ip("node1"), "") })?;
     Ok(())
 }

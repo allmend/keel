@@ -10,21 +10,45 @@ use openraft::{
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 
+use crate::cluster::persist::{Disk, Loaded, StoredSnapshot};
 use crate::cluster::types::{
     CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, NodeId, TypeConfig, ControlCaPair};
 
+fn disk_err(e: anyhow::Error) -> openraft::StorageError<NodeId> {
+    openraft::StorageIOError::write(openraft::AnyError::error(format!("{e:#}"))).into()
+}
+
 // Log store
 
-#[derive(Debug, Default)]
+/// The log in memory, written through to disk before each change is visible.
+#[derive(Default)]
 struct LogStoreData {
     vote: Option<Vote<NodeId>>,
     committed: Option<LogId<NodeId>>,
     last_purged: Option<LogId<NodeId>>,
     log: BTreeMap<u64, Entry<TypeConfig>>,
+    disk: Option<Arc<Disk>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LogStore(Arc<RwLock<LogStoreData>>);
+
+impl LogStore {
+    /// The log as the store held it, persisted to `disk` from here on.
+    pub fn persisted(disk: Arc<Disk>, loaded: &Loaded) -> Self {
+        LogStore(Arc::new(RwLock::new(LogStoreData {
+            vote: loaded.vote,
+            committed: loaded.committed,
+            last_purged: loaded.last_purged,
+            log: loaded.log.clone(),
+            disk: Some(disk),
+        })))
+    }
+
+    fn disk(&self) -> Option<Arc<Disk>> {
+        self.0.read().unwrap().disk.clone()
+    }
+}
 
 impl RaftLogReader<TypeConfig> for LogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
@@ -54,6 +78,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
+        if let Some(disk) = self.disk() {
+            disk.save_committed(&committed).map_err(disk_err)?;
+        }
         self.0.write().unwrap().committed = committed;
         Ok(())
     }
@@ -68,6 +95,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         vote: &Vote<NodeId>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
+        if let Some(disk) = self.disk() {
+            disk.save_vote(vote).map_err(disk_err)?;
+        }
         self.0.write().unwrap().vote = Some(*vote);
         Ok(())
     }
@@ -86,6 +116,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        if let Some(disk) = self.disk() {
+            disk.append(&entries).map_err(disk_err)?;
+        }
         {
             let mut d = self.0.write().unwrap();
             for e in entries {
@@ -100,6 +134,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
+        if let Some(disk) = self.disk() {
+            disk.truncate(log_id.index).map_err(disk_err)?;
+        }
         let mut d = self.0.write().unwrap();
         let keys: Vec<u64> = d.log.range(log_id.index..).map(|(k, _)| *k).collect();
         for k in keys {
@@ -112,6 +149,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
+        if let Some(disk) = self.disk() {
+            disk.purge(&log_id).map_err(disk_err)?;
+        }
         let mut d = self.0.write().unwrap();
         let keys: Vec<u64> = d.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for k in keys {
@@ -138,6 +178,42 @@ struct StateMachineData {
     challenges_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>>,
     control_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>>,
     cluster_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>>,
+    disk: Option<Arc<Disk>>,
+}
+
+impl StateMachineData {
+    /// Replace the state with a snapshot's and tell every watcher, as apply()
+    /// would have. Used for a received snapshot and for the stored one at start.
+    fn restore(&mut self, meta: &SnapshotMeta<NodeId, BasicNode>, state: ClusterState) {
+        self.state = state;
+        self.last_applied = meta.last_log_id;
+        self.last_membership = meta.last_membership.clone();
+        if let Some(tx) = &self.certs_tx {
+            let _ = tx.send(self.state.certs.clone());
+        }
+        if let Some(tx) = &self.challenges_tx {
+            let _ = tx.send(self.state.challenges.clone());
+        }
+        if let Some(tx) = &self.control_ca_tx {
+            let _ = tx.send(self.state.control_ca.clone());
+        }
+        if let Some(tx) = &self.cluster_ca_tx {
+            let _ = tx.send(self.state.cluster_ca.clone());
+        }
+        if let (Some(tx), Some(yaml)) = (&self.config_tx, &self.state.config_yaml) {
+            let _ = tx.send(Some(yaml.clone()));
+        }
+    }
+}
+
+// The error is openraft's own storage error, returned unchanged to it.
+#[allow(clippy::result_large_err)]
+fn decode_state(meta: &SnapshotMeta<NodeId, BasicNode>, data: &[u8]) -> Result<ClusterState, openraft::StorageError<NodeId>> {
+    // A corrupt snapshot must surface as a storage error, not silently reset
+    // the cluster state (config + drain map) to default.
+    serde_json::from_slice(data).map_err(|e| {
+        openraft::StorageIOError::read_snapshot(Some(meta.signature()), openraft::AnyError::new(&e)).into()
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,6 +239,18 @@ impl StateMachine {
     pub fn set_cluster_ca_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>) {
         self.0.write().unwrap().cluster_ca_tx = Some(tx);
     }
+
+    /// Persist snapshots to `disk` from here on, and start from the stored
+    /// one. Call after the watch senders are set, so restoring notifies them.
+    pub fn persisted(&self, disk: Arc<Disk>, stored: Option<&StoredSnapshot>) -> anyhow::Result<()> {
+        let mut d = self.0.write().unwrap();
+        d.disk = Some(disk);
+        if let Some(snap) = stored {
+            let state = decode_state(&snap.meta, &snap.data).map_err(|e| anyhow::anyhow!("stored snapshot: {e}"))?;
+            d.restore(&snap.meta, state);
+        }
+        Ok(())
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
@@ -180,6 +268,12 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachine {
                 d.last_applied.map_or(0, |l| l.index)
             ),
         };
+        // Stored before openraft purges the log it covers.
+        if let Some(disk) = &d.disk {
+            disk.save_snapshot(&StoredSnapshot { meta: meta.clone(), data: data.clone() }).map_err(|e| {
+                openraft::StorageIOError::write_snapshot(Some(meta.signature()), openraft::AnyError::error(format!("{e:#}")))
+            })?;
+        }
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -297,32 +391,17 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), openraft::StorageError<NodeId>> {
-        // A corrupt snapshot must surface as a storage error, not silently reset
-        // the cluster state (config + drain map) to default.
-        let data: ClusterState = serde_json::from_slice(snapshot.get_ref()).map_err(|e| {
-            openraft::StorageIOError::read_snapshot(Some(meta.signature()), openraft::AnyError::new(&e))
-        })?;
+        let state = decode_state(meta, snapshot.get_ref())?;
         let mut d = self.0.write().unwrap();
-        d.state = data;
-        d.last_applied = meta.last_log_id;
-        d.last_membership = meta.last_membership.clone();
+        if let Some(disk) = &d.disk {
+            let stored = StoredSnapshot { meta: meta.clone(), data: snapshot.get_ref().clone() };
+            disk.save_snapshot(&stored).map_err(|e| {
+                openraft::StorageIOError::write_snapshot(Some(meta.signature()), openraft::AnyError::error(format!("{e:#}")))
+            })?;
+        }
         // A snapshot is how late joiners receive replicated state that has been
-        // compacted out of the log — notify watchers just like apply() does.
-        if let Some(tx) = &d.certs_tx {
-            let _ = tx.send(d.state.certs.clone());
-        }
-        if let Some(tx) = &d.challenges_tx {
-            let _ = tx.send(d.state.challenges.clone());
-        }
-        if let Some(tx) = &d.control_ca_tx {
-            let _ = tx.send(d.state.control_ca.clone());
-        }
-        if let Some(tx) = &d.cluster_ca_tx {
-            let _ = tx.send(d.state.cluster_ca.clone());
-        }
-        if let (Some(tx), Some(yaml)) = (&d.config_tx, &d.state.config_yaml) {
-            let _ = tx.send(Some(yaml.clone()));
-        }
+        // compacted out of the log — restore() notifies watchers like apply().
+        d.restore(meta, state);
         Ok(())
     }
 

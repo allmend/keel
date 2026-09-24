@@ -55,6 +55,11 @@ struct Cli {
     #[arg(long)]
     secret: Option<String>,
 
+    /// Forced recovery after a permanently lost majority: keep this node's
+    /// stored state and make it the only member of the cluster
+    #[arg(long, requires = "cluster")]
+    force_new_cluster: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -224,6 +229,8 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
         node_id,
         cluster_addr,
         advertise,
+        state_dir: state_dir.to_path_buf(),
+        force_new_cluster: cli.force_new_cluster,
         secret,
         bootstrap: cli.bootstrap,
         join: cli.join,

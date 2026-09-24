@@ -45,7 +45,7 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 - Prometheus metrics (`/metrics`)
 - NDJSON access logs, per-vhost
 - conf.d config splitting — vhosts, pools, and certificates per team file
-- Raft-based clustering with mTLS, encrypted join, automatic voter promotion
+- Raft-based clustering with mTLS, encrypted join, automatic voter promotion, and state on disk — nodes restart without rejoining
 - Distributed config push via `keel config push`
 - Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
 - Graceful node removal — `keel cluster stepdown` with quorum-loss protection

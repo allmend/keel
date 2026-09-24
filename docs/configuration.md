@@ -33,7 +33,7 @@ keel:
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
   grace_period_seconds: 10   # graceful shutdown: time for in-flight requests
   udp_flow_timeout_seconds: 30   # idle time before a UDP flow expires
-  state_dir: /var/lib/keel   # state kept across restarts: the node ID
+  state_dir: /var/lib/keel   # state kept across restarts: node ID, certificates, Raft store
 ```
 
 | Field | Type | Default |
@@ -311,7 +311,7 @@ cluster:
 | `advertise` | string | `addr` | Address announced to the other nodes. Required when `addr` is unspecified (`0.0.0.0`, `::`) |
 | `secret` | string | none | Shared secret for join authentication |
 
-Unknown keys under `cluster:` are refused. The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity).
+Unknown keys under `cluster:` are refused. The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity). The Raft store and the node's certificates live there too; see [Restarts](cluster.md#restarts).
 
 See [Cluster](cluster.md) for bootstrap, join, and restarts.
 

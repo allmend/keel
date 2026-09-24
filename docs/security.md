@@ -24,7 +24,7 @@ See [Cluster](cluster.md) for the full join flow.
 
 Every node's certificate is issued by the cluster CA and names the node: `CN=keel-node-<id>`. The handshake proves a peer holds a certificate from the cluster CA; beyond that, each request that names a sender — a Raft message's vote, a stepdown's node — must name the node its certificate belongs to, or it is refused and logged. A member's certificate therefore cannot vote, replicate, or step down in another member's name.
 
-The cluster CA's key is committed to Raft and held in memory by every member, so any member can admit joiners. A compromised member holds the key.
+The cluster CA's key is committed to Raft, so every member holds it — in memory and in its Raft store under `keel.state_dir` — and any member can admit joiners. A compromised member holds the key.
 
 ---
 
@@ -70,7 +70,7 @@ Metrics expose backend addresses, pool and vhost names, and traffic volumes. Acc
 
 The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
 
-In cluster mode the control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is held in memory; on each node the key is written to `ca_dir/ca.key` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
+In cluster mode the control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is stored in each node's Raft store under `keel.state_dir`; on each node the key is also written to `ca_dir/ca.key` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
 
 The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but does not replace mTLS.
 

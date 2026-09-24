@@ -8,6 +8,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Raft state on disk.** Each node stores its Raft log, vote, committed
+  index and latest snapshot in `raft/store.redb` under `keel.state_dir`,
+  together with its certificate and key, the cluster CA certificate, and
+  `members.yaml`, the last known members. A node with stored state restarts
+  from it without `--join`; `--bootstrap` and `--join` are ignored, so a
+  restarted bootstrap node keeps its cluster and its CA. A full cluster
+  restart recovers the membership and the committed config. See
+  [Restarts](docs/cluster.md#restarts).
+- **Recovery from lost Raft state.** A store Keel cannot read is moved to
+  `raft.corrupt-<time>/` for inspection; the node keeps serving and rejoins
+  through the members in `members.yaml` as a learner, promoted once its log
+  has caught up. A node whose announced address changed rejoins the same way.
+- **`--force-new-cluster`**: after a majority is gone for good, one survivor
+  keeps its stored state and becomes the only member. See
+  [Forced recovery](docs/cluster.md#forced-recovery).
+
+### Changed
+
+- A join under a member's node ID always removes that member and adds the
+  node back as a learner: a joining node has no Raft state, and a voter that
+  forgot its votes and log must not count toward a majority.
+- Operator credentials work on every node within a second of a new cluster
+  forming: the leader publishes the control CA as soon as it leads.
+
 ---
 
 ## [0.18.0] — 2026-09-24
