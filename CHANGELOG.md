@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.16.0] — 2026-09-24
+
 ### Added
 
 - **End-to-end test suite** in `tests/e2e/`: Keel in Docker containers,
@@ -18,14 +22,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **A node joining at the same time as another could stay a learner for
-  good.** Raft commits one membership change at a time, and the leader gave up
-  on a join as soon as the cluster reported a change already in progress.
-  Starting all nodes of a new cluster together hit this about one time in
-  three: the third node never became a voter, so a 3-node cluster tolerated no
-  failure. Membership changes (join, promotion to voter, stepdown) now wait
-  for the change in flight to commit and retry, and a failed join is logged
-  instead of ignored.
+- **Nodes that join at the same time all become voters.** Raft commits one
+  membership change at a time; a join that overlapped another left the second
+  node a learner. Joins, promotion to voter and stepdown wait for the change
+  in flight to commit, and a failed join is logged.
 
 ### Changed
 
@@ -775,7 +775,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.15.2...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/allmend/keel/compare/v0.15.2...v0.16.0
 [0.15.2]: https://github.com/allmend/keel/compare/v0.15.1...v0.15.2
 [0.15.1]: https://github.com/allmend/keel/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/allmend/keel/compare/v0.14.0...v0.15.0
