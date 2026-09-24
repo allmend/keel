@@ -501,6 +501,8 @@ type MembershipResult = std::result::Result<
 /// while the first is uncommitted. Every node of a new cluster starts at once,
 /// so joins overlap: a refused change is retried until `deadline` rather than
 /// leaving the joiner a learner for good. The busy window is one commit.
+// The error is openraft's own, passed through unchanged from its API.
+#[allow(clippy::result_large_err)]
 async fn when_membership_free<F, Fut>(deadline: tokio::time::Instant, mut change: F) -> MembershipResult
 where
     F: FnMut() -> Fut,
