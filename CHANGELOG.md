@@ -8,6 +8,17 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A node joining at the same time as another could stay a learner for
+  good.** Raft commits one membership change at a time, and the leader gave up
+  on a join as soon as the cluster reported a change already in progress.
+  Starting all nodes of a new cluster together hit this about one time in
+  three: the third node never became a voter, so a 3-node cluster tolerated no
+  failure. Membership changes (join, promotion to voter, stepdown) now wait
+  for the change in flight to commit and retry, and a failed join is logged
+  instead of ignored.
+
 ### Changed
 
 - **BREAKING:** the metrics endpoint default moved from `127.0.0.1:9090` to

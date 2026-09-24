@@ -446,9 +446,15 @@ async fn handle_join(
         let envelope = match ca.issue_node_cert(req.node_id) {
             Ok((cert_pem, key_pem)) => {
                 // Add the joining node as a learner — non-blocking.
-                let node = BasicNode { addr: req.addr.clone() };
-                let _ = raft.add_learner(req.node_id, node, false).await;
-                info!(node_id = req.node_id, addr = req.addr, "cluster: node joined");
+                let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
+                let added = when_membership_free(deadline, || {
+                    raft.add_learner(req.node_id, BasicNode { addr: req.addr.clone() }, false)
+                })
+                .await;
+                match added {
+                    Ok(_) => info!(node_id = req.node_id, addr = req.addr, "cluster: node joined"),
+                    Err(e) => warn!(node_id = req.node_id, error = %e, "cluster: adding learner failed"),
+                }
                 JoinEnvelope::Ok(JoinResponse {
                     ca_cert_pem: ca.cert_pem.clone(),
                     node_cert_pem: cert_pem,
@@ -483,6 +489,36 @@ async fn handle_join(
 /// up on promoting it (it stays a learner and holds no quorum weight).
 const PROMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a join waits for the cluster to accept the learner entry.
+const JOIN_MEMBERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+type MembershipResult = std::result::Result<
+    openraft::raft::ClientWriteResponse<TypeConfig>,
+    openraft::error::RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>,
+>;
+
+/// Raft commits one membership change at a time, and openraft refuses a second
+/// while the first is uncommitted. Every node of a new cluster starts at once,
+/// so joins overlap: a refused change is retried until `deadline` rather than
+/// leaving the joiner a learner for good. The busy window is one commit.
+async fn when_membership_free<F, Fut>(deadline: tokio::time::Instant, mut change: F) -> MembershipResult
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = MembershipResult>,
+{
+    use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
+    loop {
+        match change().await {
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(ChangeMembershipError::InProgress(_))))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Wait for a newly joined learner to catch up, then promote it to voter so it
 /// counts toward quorum. Failures are logged, never fatal — the node keeps
 /// working as a learner.
@@ -492,10 +528,11 @@ async fn promote_to_voter(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String)
         return;
     }
 
-    let node = BasicNode { addr };
+    let deadline = tokio::time::Instant::now() + PROMOTE_TIMEOUT;
     // Blocking add_learner returns once the leader sees the learner's log caught
     // up — replication retries internally while the joiner finishes starting.
-    match tokio::time::timeout(PROMOTE_TIMEOUT, raft.add_learner(node_id, node, true)).await {
+    let caught_up = when_membership_free(deadline, || raft.add_learner(node_id, BasicNode { addr: addr.clone() }, true));
+    match tokio::time::timeout_at(deadline, caught_up).await {
         Err(_) => {
             warn!(
                 node_id,
@@ -511,9 +548,11 @@ async fn promote_to_voter(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String)
         Ok(Ok(_)) => {}
     }
 
-    let mut ids = std::collections::BTreeSet::new();
-    ids.insert(node_id);
-    match raft.change_membership(openraft::ChangeMembers::AddVoterIds(ids), false).await {
+    let ids = std::collections::BTreeSet::from([node_id]);
+    let promote = when_membership_free(deadline, || {
+        raft.change_membership(openraft::ChangeMembers::AddVoterIds(ids.clone()), false)
+    });
+    match promote.await {
         Ok(_) => info!(node_id, "cluster: node promoted to voter"),
         Err(e) => warn!(node_id, error = %e, "cluster: voter promotion failed; node remains a learner"),
     }
@@ -929,7 +968,9 @@ pub async fn apply_stepdown(raft: &ClusterRaft, node_id: NodeId) -> Result<Strin
     };
 
     // retain=false removes the node from the membership entirely (not learner).
-    match tokio::time::timeout(STEPDOWN_COMMIT_TIMEOUT, raft.change_membership(change, false)).await
+    let deadline = tokio::time::Instant::now() + STEPDOWN_COMMIT_TIMEOUT;
+    let removed = when_membership_free(deadline, || raft.change_membership(change.clone(), false));
+    match tokio::time::timeout_at(deadline, removed).await
     {
         Err(_) => anyhow::bail!(
             "membership change did not commit within {}s — the cluster has likely lost quorum",
