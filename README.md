@@ -253,6 +253,14 @@ does refuse is a wildcard vhost with `tls.acme`.
 
 Issues and pull requests welcome. Branch off `main`, use [Conventional Commits](https://www.conventionalcommits.org), and keep `main` releasable.
 
+`cargo test --workspace` runs the unit tests. The end-to-end suite in `tests/e2e/` runs Keel in Docker containers — clusters, privileges, remote control — and needs a running Docker daemon:
+
+```bash
+cargo test -p keel-e2e --no-fail-fast -- --ignored
+```
+
+It builds a debug image of the working tree first (several minutes the first time; later builds reuse a cache). `KEEL_E2E_IMAGE=<tag>` uses an existing image instead, and `KEEL_E2E_KEEP=1` leaves the containers of a failed test running for inspection.
+
 ---
 
 ## License

@@ -8,6 +8,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **End-to-end test suite** in `tests/e2e/`: Keel in Docker containers,
+  driven over the control protocol. Covers cluster formation, config push,
+  remote control over mTLS, stepdown and its quorum check, and the process
+  model (root master, unprivileged workers, worker replacement). Runs on
+  pushes to `main`; locally with `cargo test -p keel-e2e --no-fail-fast -- --ignored`.
+
 ### Fixed
 
 - **A node joining at the same time as another could stay a learner for

@@ -1346,6 +1346,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "keel-e2e"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "keel-control",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+]
+
+[[package]]
 name = "keelctl"
 version = "0.15.2"
 dependencies = [

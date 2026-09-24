@@ -38,3 +38,19 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  e2e:
+    name: end-to-end
+    # Minutes of image build and cluster start-up per run: on main only, not
+    # on every pull request push.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Builds keel in Docker (tests/e2e/Dockerfile), then runs every stack
+      # one at a time.
+      - name: End-to-end tests
+        run: cargo test -p keel-e2e --no-fail-fast -- --ignored

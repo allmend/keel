@@ -1,0 +1,13 @@
+[package]
+name = "keel-e2e"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "End-to-end tests: keel in containers, driven over the control protocol"
+
+[dependencies]
+keel-control = { path = "../../crates/keel-control" }
+anyhow = "1"
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"

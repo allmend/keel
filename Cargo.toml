@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/keel-control", "crates/keelctl"]
+members = ["crates/keel-control", "crates/keelctl", "tests/e2e"]
 
 [package]
 name = "keel"
