@@ -2,9 +2,9 @@
 //! and operator client certs (`keel credentials create`).
 //!
 //! Standalone and cluster mode both use this CA. It lives on disk in
-//! `control.remote.ca_dir` (`ca.crt` / `ca.key`) and is generated on first
-//! use, so `keel credentials create` and the remote listener can each come
-//! first — whichever runs first creates it, the other loads it.
+//! `control/` under `keel.state_dir` (`ca.crt` / `ca.key`) and is generated
+//! on first use, so `keel credentials create` and the remote listener can
+//! each come first — whichever runs first creates it, the other loads it.
 
 use std::path::Path;
 
@@ -38,24 +38,20 @@ impl ControlCa {
             return Self::from_pems(cert_pem, key_pem);
         }
 
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir).with_context(|| format!("create {dir}"))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let (cert_pem, key_pem) = Self::generate()?;
+        let ca = Self::install(dir, &cert_pem, &key_pem)?;
+        tracing::info!(dir, "control: control CA generated");
+        Ok(ca)
+    }
 
+    /// A new control CA, (cert PEM, key PEM), in memory.
+    pub fn generate() -> Result<(String, String)> {
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.distinguished_name.push(rcgen::DnType::CommonName, "Keel Control CA");
         let cert = params.self_signed(&key)?;
-        let cert_pem = cert.pem();
-
-        let key_pem = key.serialize_pem();
-        write_file(&key_path, key_pem.as_bytes(), 0o600)?;
-        write_file(&cert_path, cert_pem.as_bytes(), 0o644)?;
-        tracing::info!(dir, "control: control CA generated");
-
-        let issuer = Issuer::new(params, key);
-        Ok(Self { issuer, ca_cert_pem: cert_pem, ca_key_pem: key_pem })
+        Ok((cert.pem(), key.serialize_pem()))
     }
 
     /// Write a CA received from the cluster into `dir`, replacing whatever

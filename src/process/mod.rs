@@ -84,9 +84,6 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
         // The node ID is created here on first start, after the drop.
         std::path::PathBuf::from(&cfg.keel.state_dir),
     ];
-    if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.as_ref()) {
-        dirs.push(std::path::PathBuf::from(&remote.ca_dir));
-    }
     if let Some(acme) = cfg.acme_effective() {
         dirs.push(std::path::PathBuf::from(&acme.storage));
     }
@@ -103,6 +100,28 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// A cluster node writes every applied version into the config directory
+/// after dropping privileges, so the directory tree belongs to `keel.user`.
+fn hand_over_config_dir(cfg: &Config) -> Result<()> {
+    use nix::unistd::{chown, Group, User};
+    let uid = User::from_name(&cfg.keel.user)?.map(|u| u.uid);
+    let gid = Group::from_name(&cfg.keel.group)?.map(|g| g.gid);
+    fn walk(path: &std::path::Path, uid: Option<nix::unistd::Uid>, gid: Option<nix::unistd::Gid>) -> Result<()> {
+        chown(path, uid, gid).with_context(|| format!("master: cannot chown {}", path.display()))?;
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                walk(&entry?.path(), uid, gid)?;
+            }
+        }
+        Ok(())
+    }
+    let dir = std::path::Path::new(&cfg.keel.config_dir);
+    std::fs::create_dir_all(dir).with_context(|| format!("master: cannot create {}", dir.display()))?;
+    walk(dir, uid, gid)?;
+    info!(dir = %dir.display(), user = cfg.keel.user, "master: config directory ready");
+    Ok(())
+}
+
 /// Single-process modes (cluster) have no master to bind for them. When
 /// started as root on Linux, bind everything in-process, drop privileges,
 /// and hand the sockets back as if a master had passed them down. Returns
@@ -115,6 +134,7 @@ pub fn take_privileges_single_process(cfg: &Config) -> Result<Option<proxy::Work
     }
     preflight_privileges(&cfg.keel.user, &cfg.keel.group)?;
     prepare_runtime_dir(cfg)?;
+    hand_over_config_dir(cfg)?;
     let bound = bind_listeners(cfg, 1)?;
     drop_privileges(&cfg.keel.user, &cfg.keel.group);
     let sockets = bound.for_worker(0, cfg)?;
@@ -257,6 +277,7 @@ pub fn run_master(mut cfg: Config) -> Result<()> {
         if let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.clone()) {
             let server = control::remote::RemoteControlServer {
                 cfg: remote,
+                ca_dir: cfg.keel.control_ca_dir(),
                 dispatch: Arc::clone(&dispatch),
             };
             let mut rx = shutdown_rx.clone();
@@ -295,7 +316,7 @@ pub fn run_master(mut cfg: Config) -> Result<()> {
             // the startup config and quietly diverge from its siblings.
             // Listener set and worker count are fixed for the process
             // lifetime either way — those need a restart.
-            match crate::config::load(&cfg.path, cfg.conf_dir.as_deref()) {
+            match crate::config::load(&cfg.path) {
                 Ok(new_cfg) => cfg = new_cfg,
                 Err(e) => warn!(
                     error = %format!("{e:#}"),

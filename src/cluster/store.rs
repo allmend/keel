@@ -12,7 +12,7 @@ use openraft::{
 
 use crate::cluster::persist::{Disk, Loaded, StoredSnapshot};
 use crate::cluster::types::{
-    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, NodeId, TypeConfig, ControlCaPair};
+    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, NodeId, TypeConfig, ControlCaPair};
 
 fn disk_err(e: anyhow::Error) -> openraft::StorageError<NodeId> {
     openraft::StorageIOError::write(openraft::AnyError::error(format!("{e:#}"))).into()
@@ -173,7 +173,7 @@ struct StateMachineData {
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     state: ClusterState,
-    config_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<String>>>>,
+    config_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<Option<ConfigVersion>>>>,
     certs_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<CertMap>>>,
     challenges_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>>,
     control_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>>,
@@ -182,6 +182,13 @@ struct StateMachineData {
 }
 
 impl StateMachineData {
+    fn set_config(&mut self, version: u64, files: crate::config::FileSet) {
+        self.state.config = Some(ConfigVersion { version, files });
+        if let Some(tx) = &self.config_tx {
+            let _ = tx.send(self.state.config.clone());
+        }
+    }
+
     /// Replace the state with a snapshot's and tell every watcher, as apply()
     /// would have. Used for a received snapshot and for the stored one at start.
     fn restore(&mut self, meta: &SnapshotMeta<NodeId, BasicNode>, state: ClusterState) {
@@ -200,8 +207,8 @@ impl StateMachineData {
         if let Some(tx) = &self.cluster_ca_tx {
             let _ = tx.send(self.state.cluster_ca.clone());
         }
-        if let (Some(tx), Some(yaml)) = (&self.config_tx, &self.state.config_yaml) {
-            let _ = tx.send(Some(yaml.clone()));
+        if let (Some(tx), Some(config)) = (&self.config_tx, &self.state.config) {
+            let _ = tx.send(Some(config.clone()));
         }
     }
 }
@@ -220,7 +227,7 @@ fn decode_state(meta: &SnapshotMeta<NodeId, BasicNode>, data: &[u8]) -> Result<C
 pub struct StateMachine(Arc<RwLock<StateMachineData>>);
 
 impl StateMachine {
-    pub fn set_config_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<Option<String>>>) {
+    pub fn set_config_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<Option<ConfigVersion>>>) {
         self.0.write().unwrap().config_tx = Some(tx);
     }
 
@@ -314,10 +321,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 openraft::EntryPayload::Normal(req) => {
                     let resp = match req {
                         ClientRequest::SetConfig { yaml } => {
-                            if let Some(tx) = &d.config_tx {
-                                let _ = tx.send(Some(yaml.clone()));
-                            }
-                            d.state.config_yaml = Some(yaml);
+                            let files = crate::config::FileSet::from([(crate::config::ROOT_FILE.to_owned(), yaml)]);
+                            d.set_config(entry.log_id.index, files);
+                            ClientResponse::ok()
+                        }
+                        ClientRequest::SetConfigFiles { files } => {
+                            d.set_config(entry.log_id.index, files);
                             ClientResponse::ok()
                         }
                         ClientRequest::DrainBackend { pool, address } => {

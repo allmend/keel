@@ -40,14 +40,14 @@ A 2-node cluster provides high availability for traffic but not for configuratio
 Bootstrap the first node:
 
 ```bash
-keel --config keel.yaml --cluster --bootstrap --secret mysecret
+keel --cluster --bootstrap --secret mysecret
 ```
 
-The `--secret` flag sets the shared secret that joining nodes must present. You can also set it in `keel.yaml`:
+The `--secret` flag sets the shared secret that joining nodes must present. You can also set it in the node file, `/etc/keel/node.yaml`:
 
 ```yaml
 cluster:
-  addr: 10.0.0.1:7654
+  advertise: 10.0.0.1:7654
   secret: mysecret
 ```
 
@@ -65,7 +65,7 @@ On bootstrap, Keel generates a cluster CA, issues its own node certificate, and 
 On each subsequent node:
 
 ```bash
-keel --config keel.yaml --cluster --join 10.0.0.1:7654 --secret mysecret
+keel --cluster --join 10.0.0.1:7654 --secret mysecret
 ```
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
@@ -103,14 +103,14 @@ The same rejoin applies when a node's stored address differs from its `advertise
 When a majority of the voters is gone for good, the survivors cannot commit anything, including a membership change. Start one survivor with `--force-new-cluster`:
 
 ```bash
-keel --config keel.yaml --cluster --force-new-cluster --secret mysecret
+keel --cluster --force-new-cluster --secret mysecret
 ```
 
 It keeps its stored state and makes itself the only member: the committed config, CAs and certificates stay, and it serves writes again. Other nodes join it with `--join` after their `raft/` directory is moved aside. Only use it for members that are gone for good: a member that comes back still holds the old membership and forms a cluster of its own with any peers it can reach.
 
 ---
 
-## Cluster configuration in keel.yaml
+## Cluster configuration in node.yaml
 
 ```yaml
 cluster:
@@ -159,25 +159,25 @@ Keel always generates the cluster CA; bringing your own is not supported, and `-
 
 ## Config replication
 
-In cluster mode, all configuration changes flow through the Raft log. This ensures every node applies changes in the same order.
-
-To push a new config to the entire cluster:
+The config directory, `/etc/keel/config/`, is the replicated config: every node holds the same files, and every change is a new **version** committed through Raft. The node file, `/etc/keel/node.yaml`, is never replicated. See [Files and layout](configuration.md#in-a-cluster) for the full model.
 
 ```bash
-keel config push keel.yaml
+keel config push /etc/keel/config     # or keelctl config push ./config from a workstation
+config version 42 committed; every node applies it
 ```
 
-This reads the local file and commits its text as a Raft log entry. The command returns once a quorum has committed the entry; each node applies it when the entry reaches its state machine.
+- **Any node.** A follower forwards the push to the leader over the mTLS peer channel.
+- **The whole set.** A push carries every file of the directory by relative path, certificates included; a single file is pushed as the set's `keel.yaml`. Files a version no longer has are deleted on every node.
+- **Checked before commit.** The set is built against the receiving node's node file, and again on the leader; a set that does not load is refused with the reason, and nothing changes.
+- **Quorum.** Without a reachable majority the push fails at once, naming how many members are reachable. Traffic on every node is unaffected.
+- **Files after apply.** Each node applies a version, then writes it into its config directory and records it as the version it serves. A version that fails on a node leaves that node on the previous one, files untouched.
 
-- **Send it to the leader.** Raft accepts writes only on the leader, and `config push` is not forwarded: sent to a follower, the command fails. `keel cluster status` shows the leader.
-- **One file.** The file's text is pushed as is. `include:` globs and `--conf-dir` fragments are not expanded, so a split config is pushed without its fragments.
-- **No validation before commit.** The text is not validated before it is committed. Each node parses it when applying; a node that cannot parse it logs `cluster: invalid config YAML` and keeps its current config.
-- **Quorum.** Without quorum the commit cannot happen: during a network partition or leader election the command blocks or fails. Traffic on individual nodes is unaffected.
+`SIGHUP` or `keel config reload` on a node pushes that node's config directory as the next version, and a node whose files were edited while it was stopped pushes them when it starts. The first start of a new cluster seeds the first version from the bootstrap node's files.
 
-A pushed config is applied the same way as a local [hot reload](configuration.md#hot-reload):
+A version is applied the same way as a local [hot reload](configuration.md#hot-reload):
 
 - Applied: virtual host routing rules, TLS certificates, backends removed from a pool (they drain).
-- Not applied until restart: backends added to a pool, weights, algorithms, `health_check`, `passive`, listeners, and the `keel`, `cache`, `access_log`, `metrics`, `acme` and `control` sections.
+- Not applied until restart: backends added to a pool, weights, algorithms, `health_check`, `passive`, listeners, and the `cache`, `access_log` and `acme` sections.
 
 ---
 

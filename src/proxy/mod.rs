@@ -750,7 +750,6 @@ struct ReloadService {
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
     config_path: String,
-    conf_dir: Option<String>,
 }
 
 #[async_trait]
@@ -770,7 +769,7 @@ impl pingora::services::background::BackgroundService for ReloadService {
                     if *shutdown.borrow() { return; }
                 }
                 _ = sighup.recv() => {
-                    match crate::config::load(&self.config_path, self.conf_dir.as_deref()) {
+                    match crate::config::load(&self.config_path) {
                         Ok(new_cfg) => {
                             self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
                             self.pools.sync_from_config(&new_cfg);
@@ -1098,7 +1097,6 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
             pools: Arc::clone(&pools),
             cert_store: Arc::clone(&cert_store),
             config_path: cfg.path.clone(),
-            conf_dir: cfg.conf_dir.clone(),
         },
     ));
 
@@ -1180,6 +1178,7 @@ fn add_remote_control(
         "control-remote",
         crate::control::remote::RemoteControlServer {
             cfg: remote,
+            ca_dir: cfg.keel.control_ca_dir(),
             dispatch: Arc::clone(dispatch),
         },
     ));
@@ -1391,11 +1390,54 @@ fn add_udp_services(
 
 // Cluster reload watcher
 
+/// Applies every committed config version on this node. A version is built
+/// against this node's `node.yaml` and applied in place; only then are the
+/// config directory and the "last applied" record written, so the files are
+/// always the last version that worked here. A version that fails leaves the
+/// node serving the previous one, files untouched.
 struct ClusterReloadWatcher {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
-    config_rx: tokio::sync::watch::Receiver<Option<String>>,
+    config_rx: tokio::sync::watch::Receiver<Option<crate::cluster::types::ConfigVersion>>,
+    node_yaml: String,
+    config_dir: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
+}
+
+impl ClusterReloadWatcher {
+    fn apply(&self, next: &crate::cluster::types::ConfigVersion) {
+        use crate::cluster::applied;
+        let serving = applied::read(&self.state_dir).ok().flatten();
+        if serving.as_ref().is_some_and(|a| a.version == next.version) {
+            return;
+        }
+        match crate::config::assemble(&self.node_yaml, &next.files) {
+            Ok(cfg) => {
+                self.routing.store(Arc::new(RoutingTable::build(&cfg)));
+                self.pools.sync_from_config(&cfg);
+                if let Err(e) = self.cert_store.reload(&cfg) {
+                    error!(error = %e, "cluster: TLS cert reload failed");
+                }
+                let written = applied::write_config_dir(&self.config_dir, &next.files)
+                    .and_then(|()| applied::save(&self.state_dir, next.version, &next.files));
+                match written {
+                    Ok(()) => info!(version = next.version, "cluster: config version applied"),
+                    Err(e) => error!(
+                        version = next.version,
+                        error = %format!("{e:#}"),
+                        "cluster: config version applied, but its files could not be written"
+                    ),
+                }
+            }
+            Err(e) => error!(
+                version = next.version,
+                serving = serving.map(|a| a.version),
+                error = %format!("{e:#}"),
+                "cluster: config version cannot be applied; still serving the previous one, files unchanged"
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -1403,24 +1445,51 @@ impl pingora::services::background::BackgroundService for ClusterReloadWatcher {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
         let mut rx = self.config_rx.clone();
         loop {
+            let current = rx.borrow_and_update().clone();
+            if let Some(next) = current {
+                self.apply(&next);
+            }
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 }
                 result = rx.changed() => {
                     if result.is_err() { return; }
-                    if let Some(yaml) = rx.borrow().clone() {
-                        match serde_yml::from_str::<crate::config::Config>(&yaml) {
-                            Ok(new_cfg) => {
-                                self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
-                                self.pools.sync_from_config(&new_cfg);
-                                if let Err(e) = self.cert_store.reload(&new_cfg) {
-                                    error!(error = %e, "cluster: TLS cert reload failed");
-                                }
-                                info!("cluster: config applied from Raft log");
-                            }
-                            Err(e) => error!(error = %e, "cluster: invalid config YAML"),
-                        }
+                }
+            }
+        }
+    }
+}
+
+/// SIGHUP on a cluster node: reconcile its config directory into the cluster
+/// as the next version. Every node, this one included, then applies it.
+struct ClusterReconcileOnSighup {
+    cluster: crate::cluster::ClusterHandle,
+}
+
+#[async_trait]
+impl pingora::services::background::BackgroundService for ClusterReconcileOnSighup {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "reload: failed to register SIGHUP handler");
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = sighup.recv() => {
+                    let pushed = match crate::config::read_config_dir(&self.cluster.config_dir) {
+                        Ok(files) => self.cluster.push_config(files).await,
+                        Err(e) => Err(e),
+                    };
+                    match pushed {
+                        Ok(version) => info!(version, "reload: config directory committed as a new version"),
+                        Err(e) => error!(error = %format!("{e:#}"), "reload: config directory not pushed"),
                     }
                 }
             }
@@ -1482,18 +1551,12 @@ pub fn run_cluster(
             pools: Arc::clone(&pools),
             cert_store: Arc::clone(&cert_store),
             config_rx: cluster.config_rx.clone(),
+            node_yaml: cfg.node_yaml.clone(),
+            config_dir: std::path::PathBuf::from(&cfg.keel.config_dir),
+            state_dir: std::path::PathBuf::from(&cfg.keel.state_dir),
         },
     ));
-    server.add_service(background_service(
-        "reload",
-        ReloadService {
-            routing: Arc::clone(&routing),
-            pools: Arc::clone(&pools),
-            cert_store: Arc::clone(&cert_store),
-            config_path: cfg.path.clone(),
-            conf_dir: cfg.conf_dir.clone(),
-        },
-    ));
+    server.add_service(background_service("reload", ClusterReconcileOnSighup { cluster: cluster.clone() }));
 
     let acme_challenge_dir = cfg
         .acme_effective()

@@ -6,9 +6,9 @@
 //! narrows exposure but never replaces mTLS.
 //!
 //! In cluster mode the control CA is replicated through the Raft log: the
-//! leader publishes its CA once, every node writes it into its own `ca_dir`
-//! and re-keys its listener, so one keelconfig authenticates to all nodes
-//! and `keel credentials create` works on any of them.
+//! leader publishes its CA once, every node writes it into its own control CA
+//! directory and re-keys its listener, so one keelconfig authenticates to all
+//! nodes and `keel credentials create` works on any of them.
 
 use std::sync::Arc;
 
@@ -29,7 +29,25 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 
 pub struct RemoteControlServer {
     pub cfg: RemoteControlConfig,
+    /// `control/` under `keel.state_dir`.
+    pub ca_dir: String,
     pub dispatch: Arc<Dispatch>,
+}
+
+/// The running listener's CA directory and TLS config, so a revocation can
+/// re-key it in place.
+static LISTENER: std::sync::OnceLock<(String, Arc<ArcSwap<rustls::ServerConfig>>)> = std::sync::OnceLock::new();
+
+/// Revoke every operator credential on a node that is not in a cluster:
+/// replace the control CA and re-key the running listener. Credentials
+/// signed by the old CA no longer authenticate.
+pub fn revoke_local() -> Result<()> {
+    let (ca_dir, tls) = LISTENER.get().context("no remote control listener is running")?;
+    let (cert_pem, key_pem) = ControlCa::generate()?;
+    let ca = ControlCa::install(ca_dir, &cert_pem, &key_pem)?;
+    tls.store(server_tls_for(&ca)?);
+    info!(ca_dir, "control: control CA replaced; every earlier keelconfig is revoked");
+    Ok(())
 }
 
 #[async_trait]
@@ -59,14 +77,15 @@ impl RemoteControlServer {
             .map(|c| c.parse().map_err(|e| anyhow::anyhow!("invalid CIDR '{c}': {e}")))
             .collect::<Result<_>>()?;
 
-        let ca = ControlCa::load_or_generate(&self.cfg.ca_dir)?;
-        // Swapped when the cluster's CA replaces the local one; each accept
-        // reads the current config.
+        let ca = ControlCa::load_or_generate(&self.ca_dir)?;
+        // Swapped when the cluster's CA replaces the local one or a revocation
+        // replaces it; each accept reads the current config.
         let tls = Arc::new(ArcSwap::from(server_tls_for(&ca)?));
+        let _ = LISTENER.set((self.ca_dir.clone(), Arc::clone(&tls)));
         if let Some(cluster) = self.dispatch.cluster() {
             tokio::spawn(sync_control_ca(
                 cluster,
-                self.cfg.ca_dir.clone(),
+                self.ca_dir.clone(),
                 Arc::clone(&tls),
                 (ca.ca_cert_pem.clone(), ca.ca_key_pem.clone()),
                 shutdown.clone(),

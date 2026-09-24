@@ -15,4 +15,4 @@ COPY dist/linux-${TARGETARCH}/keel /keel
 EXPOSE 80 443 10790
 
 ENTRYPOINT ["/keel"]
-CMD ["--config", "/etc/keel/keel.yaml"]
+CMD ["--config", "/etc/keel/node.yaml"]

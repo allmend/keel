@@ -19,11 +19,11 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/log/keel /var/run/keel /etc/keel
+    && mkdir -p /var/log/keel /var/run/keel /etc/keel/config /var/lib/keel
 
 COPY --from=builder /build/target/release/keel /usr/local/bin/keel
 
 EXPOSE 80 443 10790
 
 ENTRYPOINT ["/usr/local/bin/keel"]
-CMD ["--config", "/etc/keel/keel.yaml"]
+CMD ["--config", "/etc/keel/node.yaml"]

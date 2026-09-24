@@ -10,7 +10,14 @@ The binary is at `target/release/keel`.
 
 ## Minimal configuration
 
-Create `keel.yaml`:
+Keel reads a node file and the config directory it names. For a local test, create both in the current directory — `node.yaml`:
+
+```yaml
+keel:
+  config_dir: config
+```
+
+and `config/keel.yaml`:
 
 ```yaml
 listeners:
@@ -31,7 +38,7 @@ This listens on port 8080 and proxies all traffic to a single backend at `127.0.
 ## Run
 
 ```bash
-./keel --config keel.yaml
+./keel --config node.yaml
 ```
 
 Keel forks a root master process that binds the listening ports and spawns worker processes running as the `keel` user. For local testing as the current user, set `keel.user` and `keel.group` to your username, or run as root.

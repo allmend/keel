@@ -8,6 +8,43 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **The config directory is replicated, versioned state in a cluster.** Every
+  node holds the same `/etc/keel/config/`; a change is a new version, the
+  whole file set committed through Raft. Each node builds a version against
+  its own node file, applies it, and only then writes it into its config
+  directory, so the directory always holds the last version that worked on
+  that node; files a version no longer has are deleted. A new version comes
+  from `keel config push <dir>`, from `SIGHUP` or `keel config reload` on any
+  node, from a node whose files changed while it was stopped, or — for a new
+  cluster — from the bootstrap node's files. A push is checked before it is
+  committed, a follower forwards it to the leader, and without a reachable
+  majority it fails at once, naming how many members answer. See
+  [Files and layout](docs/configuration.md#files-and-layout).
+- **`keel credentials revoke-all`** (and `keelctl credentials revoke-all`):
+  replaces the control CA — on every node of a cluster — so every keelconfig
+  issued so far stops working.
+
+### Changed
+
+- **BREAKING:** configuration is two things. The node file,
+  `/etc/keel/node.yaml` (`--config`, now the default path), holds only node
+  settings: `keel.workers`, `user`, `group`, `control_socket`, `state_dir`,
+  `config_dir`, and the `cluster`, `control` and `metrics` sections. The load
+  balancer lives in the config directory, `/etc/keel/config/`: `keel.yaml`
+  first, then every other `*.yaml` below it in path order. A section in the
+  wrong file is a load error that names where it belongs. To migrate a single
+  `keel.yaml`, move the node settings into `node.yaml` and the rest into
+  `config/keel.yaml`; the examples `node.yaml` and `keel.yaml` show the split.
+- **BREAKING:** `include:` and `--conf-dir` are removed: every `*.yaml` in the
+  config directory is loaded.
+- **BREAKING:** `keel config push` and `keelctl config push` send a file set —
+  a directory as it is, or a single file as its `keel.yaml` — and the set
+  replaces the current one. keel and keelctl must be the same version.
+- **BREAKING:** `control.remote.ca_dir` is refused. The control CA lives in
+  `control/` under `keel.state_dir` — the same path as the former default.
+
 ---
 
 ## [0.19.0] — 2026-09-24

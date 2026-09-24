@@ -20,13 +20,12 @@ Kubernetes Service, so this narrows exposure but never replaces mTLS.
 ## Enabling the remote listener
 
 ```yaml
-# keel.yaml
+# /etc/keel/node.yaml
 control:
   remote:
     address: 0.0.0.0:10789
     allow:                       # optional; empty = any source
       - 10.1.2.0/24
-    # ca_dir: /var/lib/keel/control   # default
 ```
 
 Remote control is off unless `control.remote` is configured. The local Unix
@@ -36,8 +35,8 @@ the node works exactly as before.
 `address` takes a literal `ip:port`; a hostname is rejected during config validation. The listener is served by the root master process — see [Security](security.md#the-remote-control-listener-runs-as-root).
 
 On first start with `control.remote` set (or on the first
-`keel credentials create`), Keel generates the control CA in `ca_dir`:
-`ca.crt` and `ca.key` (0600, directory 0700). The listener's server
+`keel credentials create`), Keel generates the control CA in `control/`
+under `keel.state_dir`: `ca.crt` and `ca.key` (0600, directory 0700). The listener's server
 certificate is issued from it in memory at each start.
 
 ## Creating credentials
@@ -65,7 +64,7 @@ keelctl status
 keelctl backend list --pool web
 keelctl backend drain 10.0.0.1:8080 --wait
 keelctl config reload
-keelctl config push keel.yaml
+keelctl config push ./config
 keelctl cluster status
 keelctl cluster stepdown
 ```
@@ -81,16 +80,15 @@ The keelconfig is resolved in order:
 
 ## Cluster mode
 
-Every node with `control.remote` configured listens. `cluster stepdown`
-sent to a follower is forwarded to the leader. `config push` is not
-forwarded: send it to the leader's endpoint, or it fails. `status`,
-`backend list`, `backend drain` and `config reload` act on the node that
-receives them only.
+Every node with `control.remote` configured listens. `cluster stepdown`,
+`config push`, `config reload` and `credentials revoke-all` sent to a
+follower reach the leader. `status`, `backend list` and `backend drain` act
+on the node that receives them only.
 
 The control CA is cluster-wide. When a cluster forms, the leader commits
 its control CA (certificate and key) to the Raft log; every node, including
-one that joins later, writes it into its own `ca_dir` and re-keys its remote
-listener. One keelconfig therefore authenticates to every node, and
+one that joins later, writes it into its own control CA directory and re-keys
+its remote listener. One keelconfig therefore authenticates to every node, and
 `keel credentials create` produces a valid keelconfig on any node.
 
 A node that starts with a different local CA (for example a node previously
@@ -100,14 +98,16 @@ up rather than on a node before it joins, for the same reason.
 
 ## Revocation
 
-There is no per-certificate revocation. To invalidate issued credentials,
-delete `ca_dir` and restart Keel — a new CA is generated, all previously
-issued keelconfigs stop working, and each operator needs a new one.
+There is no per-certificate revocation. To invalidate every issued
+credential, run on a node:
 
-In cluster mode the CA in the Raft log would repopulate a deleted `ca_dir`
-on the next start, and the log is in memory. Rotation therefore means:
-stop every node, delete `ca_dir` on every node, start the cluster again.
-The new leader generates and publishes a fresh CA.
+```bash
+keel credentials revoke-all
+```
+
+It replaces the control CA — in a cluster through Raft, so every node
+re-keys its listener — and every keelconfig issued so far stops working.
+Issue new ones with `keel credentials create`.
 
 ## Audit log
 

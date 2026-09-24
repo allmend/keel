@@ -1,24 +1,17 @@
-keel:
-  workers: 4
-  user: keel
-  group: keel
-
-# Load additional vhost/pool configs from a directory (conf.d style).
-# Files are merged in alphabetical order.
-# include:
-#   - conf.d/**/*.yaml
+# /etc/keel/config/keel.yaml — the load balancer: listeners, pools, vhosts.
+# Every *.yaml below /etc/keel/config/ is loaded after this file, in
+# alphabetical order (pools/web.yaml, vhosts/example.com.yaml, ...).
+# In a cluster this directory is the replicated config: identical on every
+# node. How this node is run and reached lives in /etc/keel/node.yaml.
 
 listeners:
   - address: 0.0.0.0:80
   - address: 0.0.0.0:443
     tls: true
-  # Enable PROXY Protocol on a listener when Keel sits behind a cloud LB
-  # that injects the real client IP via PROXY Protocol (AWS NLB, HAProxy, etc.)
+  # Enable PROXY Protocol on a listener when Keel sits behind a load balancer
+  # or proxy that sends the real client address that way.
   # - address: 0.0.0.0:80
   #   proxy_protocol: true
-
-metrics:
-  address: 0.0.0.0:10790
 
 access_log:
   enabled: true

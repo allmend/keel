@@ -1,0 +1,10 @@
+# Local dev stack (docker compose): this node.
+keel:
+  workers: 2
+  # Workers must end up unprivileged: keel refuses to serve as root after the
+  # drop. nobody/nogroup exist in the debian:bookworm-slim runtime image.
+  user: nobody
+  group: nogroup
+
+metrics:
+  address: 0.0.0.0:10790

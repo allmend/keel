@@ -5,96 +5,164 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub fn load(path: &str, conf_dir: Option<&str>) -> Result<Config> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("cannot read {path}"))?;
-    let mut cfg: Config = serde_yml::from_str(&raw)
-        .with_context(|| format!("cannot parse {path}"))?;
-    cfg.path = path.to_owned();
-    cfg.conf_dir = conf_dir.map(|s| s.to_owned());
+/// Default location of the node-local file. A node without one runs on the
+/// defaults of every node setting.
+pub const DEFAULT_NODE_PATH: &str = "/etc/keel/node.yaml";
 
-    // Collect glob patterns: from include: in YAML plus optional --conf-dir flag.
-    let mut patterns = cfg.include.clone();
-    if let Some(dir) = conf_dir {
-        patterns.push(format!("{dir}/**/*.yaml"));
+/// The replicated config: every file under the config directory by relative
+/// path. Only `*.yaml` files are parsed as config; others (certificates)
+/// travel with them unchanged.
+pub use keel_control::FileSet;
+
+/// The config directory's root file, loaded before every other `*.yaml`.
+pub const ROOT_FILE: &str = "keel.yaml";
+
+/// Sections of `node.yaml`: how this node is reached and run.
+const NODE_SECTIONS: [&str; 4] = ["keel", "cluster", "control", "metrics"];
+/// `keel:` settings that describe the node rather than the load balancer.
+const NODE_KEEL_KEYS: [&str; 6] = ["workers", "user", "group", "control_socket", "state_dir", "config_dir"];
+/// Sections only the root file of the config directory may hold; the other
+/// files add pools, vhosts, listeners and certificates.
+const ROOT_ONLY_SECTIONS: [&str; 4] = ["keel", "access_log", "acme", "cache"];
+
+/// Load `node.yaml` at `node_path` and the config directory it names
+/// (`keel.config_dir`). A missing file at the default path means defaults.
+pub fn load(node_path: &str) -> Result<Config> {
+    let node_yaml = match fs::read_to_string(node_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && node_path == DEFAULT_NODE_PATH => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {node_path}")),
+    };
+    let dir = config_dir(&node_yaml).with_context(|| format!("cannot parse {node_path}"))?;
+    let files = read_config_dir(&dir)?;
+    let mut cfg = assemble(&node_yaml, &files).with_context(|| format!("invalid config ({node_path}, {})", dir.display()))?;
+    cfg.path = node_path.to_owned();
+    cfg.node_yaml = node_yaml;
+    Ok(cfg)
+}
+
+/// `keel.config_dir` from a node file, or its default.
+fn config_dir(node_yaml: &str) -> Result<PathBuf> {
+    let node = parse_mapping("node.yaml", node_yaml)?;
+    let dir = node
+        .get("keel")
+        .and_then(|k| k.get("config_dir"))
+        .and_then(|d| d.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(default_config_dir);
+    Ok(PathBuf::from(dir))
+}
+
+/// Every file below `dir`, by relative path.
+pub fn read_config_dir(dir: &std::path::Path) -> Result<FileSet> {
+    keel_control::read_file_set(dir)
+}
+
+fn parse_mapping(name: &str, text: &str) -> Result<serde_yml::Mapping> {
+    if text.trim().is_empty() {
+        return Ok(serde_yml::Mapping::new());
     }
+    match serde_yml::from_str::<serde_yml::Value>(text).with_context(|| format!("cannot parse {name}"))? {
+        serde_yml::Value::Mapping(m) => Ok(m),
+        serde_yml::Value::Null => Ok(serde_yml::Mapping::new()),
+        _ => anyhow::bail!("{name}: expected a mapping of sections"),
+    }
+}
 
-    if !patterns.is_empty() {
-        let root_canonical = fs::canonicalize(path).ok().unwrap_or_else(|| PathBuf::from(path));
+fn keel_keys(section: &serde_yml::Mapping) -> Vec<String> {
+    section
+        .get("keel")
+        .and_then(|k| k.as_mapping())
+        .map(|m| m.keys().map(|k| k.as_str().to_owned()).collect())
+        .unwrap_or_default()
+}
 
-        // Expand all patterns, deduplicate, sort alphabetically.
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        let mut fragment_paths: Vec<PathBuf> = Vec::new();
-        for pattern in &patterns {
-            let entries = glob::glob(pattern)
-                .with_context(|| format!("invalid glob pattern '{pattern}'"))?;
-            for entry in entries {
-                let p = entry.with_context(|| format!("glob error in pattern '{pattern}'"))?;
-                if seen.insert(p.clone()) {
-                    fragment_paths.push(p);
+/// `node.yaml` holds node settings only; everything else is replicated.
+fn check_node_file(node: &serde_yml::Mapping) -> Result<()> {
+    for key in node.keys().map(|k| k.as_str()) {
+        if !NODE_SECTIONS.contains(&key) {
+            anyhow::bail!("node.yaml: `{key}` belongs in the config directory, not in node.yaml");
+        }
+    }
+    for key in keel_keys(node) {
+        if !NODE_KEEL_KEYS.contains(&key.as_str()) {
+            anyhow::bail!("node.yaml: `keel.{key}` belongs in the config directory's {ROOT_FILE}, not in node.yaml");
+        }
+    }
+    Ok(())
+}
+
+/// Files of the config directory hold no node settings, and only the root
+/// file holds the sections that exist once.
+fn check_replicated_file(path: &str, file: &serde_yml::Mapping) -> Result<()> {
+    for key in file.keys().map(|k| k.as_str()) {
+        if key == "include" {
+            anyhow::bail!("{path}: `include` is not supported: every *.yaml in the config directory is loaded");
+        }
+        if NODE_SECTIONS.contains(&key) && key != "keel" {
+            anyhow::bail!("{path}: `{key}` belongs in node.yaml");
+        }
+        if path != ROOT_FILE && ROOT_ONLY_SECTIONS.contains(&key) {
+            anyhow::bail!("{path}: `{key}` may only be set in {ROOT_FILE}");
+        }
+    }
+    for key in keel_keys(file) {
+        if NODE_KEEL_KEYS.contains(&key.as_str()) {
+            anyhow::bail!("{path}: `keel.{key}` belongs in node.yaml");
+        }
+    }
+    Ok(())
+}
+
+/// Build the config from this node's `node.yaml` and a replicated file set:
+/// the set's `keel.yaml` first, then its other `*.yaml` files in path order.
+pub fn assemble(node_yaml: &str, files: &FileSet) -> Result<Config> {
+    let node = parse_mapping("node.yaml", node_yaml)?;
+    check_node_file(&node)?;
+    let root_text = files.get(ROOT_FILE).with_context(|| format!("the config directory has no {ROOT_FILE}"))?;
+    let mut root = parse_mapping(ROOT_FILE, root_text)?;
+    check_replicated_file(ROOT_FILE, &root)?;
+
+    // Node settings join the root: its `keel:` keys into the root's `keel:`.
+    for (key, value) in node {
+        match (key.as_str(), value) {
+            ("keel", serde_yml::Value::Mapping(node_keel)) => {
+                let keel = root.entry("keel".to_owned()).or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
+                if let serde_yml::Value::Mapping(keel) = keel {
+                    keel.extend(node_keel);
                 }
             }
-        }
-        fragment_paths.sort();
-
-        for frag_path in &fragment_paths {
-            // Skip the root config file itself if it matches a glob.
-            let frag_canonical = fs::canonicalize(frag_path)
-                .ok()
-                .unwrap_or_else(|| frag_path.clone());
-            if frag_canonical == root_canonical {
-                continue;
+            (_, value) => {
+                root.insert(key, value);
             }
-
-            let frag_str = frag_path.to_string_lossy();
-            let raw = fs::read_to_string(frag_path)
-                .with_context(|| format!("cannot read {frag_str}"))?;
-
-            check_no_root_sections(&frag_str, &raw)?;
-
-            let fragment: IncludeFragment = serde_yml::from_str(&raw)
-                .with_context(|| format!("cannot parse {frag_str}"))?;
-
-            // Pools merge as a map — duplicate name is an error.
-            for (name, pool) in fragment.pools {
-                if cfg.pools.contains_key(&name) {
-                    anyhow::bail!(
-                        "{frag_str}: pool '{name}' is already defined in another config file"
-                    );
-                }
-                cfg.pools.insert(name, pool);
-            }
-
-            // Vhosts, listeners, and certificates are appended in load order.
-            cfg.vhosts.extend(fragment.vhosts);
-            cfg.listeners.extend(fragment.listeners);
-            cfg.certificates.extend(fragment.certificates);
         }
+    }
+    let mut cfg: Config = serde_yml::from_value(serde_yml::Value::Mapping(root)).context("cannot parse config")?;
+
+    for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".yaml") && p.as_str() != ROOT_FILE) {
+        let file = parse_mapping(path, text)?;
+        check_replicated_file(path, &file)?;
+        let fragment: IncludeFragment =
+            serde_yml::from_value(serde_yml::Value::Mapping(file)).with_context(|| format!("cannot parse {path}"))?;
+
+        // Pools merge as a map — duplicate name is an error.
+        for (name, pool) in fragment.pools {
+            if cfg.pools.contains_key(&name) {
+                anyhow::bail!("{path}: pool '{name}' is already defined in another config file");
+            }
+            cfg.pools.insert(name, pool);
+        }
+        // Vhosts, listeners, and certificates are appended in load order.
+        cfg.vhosts.extend(fragment.vhosts);
+        cfg.listeners.extend(fragment.listeners);
+        cfg.certificates.extend(fragment.certificates);
     }
 
     cfg.validate()?;
     Ok(cfg)
 }
 
-/// Reject conf.d files that contain root-only sections.
-fn check_no_root_sections(path: &str, raw: &str) -> Result<()> {
-    let value: serde_yml::Value = serde_yml::from_str(raw)
-        .with_context(|| format!("cannot parse {path}"))?;
-
-    let forbidden = ["keel", "metrics", "access_log", "include", "cluster", "acme", "control"];
-    if let Some(map) = value.as_mapping() {
-        for key in &forbidden {
-            if map.contains_key(key) {
-                anyhow::bail!(
-                    "{path}: conf.d files may not contain '{key}' (root-level section only)"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Fragment parsed from a conf.d include file.
+/// A file of the config directory other than its root `keel.yaml`.
 #[derive(Debug, Deserialize, Default)]
 struct IncludeFragment {
     #[serde(default)]
@@ -112,13 +180,14 @@ struct IncludeFragment {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    /// Path this config was loaded from — set by load(), not from YAML.
+    /// The node file this config was loaded from — set by load(), not from YAML.
     #[serde(skip, default)]
     pub path: String,
 
-    /// --conf-dir CLI value — set by load(), not from YAML.
+    /// The node file's text as loaded — set by load(). A cluster node builds
+    /// every replicated version against it.
     #[serde(skip, default)]
-    pub conf_dir: Option<String>,
+    pub node_yaml: String,
 
     #[serde(default)]
     pub keel: KeelConfig,
@@ -141,10 +210,6 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
 
-    /// Glob patterns for conf.d include files. Processed at load time.
-    #[serde(default)]
-    pub include: Vec<String>,
-
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
 
@@ -166,7 +231,10 @@ pub struct ControlConfig {
     pub remote: Option<RemoteControlConfig>,
 }
 
+// Unknown keys are refused: `ca_dir` is not a setting (the control CA lives
+// in `keel.state_dir`), and a misspelt `allow` would silently open the port.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteControlConfig {
     /// TCP listen address for keelctl connections (mTLS required).
     pub address: String,
@@ -175,14 +243,7 @@ pub struct RemoteControlConfig {
     /// Empty = allow any source. Narrows exposure; mTLS stays mandatory.
     #[serde(default)]
     pub allow: Vec<String>,
-
-    /// Directory holding the control CA (ca.crt / ca.key). Generated on
-    /// first use; `keel credentials create` signs client certs with it.
-    #[serde(default = "default_control_ca_dir")]
-    pub ca_dir: String,
 }
-
-pub fn default_control_ca_dir() -> String { "/var/lib/keel/control".into() }
 
 impl Config {
     fn validate(&self) -> Result<()> {
@@ -566,6 +627,11 @@ pub struct KeelConfig {
     /// ID today. Written by the unprivileged process after the drop.
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
+
+    /// The replicated config directory: `keel.yaml` and every other `*.yaml`
+    /// below it. In cluster mode Keel writes it after each applied version.
+    #[serde(default = "default_config_dir")]
+    pub config_dir: String,
 }
 
 impl Default for KeelConfig {
@@ -579,11 +645,20 @@ impl Default for KeelConfig {
             udp_flow_timeout_seconds: default_udp_flow_timeout(),
             udp_max_flows: default_udp_max_flows(),
             state_dir: default_state_dir(),
+            config_dir: default_config_dir(),
         }
     }
 }
 
 fn default_state_dir() -> String { "/var/lib/keel".into() }
+
+impl KeelConfig {
+    /// Where the control CA lives: `ca.crt` / `ca.key` under the state directory.
+    pub fn control_ca_dir(&self) -> String {
+        format!("{}/control", self.state_dir.trim_end_matches('/'))
+    }
+}
+fn default_config_dir() -> String { "/etc/keel/config".into() }
 
 fn default_grace_period() -> u64 { 10 }
 fn default_udp_flow_timeout() -> u64 { 30 }
@@ -1249,6 +1324,94 @@ mod tests {
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
+    }
+
+    fn files(entries: &[(&str, &str)]) -> FileSet {
+        entries.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect()
+    }
+
+    const ROOT: &str = "keel:\n  grace_period_seconds: 3\nlisteners:\n  - address: 0.0.0.0:80\npools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n";
+
+    fn assemble_err(node: &str, set: &FileSet) -> String {
+        format!("{:#}", assemble(node, set).expect_err("must be refused"))
+    }
+
+    #[test]
+    fn node_file_and_config_directory_assemble_into_one_config() {
+        let node = "keel:\n  workers: 3\n  config_dir: /srv/lb\nmetrics:\n  address: 127.0.0.1:9999\n";
+        let set = files(&[
+            ("keel.yaml", ROOT),
+            ("vhosts/b.yaml", "vhosts:\n  - host: b.test\n    pool: api\n"),
+            ("pools/api.yaml", "pools:\n  api:\n    backends:\n      - address: 10.0.0.2:80\n"),
+            ("certs/b.crt", "-----BEGIN CERTIFICATE-----\nnot parsed\n"),
+        ]);
+        let cfg = assemble(node, &set).unwrap();
+        assert_eq!((cfg.keel.workers, cfg.keel.grace_period_seconds), (3, 3), "keel: from both files");
+        assert_eq!(cfg.keel.config_dir, "/srv/lb");
+        assert_eq!(cfg.metrics.address, "127.0.0.1:9999");
+        assert!(cfg.pools.contains_key("web") && cfg.pools.contains_key("api"));
+        let hosts: Vec<&str> = cfg.vhosts.iter().map(|v| v.host.as_str()).collect();
+        assert_eq!(hosts, vec!["a.test", "b.test"], "root first, then the others in path order");
+    }
+
+    #[test]
+    fn replicated_sections_are_refused_in_the_node_file() {
+        let set = files(&[("keel.yaml", ROOT)]);
+        let err = assemble_err("listeners:\n  - address: 0.0.0.0:81\n", &set);
+        assert!(err.contains("`listeners` belongs in the config directory"), "{err}");
+        let err = assemble_err("keel:\n  grace_period_seconds: 5\n", &set);
+        assert!(err.contains("`keel.grace_period_seconds` belongs in the config directory"), "{err}");
+    }
+
+    #[test]
+    fn node_sections_are_refused_in_the_config_directory() {
+        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}cluster:\n  addr: 10.0.0.1:7654\n"))]));
+        assert!(err.contains("keel.yaml: `cluster` belongs in node.yaml"), "{err}");
+        let err = assemble_err("", &files(&[("keel.yaml", &ROOT.replace("grace_period_seconds: 3", "workers: 2"))]));
+        assert!(err.contains("`keel.workers` belongs in node.yaml"), "{err}");
+    }
+
+    #[test]
+    fn once_only_sections_stay_in_the_root_file() {
+        let err = assemble_err("", &files(&[("keel.yaml", ROOT), ("more.yaml", "cache:\n  memory: 1M\n")]));
+        assert!(err.contains("more.yaml: `cache` may only be set in keel.yaml"), "{err}");
+        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}include:\n  - x/*.yaml\n"))]));
+        assert!(err.contains("`include` is not supported"), "{err}");
+    }
+
+    #[test]
+    fn a_config_directory_needs_its_root_file() {
+        let err = assemble_err("", &files(&[("pools.yaml", "pools: {}\n")]));
+        assert!(err.contains("has no keel.yaml"), "{err}");
+    }
+
+    #[test]
+    fn the_config_directory_is_read_with_relative_paths() {
+        let dir = std::env::temp_dir().join(format!("keel-configdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vhosts")).unwrap();
+        std::fs::write(dir.join("keel.yaml"), ROOT).unwrap();
+        std::fs::write(dir.join("vhosts/b.yaml"), "vhosts: []\n").unwrap();
+        std::fs::write(dir.join(".keel.yaml.swp"), "editor").unwrap();
+        let set = read_config_dir(&dir).unwrap();
+        assert_eq!(set.keys().map(String::as_str).collect::<Vec<_>>(), vec!["keel.yaml", "vhosts/b.yaml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_shipped_examples_load() {
+        let example = files(&[("keel.yaml", include_str!("../../keel.yaml"))]);
+        assemble(include_str!("../../node.yaml"), &example).expect("node.yaml + keel.yaml");
+        let dev = files(&[("keel.yaml", include_str!("../../dev/config/keel.yaml"))]);
+        assemble(include_str!("../../dev/node.yaml"), &dev).expect("dev stack");
+    }
+
+    #[test]
+    fn control_ca_dir_is_not_a_setting() {
+        let yaml = format!("{POOL}control:\n  remote:\n    address: 127.0.0.1:10789\n    ca_dir: /x\n");
+        let err = serde_yml::from_str::<Config>(&yaml).expect_err("ca_dir must be refused").to_string();
+        assert!(err.contains("ca_dir"), "error names the option: {err}");
+        assert_eq!(KeelConfig::default().control_ca_dir(), "/var/lib/keel/control");
     }
 
     #[test]

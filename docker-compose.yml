@@ -3,7 +3,8 @@ services:
     build: .
     init: true   # tini — proper PID 1 / signal handling for forked workers
     volumes:
-      - ./keel-dev.yaml:/etc/keel/keel.yaml:ro
+      - ./dev/node.yaml:/etc/keel/node.yaml:ro
+      - ./dev/config:/etc/keel/config:ro
     ports:
       - "8080:80"     # proxy — curl http://localhost:8080
       - "10790:10790" # metrics — curl http://localhost:10790/metrics

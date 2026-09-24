@@ -1,51 +1,60 @@
 # Configuration
 
-Keel is configured via a YAML file, defaulting to `keel.yaml` in the working directory. Pass a different path with `--config`.
+Keel reads two things: the **node file**, `/etc/keel/node.yaml` (`--config` sets another path), and the **config directory** it names, `/etc/keel/config/` by default. The node file says how this node runs and is reached; the config directory is the load balancer. See [Files and layout](#files-and-layout).
 
 ## Top-level sections
 
-| Section | Purpose | Reference |
-|---|---|---|
-| `keel` | Process settings: worker count, user/group, control socket | [below](#keel) |
-| `listeners` | Network ports to bind | [below](#listeners) |
-| `metrics` | Prometheus metrics endpoint | [below](#metrics) |
-| `access_log` | NDJSON access log output | [Access logging](access-logging.md) |
-| `cache` | Memory and disk HTTP cache | [Caching](caching.md) |
-| `pools` | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
-| `vhosts` | Virtual host routing rules, TLS, cache rules | [Virtual hosts](virtual-hosts.md) |
-| `acme` | ACME issuers: directory, contact | [ACME](acme.md) |
-| `certificates` | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-for-tcp--tls-passthrough-backends) |
-| `include` | Glob patterns for conf.d-style config splitting | [below](#config-splitting) |
-| `cluster` | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
-| `control` | Remote control listener (keelctl, mTLS) | [Remote control](keelctl.md) |
+| Section | File | Purpose | Reference |
+|---|---|---|---|
+| `keel` | both | Process settings; which keys go where is [below](#keel) | [below](#keel) |
+| `cluster` | node file | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
+| `control` | node file | Remote control listener (keelctl, mTLS) | [Remote control](keelctl.md) |
+| `metrics` | node file | Prometheus metrics endpoint | [below](#metrics) |
+| `listeners` | config directory | Network ports to bind | [below](#listeners) |
+| `access_log` | config directory | NDJSON access log output | [Access logging](access-logging.md) |
+| `cache` | config directory | Memory and disk HTTP cache | [Caching](caching.md) |
+| `pools` | config directory | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
+| `vhosts` | config directory | Virtual host routing rules, TLS, cache rules | [Virtual hosts](virtual-hosts.md) |
+| `acme` | config directory | ACME issuers: directory, contact | [ACME](acme.md) |
+| `certificates` | config directory | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-for-tcp--tls-passthrough-backends) |
+
+A section in the wrong file is a load error naming the section and where it belongs.
 
 ---
 
 ## keel
 
-Process-level settings.
+Process-level settings. The ones that describe the node go in the node file; the ones that shape traffic go in the config directory's `keel.yaml`.
 
 ```yaml
+# /etc/keel/node.yaml
 keel:
   workers: 4              # number of worker processes; default: CPU count (max 16)
   user: keel              # drop to this user after binding privileged ports
   group: keel             # drop to this group
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
-  grace_period_seconds: 10   # graceful shutdown: time for in-flight requests
-  udp_flow_timeout_seconds: 30   # idle time before a UDP flow expires
-  state_dir: /var/lib/keel   # state kept across restarts: node ID, certificates, Raft store
+  state_dir: /var/lib/keel       # state kept across restarts: node ID, certificates, Raft store, control CA
+  config_dir: /etc/keel/config   # the config directory
 ```
 
-| Field | Type | Default |
-|---|---|---|
-| `workers` | integer | CPU count, max 16 |
-| `user` | string | `keel` |
-| `group` | string | `keel` |
-| `control_socket` | string | `/var/run/keel/keel.sock` |
-| `grace_period_seconds` | integer | `10` |
-| `udp_flow_timeout_seconds` | integer | `30` |
-| `udp_max_flows` | integer | `8192` |
-| `state_dir` | string | `/var/lib/keel` |
+```yaml
+# /etc/keel/config/keel.yaml
+keel:
+  grace_period_seconds: 10       # graceful shutdown: time for in-flight requests
+  udp_flow_timeout_seconds: 30   # idle time before a UDP flow expires
+```
+
+| Field | File | Type | Default |
+|---|---|---|---|
+| `workers` | node file | integer | CPU count, max 16 |
+| `user` | node file | string | `keel` |
+| `group` | node file | string | `keel` |
+| `control_socket` | node file | string | `/var/run/keel/keel.sock` |
+| `state_dir` | node file | string | `/var/lib/keel` |
+| `config_dir` | node file | string | `/etc/keel/config` |
+| `grace_period_seconds` | config directory | integer | `10` |
+| `udp_flow_timeout_seconds` | config directory | integer | `30` |
+| `udp_max_flows` | config directory | integer | `8192` |
 
 On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period_seconds`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
@@ -277,7 +286,7 @@ acme:
 Standalone certificate requests: hostnames Keel obtains certificates for
 without terminating TLS itself (TCP / TLS-passthrough backends). Keel answers
 the HTTP-01 challenge and writes `{host}.crt` / `{host}.key` to
-`acme.storage`. Allowed in conf.d files (appended like vhosts). See
+`acme.storage`. Allowed in any file of the config directory (appended like vhosts). See
 [ACME](acme.md).
 
 ```yaml
@@ -338,57 +347,57 @@ The listener is served by the root master process. See [Security](security.md#th
 |---|---|---|---|
 | `remote.address` | string | none | TCP listen address for keelctl. Must be a literal `ip:port` — a hostname is rejected at startup |
 | `remote.allow` | list | none | Optional source-CIDR restriction; empty = any source. mTLS stays mandatory |
-| `remote.ca_dir` | string | `/var/lib/keel/control` | Control CA storage (`ca.crt` / `ca.key`) |
+
+The control CA (`ca.crt` / `ca.key`) lives in `control/` under `keel.state_dir`. Unknown keys under `control.remote` are refused.
 
 ---
 
-## Config splitting
-
-Large deployments can split configuration across multiple files using glob includes. This is useful when different teams manage their own vhosts or pools independently.
-
-```yaml
-# keel.yaml
-include:
-  - conf.d/**/*.yaml
-```
-
-Or via CLI:
-
-```bash
-keel --config keel.yaml --conf-dir conf.d/
-```
-
-Files are loaded in alphabetical order and merged into the root config.
-
-Merge rules:
-- `pools`: merged as a map; duplicate pool name is an error
-- `vhosts`: appended in load order
-- `listeners`: appended in load order
-- `certificates`: appended in load order
-- `keel`, `metrics`, `access_log`, `include`, `cluster`, `acme`, `control`: root file only; error if present in included files
-- Any other top-level key in an included file (for example `cache`) is ignored
-
-Example layout:
+## Files and layout
 
 ```
 /etc/keel/
-├── keel.yaml
-└── conf.d/
+├── node.yaml                 this node: keel.workers/user/group, cluster, control, metrics
+└── config/                   the load balancer
+    ├── keel.yaml             loaded first
     ├── pools/
-    │   ├── api.yaml
-    │   └── web.yaml
-    └── vhosts/
-        ├── api.example.com.yaml
-        └── app.example.com.yaml
+    │   ├── api.yaml          then every other *.yaml below config/,
+    │   └── web.yaml          recursively, in path order
+    ├── vhosts/
+    │   └── api.example.com.yaml
+    └── certs/
+        └── api.crt           not parsed; travels with the directory
 ```
 
-On `SIGHUP` or `keel config reload`, all files including conf.d fragments are re-read and re-merged.
+The node file may be missing: at the default path that means every node setting at its default. The config directory must hold `keel.yaml`.
+
+Merge rules for the files after `keel.yaml`:
+- `pools`: merged as a map; a duplicate pool name is an error
+- `vhosts`, `listeners`, `certificates`: appended in load order
+- `keel`, `access_log`, `acme`, `cache`: `keel.yaml` only
+- `cluster`, `control`, `metrics`: node file only
+- `include:` is refused: every `*.yaml` in the directory is loaded
+
+Names starting with `.` (editor and temporary files) are skipped. Every file must be UTF-8 text.
+
+### In a cluster
+
+The config directory is the replicated config: every node holds the same files. The same content exists in three forms — the committed entry in Raft, its copy in each node's Raft store on disk, and the files under `/etc/keel/config/`, which a node rewrites after it applied a version. The files are for editing and inspection; the node file is never replicated.
+
+Each push is a **version**: the whole file set, keyed by relative path, committed through Raft (the version number is its log index). Every node builds the version against its own node file, applies it, and only then writes it into its config directory — so the directory always holds the last version that worked on that node. Files a version no longer has are deleted. A version that fails on a node leaves that node serving the previous one, logged as `config version cannot be applied`, files untouched.
+
+A new version comes from:
+- `keel config push <dir>` or `keelctl config push <dir>` — a directory as it is, or a single file as its `keel.yaml`; a follower forwards the push to the leader
+- `SIGHUP` or `keel config reload` on a node — that node's config directory becomes the next version
+- starting a node whose config files differ from the version it last applied — they were edited while it was stopped, and the later push wins
+- the first start of a new cluster — the bootstrap node's files become the first version
+
+A push is built against the node file before it is committed, so a version that does not load is refused. Without a reachable majority a push fails at once: `no quorum: 1 of 3 members reachable; config not pushed`. Traffic is unaffected either way.
 
 ---
 
 ## Hot reload
 
-Send `SIGHUP` or run `keel config reload` to reload configuration without dropping connections. The master forwards the signal to every worker and re-reads the config itself, so a worker it restarts later starts from the current config. If the new config fails to load, the master logs the error and retains the previous one for that purpose.
+On a single node, send `SIGHUP` or run `keel config reload` to reload the node file and the config directory without dropping connections. The master forwards the signal to every worker and re-reads the config itself, so a worker it restarts later starts from the current config. If the new config fails to load, the master logs the error and retains the previous one for that purpose. In a cluster, the same commands push the node's config directory as the next version; see [In a cluster](#in-a-cluster).
 
 What reloads without restart:
 - Virtual host rules: hosts, routes and the pools they reference, `forwarded_headers`, cache rules, `redirect_http`, `default_action`
@@ -402,9 +411,10 @@ What requires a process restart:
 - `health_check` and `passive` settings — the running checks and rules keep their startup values
 - ACME: hosts, issuers and `certificates:` entries added on reload are not issued until restart
 - `cache` storage, `access_log`, `metrics` and `control`
+- Every setting in the node file
 - Listeners (`listeners[]`)
 - Every setting in the `keel` section, including worker count, user/group and the UDP flow settings
 
 Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
 
-In cluster mode, use `keel config push <file>` to distribute a new config to all nodes via Raft. See [Cluster](cluster.md).
+In a cluster, a version applies the same way on every node: what reloads live above takes effect on push, the rest needs a restart of each node.

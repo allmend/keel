@@ -18,8 +18,11 @@ openraft::declare_raft_types!(
 /// Commands that flow through the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
-    /// Push a full serialised config to the cluster.
+    /// A config as one document, from logs written before file sets; read
+    /// back as a set holding only `keel.yaml`.
     SetConfig { yaml: String },
+    /// A new config version: the whole file set of the config directory.
+    SetConfigFiles { files: crate::config::FileSet },
     /// Mark a backend as draining on all nodes.
     DrainBackend { pool: String, address: String },
     /// Re-activate a drained backend.
@@ -53,6 +56,14 @@ pub type ControlCaPair = Option<(String, String)>;
 /// (cert PEM, key PEM) of the cluster CA, once the bootstrap node committed it.
 pub type ClusterCaPair = Option<(String, String)>;
 
+/// A committed config: the file set and its version, the index of the log
+/// entry that committed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigVersion {
+    pub version: u64,
+    pub files: crate::config::FileSet,
+}
+
 /// Response from the state machine after applying a log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientResponse {
@@ -69,8 +80,9 @@ impl ClientResponse {
 /// The replicated state maintained by the state machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClusterState {
-    /// Last applied config YAML. Applied on every node after commit.
-    pub config_yaml: Option<String>,
+    /// The committed config version. Applied on every node after commit.
+    #[serde(default)]
+    pub config: Option<ConfigVersion>,
     /// Drain overrides: "pool/addr" → true means draining.
     pub draining: BTreeMap<String, bool>,
     /// ACME certificates replicated cluster-wide.

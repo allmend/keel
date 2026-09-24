@@ -20,18 +20,20 @@ services:
   keel:
     image: {image}
     init: true
-    command: ["--config", "/etc/keel/keel.yaml"]
     environment: [NO_COLOR=1]
-    volumes: ["./keel.yaml:/etc/keel/keel.yaml:ro"]
+    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config:ro"]
     ports: ["80"]
     networks: { net: { ipv4_address: 172.29.83.10 } }
 "#;
 
-const CONFIG: &str = r#"
+const NODE: &str = r#"
 keel:
   workers: 2
   user: nobody
   group: nogroup
+"#;
+
+const CONFIG: &str = r#"
 listeners:
   - address: 0.0.0.0:80
   - address: 0.0.0.0:53
@@ -74,7 +76,7 @@ fn keel_procs(stack: &Stack) -> Result<(Proc, Vec<Proc>)> {
 #[test]
 #[ignore = "needs Docker"]
 fn root_master_binds_privileged_ports_and_workers_drop_privileges() -> Result<()> {
-    let stack = Stack::up("privileges", COMPOSE, &[("keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("privileges", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
     serving(&stack)?;
 
     let logs = stack.logs("keel")?;
@@ -99,7 +101,7 @@ fn root_master_binds_privileged_ports_and_workers_drop_privileges() -> Result<()
 #[test]
 #[ignore = "needs Docker"]
 fn killed_worker_is_replaced_under_its_index() -> Result<()> {
-    let stack = Stack::up("respawn", COMPOSE, &[("keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("respawn", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
     serving(&stack)?;
 
     let logs = stack.logs("keel")?;

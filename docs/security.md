@@ -13,7 +13,7 @@ Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. 
 A captured exchange can still be brute-forced offline against a low-entropy secret, so use a high-entropy token:
 
 ```bash
-keel --config keel.yaml --cluster --bootstrap --secret "$(openssl rand -hex 32)"
+keel --cluster --bootstrap --secret "$(openssl rand -hex 32)"
 ```
 
 See [Cluster](cluster.md) for the full join flow.
@@ -30,7 +30,7 @@ The cluster CA's key is committed to Raft, so every member holds it — in memor
 
 ## Cluster mode requires a shared secret
 
-Keel refuses to start `--cluster` mode, bootstrap or join, without a non-empty secret from `--secret` or `cluster.secret` in `keel.yaml`.
+Keel refuses to start `--cluster` mode, bootstrap or join, without a non-empty secret from `--secret` or `cluster.secret` in `node.yaml`.
 
 Without it, the join listener would issue a CA-signed mTLS identity to any peer that can reach the cluster port, granting that peer full cluster membership.
 
@@ -70,11 +70,11 @@ Metrics expose backend addresses, pool and vhost names, and traffic volumes. Acc
 
 The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
 
-In cluster mode the control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is stored in each node's Raft store under `keel.state_dir`; on each node the key is also written to `ca_dir/ca.key` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
+In cluster mode the control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is stored in each node's Raft store under `keel.state_dir`; on each node the key is also written to `control/ca.key` under `keel.state_dir` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
 
 The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but does not replace mTLS.
 
-Every remote command is audit-logged with the client certificate's CN and source address. To invalidate all issued credentials, delete `control.remote.ca_dir` and restart — a new CA is generated and every existing keelconfig stops working.
+Every remote command is audit-logged with the client certificate's CN and source address. To invalidate all issued credentials, run `keel credentials revoke-all`: the control CA is replaced — on every node of a cluster — and every existing keelconfig stops working.
 
 ---
 
@@ -92,7 +92,7 @@ The directory holding it remains owned by root, mode `0750` with group `keel.gro
 
 ## The remote control listener runs as root
 
-The `control.remote` mTLS listener is bound and served by the master process, which keeps root privileges. TLS handshakes, client-certificate verification and command parsing for that port therefore run privileged, and the control CA in `ca_dir` is read as root. Everything else follows the process model: the master binds ports, and the unprivileged workers load TLS certificates and handle all proxied traffic.
+The `control.remote` mTLS listener is bound and served by the master process, which keeps root privileges. TLS handshakes, client-certificate verification and command parsing for that port therefore run privileged, and the control CA under `keel.state_dir` is read as root. Everything else follows the process model: the master binds ports, and the unprivileged workers load TLS certificates and handle all proxied traffic.
 
 The listener belongs to the master because a control command answers for the whole instance. Each worker holds only its own connection counts, health results and drain state, and when every worker bound the port, all but one failed with `control: remote listener failed`.
 
@@ -141,7 +141,7 @@ A Raft snapshot that fails to deserialize is returned as a storage error and sur
 
 | Requirement | Action |
 |---|---|
-| Cluster mode needs a secret | Set `cluster.secret` in `keel.yaml` or pass `--secret`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
+| Cluster mode needs a secret | Set `cluster.secret` in `node.yaml` or pass `--secret`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
 | Metrics bind to loopback by default | To scrape from another host, set `metrics.address: 0.0.0.0:10790` explicitly and firewall the port. |
 | Workers need a user to drop to | Startup fails if `keel.user` / `keel.group` cannot be resolved. Create the user and group, or point the fields at an existing account. |
 | All cluster nodes must speak the same join protocol | Run the same Keel build across the cluster when joining nodes. |

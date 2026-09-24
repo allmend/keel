@@ -47,6 +47,18 @@ enum Command {
         #[command(subcommand)]
         command: ClusterCommand,
     },
+    /// Operator credentials
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialsCommand {
+    /// Replace the control CA: every keelconfig issued so far stops working,
+    /// this one included
+    RevokeAll,
 }
 
 #[derive(Subcommand)]
@@ -67,9 +79,9 @@ enum BackendCommand {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Reload the node's config from its local disk (same as SIGHUP)
+    /// Apply the node's config directory (same as SIGHUP); in a cluster, push it as the new version
     Reload,
-    /// Push a local config file to the entire cluster via Raft
+    /// Push a config directory (or a single file, as its keel.yaml) as the cluster's new config version
     Push { file: String },
 }
 
@@ -103,9 +115,8 @@ fn main() -> Result<()> {
         Command::Config { command } => match command {
             ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload),
             ConfigCommand::Push { file } => {
-                let yaml = std::fs::read_to_string(file)
-                    .with_context(|| format!("cannot read {file}"))?;
-                client::message(&mut stream, &ControlRequest::ConfigPush { yaml })
+                let files = keel_control::push_file_set(std::path::Path::new(file))?;
+                client::message(&mut stream, &ControlRequest::ConfigPush { files })
             }
         },
         Command::Cluster { command } => match command {
@@ -115,6 +126,9 @@ fn main() -> Result<()> {
                 client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force })
             }
         },
+        Command::Credentials { command: CredentialsCommand::RevokeAll } => {
+            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll)
+        }
     }
 }
 

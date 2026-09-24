@@ -199,7 +199,7 @@ mod tests {
     fn make_config(vhosts: Vec<Vhost>, pools: HashMap<String, Pool>) -> Config {
         Config {
             path: String::new(),
-            conf_dir: None,
+            node_yaml: String::new(),
             keel: KeelConfig::default(),
             listeners: vec![],
             metrics: MetricsConfig::default(),
@@ -207,7 +207,6 @@ mod tests {
             vhosts,
             access_log: AccessLogConfig::default(),
             cache: crate::config::CacheConfig::default(),
-            include: vec![],
             cluster: None,
             acme: None,
             certificates: vec![],

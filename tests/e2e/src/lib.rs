@@ -117,7 +117,11 @@ impl Stack {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         for (file, content) in files {
-            std::fs::write(dir.join(file), content).with_context(|| format!("write {file}"))?;
+            let path = dir.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content).with_context(|| format!("write {file}"))?;
         }
         std::fs::write(dir.join("compose.yaml"), compose.replace("{image}", &image))?;
 
@@ -132,6 +136,20 @@ impl Stack {
     /// the node reads it on its next start.
     pub fn write_file(&self, file: &str, content: &str) -> Result<()> {
         std::fs::write(self.dir.join(file), content).with_context(|| format!("write {file}"))
+    }
+
+    /// A file of the stack directory, as a bind-mounted node left it.
+    pub fn read_file(&self, file: &str) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.dir.join(file)) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read {file}")),
+        }
+    }
+
+    /// Send a signal to a service's main process (init forwards it to keel).
+    pub fn signal(&self, service: &str, signal: &str) -> Result<()> {
+        self.compose(&["kill", "--signal", signal, service]).map(drop)
     }
 
     /// Run a shell script against one of the stack's named volumes, mounted at

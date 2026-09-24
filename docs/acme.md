@@ -108,10 +108,10 @@ certificates:
     issuer: default        # optional; "default" when omitted
 ```
 
-Because `certificates:` is a top-level list, like `vhosts:`, conf.d files can declare their own entries alongside their pools:
+Because `certificates:` is a top-level list, like `vhosts:`, any file of the config directory can declare its own entries alongside its pools:
 
 ```yaml
-# /etc/keel/conf.d/db-team.yaml
+# /etc/keel/config/db-team.yaml
 pools:
   db-frontend: { ... }
 

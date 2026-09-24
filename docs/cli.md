@@ -10,8 +10,7 @@ These flags are used when starting Keel as a server (no subcommand).
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--config <path>` | `keel.yaml` | Path to the YAML config file |
-| `--conf-dir <dir>` | none | Load additional `*.yaml` files from this directory (conf.d style) |
+| `--config <path>` | `/etc/keel/node.yaml` | The node file; it names the config directory (`keel.config_dir`). Missing at the default path = every node setting at its default. See [Files and layout](configuration.md#files-and-layout) |
 | `--socket <path>` | `/var/run/keel/keel.sock` | Control socket path |
 | `--cluster` | false | Enable cluster mode |
 | `--bootstrap` | false | Bootstrap a new cluster (requires `--cluster`) |
@@ -22,17 +21,17 @@ These flags are used when starting Keel as a server (no subcommand).
 Examples:
 
 ```bash
-# Standalone
-keel --config /etc/keel/keel.yaml
+# Standalone: /etc/keel/node.yaml and /etc/keel/config/
+keel
 
-# With conf.d
-keel --config /etc/keel/keel.yaml --conf-dir /etc/keel/conf.d
+# Another node file
+keel --config /srv/keel/node.yaml
 
 # Cluster — bootstrap first node
-keel --config /etc/keel/keel.yaml --cluster --bootstrap --secret mytoken
+keel --cluster --bootstrap --secret mytoken
 
 # Cluster — join existing cluster
-keel --config /etc/keel/keel.yaml --cluster --join 10.0.0.1:7654 --secret mytoken
+keel --cluster --join 10.0.0.1:7654 --secret mytoken
 ```
 
 ---
@@ -116,11 +115,11 @@ Stop routing new requests to a backend and optionally wait until all active conn
 keel backend drain <address> [--wait]
 ```
 
-The `address` must match exactly how it appears in `keel.yaml` (e.g. `10.0.0.1:8080`). If the address appears in multiple pools it is drained from all of them.
+The `address` must match exactly how it appears in the config (e.g. `10.0.0.1:8080`). If the address appears in multiple pools it is drained from all of them.
 
 Without `--wait`, the command applies the drain, prints `Drain complete.` and returns. The message means the drain was applied; the backend is in the `draining` state and keeps its open connections until they end.
 
-The drain is applied in every worker, and the master re-applies it to any worker it restarts, so a worker that crashes mid-drain returns with the backend still draining. Drain state is held by the running master and is not written to `keel.yaml`: after a full restart every backend is `active` again.
+The drain is applied in every worker, and the master re-applies it to any worker it restarts, so a worker that crashes mid-drain returns with the backend still draining. Drain state is held by the running master and is not written to the config: after a full restart every backend is `active` again.
 
 With `--wait`, the command blocks until the backend reaches zero active connections, summed across all workers. The count is polled every 500 ms and updated in place on one line:
 
@@ -146,13 +145,15 @@ In cluster mode the drain applies to the node that receives the command only; it
 keel backend add <address> --pool <name>
 ```
 
-Not supported: the command always fails and prints the instruction to add the backend to `keel.yaml`. A backend added to the config takes effect on restart, not on reload — see [Hot reload](configuration.md#hot-reload).
+Not supported: the command always fails and prints the instruction to add the backend to the config. A backend added to the config takes effect on restart, not on reload — see [Hot reload](configuration.md#hot-reload).
 
 ---
 
 ## keel config reload
 
-Reload configuration from disk. Equivalent to sending `SIGHUP` to the master process — the master forwards it to every worker, so all of them reload.
+On a single node: reload the node file and the config directory. Equivalent to sending `SIGHUP` to the master process — the master forwards it to every worker, so all of them reload.
+
+In a cluster: push this node's config directory as the next version, like `keel config push` with that directory; the answer names the committed version.
 
 ```bash
 keel config reload
@@ -170,30 +171,31 @@ What reloads: virtual host rules, TLS certificates, backends removed from a pool
 
 What does not reload without a restart: backends added to a pool, backend weights, algorithms, `health_check`, `passive`, listener ports, worker count. See [Hot reload](configuration.md#hot-reload) for the details.
 
-In cluster mode the reload re-reads the local file on the node that receives the command only. Use `keel config push` to distribute a config to all nodes.
 
 ---
 
 ## keel config push
 
-Push a config file to all cluster nodes via Raft. Only available in cluster mode; in standalone the command fails with `not in cluster mode`.
+Commit a config directory as the cluster's next version. Only available in cluster mode; in standalone the command fails with `not in cluster mode`.
 
 ```bash
-keel config push <file>
+keel config push <dir|file>
 ```
 
 Example:
 
 ```bash
-keel config push /etc/keel/keel.yaml
+keel config push /etc/keel/config
+config version 42 committed; every node applies it
 ```
 
-The file's text is committed as a Raft log entry; the command returns once a quorum has committed it, and each node applies it as the entry reaches it.
+- A directory is pushed as it is: every file by relative path, certificates included. A single file is pushed as the set's `keel.yaml`, and the set holds nothing else.
+- The set replaces the current version: files it no longer has are deleted on every node.
+- It is built against this node's node file before it is committed; a set that does not load is refused with the reason (`config not pushed: …`).
+- Any node: a follower forwards the push to the leader.
+- Without a reachable majority it fails at once: `no quorum: 1 of 3 members reachable; config not pushed`.
 
-- Run it against the leader. The command is not forwarded, and a follower rejects the write.
-- Only the named file is pushed; `include:` and `--conf-dir` fragments are not expanded.
-- The text is not validated before commit. A node that cannot parse it logs the error and keeps its current config.
-- Requires quorum. Fails if the cluster has no leader or cannot reach quorum.
+See [Config replication](cluster.md#config-replication).
 
 ---
 
@@ -272,7 +274,7 @@ Only available in cluster mode.
 
 ## keel credentials create
 
-Issue an operator client certificate from the control CA and print a keelconfig for [keelctl](keelctl.md) to stdout. Runs locally on the node (it reads the CA key from `control.remote.ca_dir`); it does not need a running keel.
+Issue an operator client certificate from the control CA and print a keelconfig for [keelctl](keelctl.md) to stdout. Runs locally on the node (it reads the CA key from `control/` under `keel.state_dir`); it does not need a running keel.
 
 ```bash
 keel credentials create <name> --endpoint <host:port> > keelconfig
@@ -284,6 +286,18 @@ keel credentials create <name> --endpoint <host:port> > keelconfig
 | `--endpoint` | Address keelctl dials; written into the keelconfig verbatim (DNS name, VIP, or IP) |
 
 The control CA is generated on first use. The output contains a private key — store it like one.
+
+---
+
+## keel credentials revoke-all
+
+Replace the control CA. Every keelconfig issued so far stops working; issue new ones with `keel credentials create`.
+
+```bash
+keel credentials revoke-all
+```
+
+In a cluster the new CA is committed through Raft (a follower forwards the request to the leader) and every node re-keys its remote control listener. On a single node the running listener switches at once. Needs a running keel.
 
 ---
 

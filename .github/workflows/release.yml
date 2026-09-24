@@ -59,7 +59,7 @@ jobs:
           PKG="keel-${VERSION}-${{ matrix.name }}"
           mkdir -p "dist/${PKG}"
           cp "target/${{ matrix.target }}/release/keel" "dist/${PKG}/"
-          cp README.md LICENSE CHANGELOG.md keel.yaml "dist/${PKG}/"
+          cp README.md LICENSE CHANGELOG.md keel.yaml node.yaml "dist/${PKG}/"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
 
       - name: Upload package

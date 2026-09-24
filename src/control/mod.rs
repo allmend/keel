@@ -330,7 +330,16 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         }
 
         ControlRequest::ConfigReload => {
-            write_line(&mut writer, &dispatch.reload()).await?;
+            // In a cluster, reloading means reconciling this node's config
+            // directory into the cluster: it becomes the next version.
+            let resp = match &cluster {
+                Some(ch) => match crate::config::read_config_dir(&ch.config_dir) {
+                    Ok(files) => cmd_config_push(&cluster, files).await,
+                    Err(e) => ControlResponse::err(format!("{e:#}")),
+                },
+                None => dispatch.reload(),
+            };
+            write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::ClusterStatus => {
@@ -348,8 +357,22 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             write_line(&mut writer, &resp).await?;
         }
 
-        ControlRequest::ConfigPush { yaml } => {
-            let resp = cmd_config_push(&cluster, yaml).await;
+        ControlRequest::ConfigPush { files } => {
+            let resp = cmd_config_push(&cluster, files).await;
+            write_line(&mut writer, &resp).await?;
+        }
+
+        ControlRequest::CredentialsRevokeAll => {
+            let revoked = match &cluster {
+                Some(ch) => ch.revoke_operator_credentials().await,
+                None => crate::control::remote::revoke_local(),
+            };
+            let resp = match revoked {
+                Ok(()) => ControlResponse::ok(serde_json::json!({
+                    "message": "control CA replaced; every earlier keelconfig is revoked — issue new ones with `keel credentials create`",
+                })),
+                Err(e) => ControlResponse::err(format!("{e:#}")),
+            };
             write_line(&mut writer, &resp).await?;
         }
     }
@@ -496,15 +519,15 @@ async fn cmd_cluster_stepdown(
     }
 }
 
-async fn cmd_config_push(cluster: &Option<crate::cluster::ClusterHandle>, yaml: String) -> String {
+async fn cmd_config_push(cluster: &Option<crate::cluster::ClusterHandle>, files: crate::config::FileSet) -> String {
     let Some(ch) = cluster else {
         return ControlResponse::err("not in cluster mode");
     };
-    let Some(raft) = ch.raft().await else {
-        return ControlResponse::err("cluster not yet initialized");
-    };
-    match crate::cluster::push_config(&raft, yaml).await {
-        Ok(()) => ControlResponse::ok(serde_json::json!({"message": "config committed to cluster"})),
-        Err(e) => ControlResponse::err(e.to_string()),
+    match ch.push_config(files).await {
+        Ok(version) => ControlResponse::ok(serde_json::json!({
+            "message": format!("config version {version} committed; every node applies it"),
+            "version": version,
+        })),
+        Err(e) => ControlResponse::err(format!("{e:#}")),
     }
 }

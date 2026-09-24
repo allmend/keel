@@ -6,8 +6,9 @@
 //! through a follower, which holds the replicated cluster CA.
 //!
 //! Each node reads its flags from `nodeN.args` (so a test can restart it with
-//! others) and keeps `/var/lib/keel` on a named volume (so a test can reach a
-//! stopped node's Raft store).
+//! others), keeps `/var/lib/keel` on a named volume (so a test can reach a
+//! stopped node's Raft store), and has its config directory bind-mounted from
+//! `nodeN-config/` (so a test can read what the node wrote, or edit it).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -58,9 +59,9 @@ services:
             r#"  {node}:
     image: {{image}}
     init: true
-    entrypoint: ["sh", "-c", "exec /usr/local/bin/keel --config /etc/keel/keel.yaml $$(cat /etc/keel/args)"]
+    entrypoint: ["sh", "-c", "exec /usr/local/bin/keel $$(cat /etc/keel/args)"]
     environment: [NO_COLOR=1]
-    volumes: ["./{node}.yaml:/etc/keel/keel.yaml:ro", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
+    volumes: ["./{node}.yaml:/etc/keel/node.yaml:ro", "./{node}-config:/etc/keel/config", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
     ports: ["80", "10789"]
     networks: {{ net: {{ ipv4_address: {ip} }} }}
 "#,
@@ -73,9 +74,9 @@ services:
         r#"  node4:
     image: {{image}}
     init: true
-    entrypoint: ["sh", "-c", "while [ ! -s {NODE_ID_FILE} ]; do sleep 0.2; done; exec /usr/local/bin/keel --config /etc/keel/keel.yaml {join}"]
+    entrypoint: ["sh", "-c", "while [ ! -s {NODE_ID_FILE} ]; do sleep 0.2; done; exec /usr/local/bin/keel {join}"]
     environment: [NO_COLOR=1]
-    volumes: ["./node4.yaml:/etc/keel/keel.yaml:ro"]
+    volumes: ["./node4.yaml:/etc/keel/node.yaml:ro", "./node4-config:/etc/keel/config"]
     networks: {{ net: {{ ipv4_address: 172.29.83.14 }} }}
 volumes:
   node1-state: {{}}
@@ -87,16 +88,14 @@ volumes:
     s
 }
 
-/// Binds the unspecified address and announces the node's own IP, so every
-/// test exercises the difference between `addr` and `advertise`.
-fn config(advertise_ip: &str, extra_vhosts: &str) -> String {
+/// The node file: binds the unspecified address and announces the node's own
+/// IP, so every test exercises the difference between `addr` and `advertise`.
+fn node_yaml(advertise_ip: &str) -> String {
     format!(
         r#"
 keel:
   user: nobody
   group: nogroup
-listeners:
-  - address: 0.0.0.0:80
 control:
   remote:
     address: 0.0.0.0:10789
@@ -104,6 +103,16 @@ cluster:
   addr: 0.0.0.0:7654
   advertise: {advertise_ip}:7654
   secret: {SECRET}
+"#
+    )
+}
+
+/// The replicated config's `keel.yaml`, with `extra_vhosts` before the catch-all.
+fn lb_config(extra_vhosts: &str) -> String {
+    format!(
+        r#"
+listeners:
+  - address: 0.0.0.0:80
 pools:
   web:
     backends:
@@ -113,6 +122,12 @@ vhosts:
     pool: web
 "#
     )
+}
+
+const MARKER_VHOST: &str = "  - host: pushed.test\n    default_action:\n      status: 418\n      body: pushed\n";
+
+fn file_set(entries: &[(&str, String)]) -> keel_control::FileSet {
+    entries.iter().map(|(p, t)| (p.to_string(), t.clone())).collect()
 }
 
 struct Cluster {
@@ -126,8 +141,10 @@ impl Cluster {
     /// Three nodes up, every one a voter, and operator credentials that work
     /// against any node.
     fn up(name: &str) -> Result<Cluster> {
-        let mut files: Vec<(&str, String)> = vec![("node4.yaml", config("172.29.83.14", ""))];
-        files.extend([("node1.yaml", "node1"), ("node2.yaml", "node2"), ("node3.yaml", "node3")].map(|(f, n)| (f, config(&ip(n), ""))));
+        let mut files: Vec<(&str, String)> =
+            vec![("node4.yaml", node_yaml("172.29.83.14")), ("node4-config/keel.yaml", lb_config(""))];
+        files.extend([("node1.yaml", "node1"), ("node2.yaml", "node2"), ("node3.yaml", "node3")].map(|(f, n)| (f, node_yaml(&ip(n)))));
+        files.extend(["node1-config/keel.yaml", "node2-config/keel.yaml", "node3-config/keel.yaml"].map(|f| (f, lb_config(""))));
         files.extend([("node1.args", "node1"), ("node2.args", "node2"), ("node3.args", "node3")].map(|(f, n)| (f, start_args(n))));
         let stack = Stack::up(name, &compose(), &files)?;
 
@@ -139,7 +156,7 @@ impl Cluster {
         })?;
         let out = stack.exec(
             "node1",
-            &["keel", "--config", "/etc/keel/keel.yaml", "credentials", "create", "e2e", "--endpoint", "127.0.0.1:1"],
+            &["keel", "credentials", "create", "e2e", "--endpoint", "127.0.0.1:1"],
         )?;
         anyhow::ensure!(out.status.success(), "credentials create: {}", String::from_utf8_lossy(&out.stderr));
         let control = Control::from_keelconfig(&String::from_utf8_lossy(&out.stdout))?;
@@ -230,8 +247,19 @@ impl Cluster {
     /// Push a config with a `pushed.test` vhost answering 418, through the leader.
     fn push_marker(&self) -> Result<()> {
         let leader = self.leader()?;
-        let vhost = "  - host: pushed.test\n    default_action:\n      status: 418\n      body: pushed\n";
-        self.request(&leader, &ControlRequest::ConfigPush { yaml: config(&ip(&leader), vhost) })?;
+        self.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
+        Ok(())
+    }
+
+    fn push(&self, node: &str, files: keel_control::FileSet) -> Result<Value> {
+        self.request(node, &ControlRequest::ConfigPush { files })
+    }
+
+    fn not_serving_marker(&self, node: &str) -> Result<()> {
+        let addr = self.stack.addr(node, 80)?;
+        wait_until(&format!("no pushed vhost on {node}"), Duration::from_secs(60), || {
+            Ok(http_get(addr, "pushed.test", "/").ok().filter(|(s, _)| *s == 200))
+        })?;
         Ok(())
     }
 
@@ -282,9 +310,7 @@ fn config_pushed_to_the_leader_reaches_every_node() -> Result<()> {
     let cluster = Cluster::up("cluster-push")?;
     let leader = cluster.leader()?;
 
-    let vhost = "  - host: pushed.test\n    default_action:\n      status: 418\n      body: pushed\n";
-    let yaml = config(&ip(&leader), vhost);
-    cluster.request(&leader, &ControlRequest::ConfigPush { yaml })?;
+    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
 
     for node in NODES {
         let addr = cluster.stack.addr(node, 80)?;
@@ -394,7 +420,7 @@ fn a_node_that_moves_to_a_new_address_keeps_its_id() -> Result<()> {
     let new_ip = "172.29.83.23";
 
     cluster.stack.stop("node3")?;
-    cluster.stack.write_file("node3.yaml", &config(new_ip, ""))?;
+    cluster.stack.write_file("node3.yaml", &node_yaml(new_ip))?;
     cluster.stack.set_ip("node3", new_ip)?;
     cluster.stack.start("node3")?;
 
@@ -542,6 +568,121 @@ fn forced_recovery_makes_the_survivor_the_only_member() -> Result<()> {
     assert_eq!(cluster.members("node1")?, vec![id], "the others are gone from the membership");
     cluster.serves_marker("node1")?;
     // Writes commit again.
-    cluster.request("node1", &ControlRequest::ConfigPush { yaml: config(&ip("node1"), "") })?;
+    cluster.push("node1", file_set(&[("keel.yaml", lb_config(""))]))?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_pushed_file_set_is_written_to_every_config_directory_and_replaces_it() -> Result<()> {
+    let cluster = Cluster::up("config-files")?;
+    let leader = cluster.leader()?;
+    let follower = NODES.iter().find(|n| **n != leader).expect("a follower").to_string();
+
+    // Pushed through a follower: forwarded to the leader.
+    let marker = format!("vhosts:\n{MARKER_VHOST}");
+    let reply = cluster.push(&follower, file_set(&[("keel.yaml", lb_config("")), ("vhosts/pushed.yaml", marker.clone())]))?;
+    assert!(reply["version"].as_u64().is_some(), "a version comes back: {reply}");
+    for node in NODES {
+        cluster.serves_marker(node)?;
+        wait_until(&format!("{node} wrote the pushed file"), Duration::from_secs(30), || {
+            Ok((cluster.stack.read_file(&format!("{node}-config/vhosts/pushed.yaml"))?.as_deref() == Some(marker.as_str())).then_some(()))
+        })?;
+    }
+
+    // A set without the file removes it everywhere.
+    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(""))]))?;
+    for node in NODES {
+        cluster.not_serving_marker(node)?;
+        wait_until(&format!("{node} deleted the file"), Duration::from_secs(30), || {
+            Ok(cluster.stack.read_file(&format!("{node}-config/vhosts/pushed.yaml"))?.is_none().then_some(()))
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn an_invalid_push_is_refused_and_changes_nothing() -> Result<()> {
+    let cluster = Cluster::up("config-invalid")?;
+    let leader = cluster.leader()?;
+    let broken = lb_config("  - host: broken.test\n    pool: nowhere\n");
+    let err = cluster.push(&leader, file_set(&[("keel.yaml", broken)])).expect_err("must be refused").to_string();
+    assert!(err.contains("config not pushed") && err.contains("nowhere"), "{err}");
+    for node in NODES {
+        assert_eq!(cluster.stack.read_file(&format!("{node}-config/keel.yaml"))?, Some(lb_config("")), "{node} files unchanged");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_push_without_quorum_fails_at_once() -> Result<()> {
+    let cluster = Cluster::up("config-no-quorum")?;
+    let leader = cluster.leader()?;
+    for node in NODES.iter().filter(|n| **n != leader) {
+        cluster.stack.stop(node)?;
+    }
+    let started = std::time::Instant::now();
+    let err = cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))])).expect_err("no quorum").to_string();
+    assert!(err.contains("no quorum: 1 of 3 members reachable"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10), "failed at once, not after a commit timeout");
+    let (status, _) = http_get(cluster.stack.addr(&leader, 80)?, "e2e.test", "/")?;
+    assert_eq!(status, 200, "traffic unaffected");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn sighup_pushes_the_node_config_directory() -> Result<()> {
+    let cluster = Cluster::up("config-sighup")?;
+    cluster.stack.write_file("node2-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.signal("node2", "HUP")?;
+    for node in NODES {
+        cluster.serves_marker(node)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn files_edited_while_a_node_was_stopped_become_the_next_version() -> Result<()> {
+    let cluster = Cluster::up("config-edited")?;
+    // Let node3 apply the seeded version first, so it has a version to compare against.
+    wait_until("node3 applied a version", Duration::from_secs(30), || {
+        Ok(cluster.stack.on_volume("node3-state", "cat /state/applied_config.json").ok())
+    })?;
+    cluster.stack.stop("node3")?;
+    cluster.stack.write_file("node3-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.start("node3")?;
+    for node in NODES {
+        cluster.serves_marker(node)?;
+    }
+    assert!(cluster.logged("node3", "config files changed while stopped")?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn revoke_all_locks_out_every_earlier_keelconfig() -> Result<()> {
+    let cluster = Cluster::up("revoke-all")?;
+    let leader = cluster.leader()?;
+    let follower = NODES.iter().find(|n| **n != leader).expect("a follower").to_string();
+    cluster.request(&follower, &ControlRequest::CredentialsRevokeAll)?;
+
+    for node in NODES {
+        wait_until(&format!("{node} refuses the old keelconfig"), Duration::from_secs(30), || {
+            Ok(cluster.request(node, &ControlRequest::Status).is_err().then_some(()))
+        })?;
+    }
+    // Credentials from the new CA work everywhere.
+    let out = cluster.stack.exec("node1", &["keel", "credentials", "create", "e2e2", "--endpoint", "127.0.0.1:1"])?;
+    let fresh = Control::from_keelconfig(&String::from_utf8_lossy(&out.stdout))?;
+    for node in NODES {
+        let addr = cluster.stack.addr(node, 10789)?;
+        wait_until(&format!("{node} accepts the new keelconfig"), Duration::from_secs(30), || {
+            Ok(fresh.request(addr, &ControlRequest::Status).ok())
+        })?;
+    }
     Ok(())
 }

@@ -33,6 +33,17 @@ pub enum RpcRequest {
     /// Ask the receiving node (must be the leader) to admit a joining node.
     /// Sent by the member that received the join; it issues the certificate.
     Join { node_id: NodeId, addr: String },
+    /// Ask the receiving node (must be the leader) to commit a config version.
+    /// Sent by the member an operator pushed to.
+    PushConfig { files: crate::config::FileSet },
+    /// Ask the receiving node (must be the leader) to replace the control CA.
+    RevokeOperatorCredentials,
+}
+
+/// The leader's answer to a forwarded config push: the committed version.
+#[derive(Serialize, Deserialize)]
+pub struct PushReply {
+    pub version: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,6 +150,30 @@ pub(crate) async fn send_join(
         .await
         .map_err(|e| anyhow::anyhow!("join request to leader at {leader_addr} failed: {e}"))?;
     Ok(reply.refused.map_or(Ok(()), Err))
+}
+
+/// Forward `keel credentials revoke-all` to the leader.
+pub(crate) async fn send_revoke(leader_addr: &str, tls: Arc<rustls::ClientConfig>) -> anyhow::Result<()> {
+    let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let _: StepDownReply = net
+        .call(&RpcRequest::RevokeOperatorCredentials)
+        .await
+        .map_err(|e| anyhow::anyhow!("revocation request to the leader at {leader_addr} failed: {e}"))?;
+    Ok(())
+}
+
+/// Forward a config push to the leader; returns the version it committed.
+pub(crate) async fn send_config(
+    leader_addr: &str,
+    tls: Arc<rustls::ClientConfig>,
+    files: crate::config::FileSet,
+) -> anyhow::Result<u64> {
+    let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let reply: PushReply = net
+        .call(&RpcRequest::PushConfig { files })
+        .await
+        .map_err(|e| anyhow::anyhow!("config push to the leader at {leader_addr} failed: {e}"))?;
+    Ok(reply.version)
 }
 
 impl RaftNetwork<TypeConfig> for ClusterNetwork {

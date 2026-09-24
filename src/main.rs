@@ -27,13 +27,9 @@ const DEFAULT_SOCKET: &str = "/var/run/keel/keel.sock";
 #[derive(Parser)]
 #[command(name = "keel", version, about = "Fast, modern load balancer and reverse proxy")]
 struct Cli {
-    /// Path to config file
-    #[arg(short, long, default_value = "keel.yaml")]
+    /// Path to the node file; it names the replicated config directory
+    #[arg(short, long, default_value = config::DEFAULT_NODE_PATH)]
     config: String,
-
-    /// Load additional config files matching this directory glob (conf.d style)
-    #[arg(long)]
-    conf_dir: Option<String>,
 
     /// Control socket path (for CLI commands)
     #[arg(long, default_value = DEFAULT_SOCKET)]
@@ -105,6 +101,9 @@ enum CredentialsCommand {
         #[arg(long)]
         endpoint: String,
     },
+    /// Replace the control CA: every keelconfig issued so far stops working,
+    /// on every node of a cluster
+    RevokeAll,
 }
 
 #[derive(Subcommand)]
@@ -146,9 +145,9 @@ enum BackendCommand {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Reload config from disk (same as SIGHUP)
+    /// Apply the node's config directory (same as SIGHUP); in a cluster, push it as the new version
     Reload,
-    /// Push a config file to the entire cluster via Raft
+    /// Push a config directory (or a single file, as its keel.yaml) as the cluster's new config version
     Push {
         file: String,
     },
@@ -195,7 +194,7 @@ fn detect_mode(cli: &Cli) -> Mode<'_> {
 }
 
 fn run_server(cli: Cli) -> Result<()> {
-    let cfg = config::load(&cli.config, cli.conf_dir.as_deref())
+    let cfg = config::load(&cli.config)
         .with_context(|| format!("failed to load config: {}", cli.config))?;
 
     if cli.cluster {
@@ -221,6 +220,11 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
     let state_dir = std::path::Path::new(&cfg.keel.state_dir);
     let node_id = cluster::identity::load_or_create_node_id(state_dir)?;
 
+    // Read before any committed version can be written over it: a restart
+    // compares these files with the version this node last applied.
+    let config_dir = std::path::Path::new(&cfg.keel.config_dir);
+    let startup_files = config::read_config_dir(config_dir)?;
+
     let secret = cli.secret.or_else(|| cluster_cfg.and_then(|c| c.secret.clone()));
 
     info!(node_id, cluster_addr, advertise, "starting keel in cluster mode");
@@ -231,6 +235,9 @@ fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
         advertise,
         state_dir: state_dir.to_path_buf(),
         force_new_cluster: cli.force_new_cluster,
+        node_yaml: cfg.node_yaml.clone(),
+        config_dir: config_dir.to_path_buf(),
+        startup_files,
         secret,
         bootstrap: cli.bootstrap,
         join: cli.join,
@@ -270,9 +277,8 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
         Command::Config { command } => match command {
             ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload),
             ConfigCommand::Push { file } => {
-                let yaml = std::fs::read_to_string(file)
-                    .with_context(|| format!("cannot read {file}"))?;
-                client::message(&mut stream, &ControlRequest::ConfigPush { yaml })
+                let files = keel_control::push_file_set(std::path::Path::new(file))?;
+                client::message(&mut stream, &ControlRequest::ConfigPush { files })
             }
         },
         Command::Cluster { command: ClusterCommand::Status } => client::cluster_status(&mut stream),
@@ -282,7 +288,10 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
         Command::Cluster { command: ClusterCommand::Stepdown { force } } => {
             client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force })
         }
-        Command::Credentials { .. } => unreachable!(),
+        Command::Credentials { command: CredentialsCommand::RevokeAll } => {
+            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll)
+        }
+        Command::Credentials { command: CredentialsCommand::Create { .. } } => unreachable!(),
     }
 }
 
@@ -301,12 +310,11 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
         anyhow::bail!("operator name must be non-empty and contain only [A-Za-z0-9.-_@]");
     }
 
-    // ca_dir from config when available; the default otherwise, so credentials
-    // can be created before keel.yaml gains a control block.
-    let ca_dir = config::load(&cli.config, cli.conf_dir.as_deref())
-        .ok()
-        .and_then(|c| c.control.and_then(|c| c.remote).map(|r| r.ca_dir))
-        .unwrap_or_else(config::default_control_ca_dir);
+    // The state directory from the node's config when it loads; the default
+    // otherwise, so credentials can be created before a config exists.
+    let ca_dir = config::load(&cli.config)
+        .map(|c| c.keel.control_ca_dir())
+        .unwrap_or_else(|_| config::KeelConfig::default().control_ca_dir());
 
     let ca = control::ca::ControlCa::load_or_generate(&ca_dir)?;
     let (client_cert, client_key) = ca.issue_client(name)?;

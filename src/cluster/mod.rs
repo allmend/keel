@@ -1,3 +1,4 @@
+pub mod applied;
 pub mod identity;
 pub mod network;
 pub mod persist;
@@ -23,7 +24,8 @@ use tracing::{error, info, warn};
 
 use crate::cluster::network::{ClusterNetworkFactory, RpcRequest, RpcResponse};
 use crate::cluster::store::{LogStore, StateMachine};
-use crate::cluster::types::{ClientRequest, NodeId, TypeConfig};
+use crate::cluster::types::{ClientRequest, ConfigVersion, NodeId, TypeConfig};
+use crate::config::FileSet;
 
 pub type ClusterRaft = Raft<TypeConfig>;
 
@@ -131,6 +133,13 @@ pub struct ClusterOpts {
     pub state_dir: std::path::PathBuf,
     /// Forced recovery: keep the stored state, make this node the only member.
     pub force_new_cluster: bool,
+    /// This node's `node.yaml`, which every config version is built against.
+    pub node_yaml: String,
+    /// The replicated config directory (`keel.config_dir`).
+    pub config_dir: std::path::PathBuf,
+    /// The config directory as it was when the process started, before any
+    /// committed version could be written over it.
+    pub startup_files: FileSet,
     pub secret: Option<String>,
     pub bootstrap: bool,
     pub join: Option<String>,
@@ -142,8 +151,12 @@ pub struct ClusterOpts {
 pub struct ClusterHandle {
     /// Becomes Some once ClusterService::start() completes Raft initialization.
     pub raft: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
-    /// Fires when a new config YAML is committed to the Raft log.
-    pub config_rx: watch::Receiver<Option<String>>,
+    /// The committed config version; fires on every new one.
+    pub config_rx: watch::Receiver<Option<ConfigVersion>>,
+    /// This node's `node.yaml`, which every config version is built against.
+    pub node_yaml: Arc<String>,
+    /// The replicated config directory (`keel.config_dir`).
+    pub config_dir: std::path::PathBuf,
     /// Current replicated ACME certificate map; updated on commit and snapshot.
     pub certs_rx: watch::Receiver<crate::cluster::types::CertMap>,
     /// Current replicated HTTP-01 challenge map; updated on commit and snapshot.
@@ -162,6 +175,31 @@ impl ClusterHandle {
 
     pub async fn client_tls(&self) -> Option<Arc<rustls::ClientConfig>> {
         self.client_tls.lock().await.clone()
+    }
+
+    /// Commit a new control CA through the leader: every node adopts it and
+    /// re-keys its remote control listener, revoking every operator credential.
+    pub async fn revoke_operator_credentials(&self) -> Result<()> {
+        let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
+            anyhow::bail!("cluster not yet initialized");
+        };
+        let m = raft.metrics().borrow().clone();
+        if m.current_leader == Some(m.id) {
+            return replace_control_ca(&raft).await;
+        }
+        let leader = m
+            .current_leader
+            .and_then(|l| m.membership_config.membership().nodes().find(|(id, _)| **id == l).map(|(_, n)| n.addr.clone()))
+            .context("no leader known; try again")?;
+        crate::cluster::network::send_revoke(&leader, tls).await
+    }
+
+    /// Commit `files` as the next config version; see [`push_config`].
+    pub async fn push_config(&self, files: FileSet) -> Result<u64> {
+        let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
+            anyhow::bail!("cluster not yet initialized");
+        };
+        push_config(&raft, tls, &self.node_yaml, files).await
     }
 }
 
@@ -399,12 +437,20 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
         RpcRequest::Vote(r) => r.vote.leader_id().voted_for(),
         RpcRequest::InstallSnapshot(r) => r.vote.leader_id().voted_for(),
         RpcRequest::StepDown { node_id } => Some(*node_id),
-        RpcRequest::Join { .. } => None,
+        RpcRequest::Join { .. } | RpcRequest::PushConfig { .. } | RpcRequest::RevokeOperatorCredentials => None,
     }
 }
 
+/// What a peer request needs besides the Raft node: this node's client TLS
+/// (to forward) and its `node.yaml` (to check a pushed config).
+#[derive(Clone)]
+struct PeerCtx {
+    tls: Arc<rustls::ClientConfig>,
+    node_yaml: Arc<String>,
+}
+
 /// Dispatches one mTLS peer connection to the Raft node.
-async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: Arc<ClusterRaft>) {
+async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: Arc<ClusterRaft>, ctx: PeerCtx) {
     // Any certificate from the cluster CA passes the handshake; the node ID it
     // names is what a request may claim to come from.
     let peer_id = crate::tls::peer_common_name(stream.get_ref().1).as_deref().and_then(node_id_from_cn);
@@ -455,6 +501,22 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             })
             .unwrap()
         }
+        Ok(RpcRequest::RevokeOperatorCredentials) => match replace_control_ca(&raft).await {
+            Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::StepDownReply { message: "revoked".into() }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
+        Ok(RpcRequest::PushConfig { files }) => match push_config(&raft, ctx.tls, &ctx.node_yaml, files).await {
+            Ok(version) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::PushReply { version }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
         Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(e) }).unwrap(),
     };
 
@@ -818,7 +880,7 @@ pub struct ClusterService {
     opts: ClusterOpts,
     raft_slot: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
     tls_slot: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
-    config_tx: Arc<watch::Sender<Option<String>>>,
+    config_tx: Arc<watch::Sender<Option<ConfigVersion>>>,
     certs_tx: Arc<watch::Sender<crate::cluster::types::CertMap>>,
     challenges_tx: Arc<watch::Sender<crate::cluster::types::ChallengeMap>>,
     control_ca_tx: Arc<watch::Sender<crate::cluster::types::ControlCaPair>>,
@@ -917,6 +979,15 @@ impl ClusterService {
             tokio::spawn(commit_cluster_ca(Arc::clone(&raft), ca.cert_pem.clone(), ca.key_pem.clone()));
         }
         tokio::spawn(keep_members_file(Arc::clone(&raft), opts.state_dir.clone()));
+        let node_yaml = Arc::new(opts.node_yaml.clone());
+        tokio::spawn(reconcile_config(
+            Arc::clone(&raft),
+            Arc::clone(&client_tls),
+            Arc::clone(&node_yaml),
+            opts.state_dir.clone(),
+            opts.startup_files.clone(),
+            self.config_tx.subscribe(),
+        ));
 
         // Publish the raft handle so ControlServer can use it.
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
@@ -944,6 +1015,7 @@ impl ClusterService {
                             let secret2 = secret.clone();
                             let ca_pems = cluster_ca_rx.borrow().clone();
                             let peer_tls = Arc::clone(&client_tls);
+                            let peer_ctx = PeerCtx { tls: Arc::clone(&client_tls), node_yaml: Arc::clone(&node_yaml) };
 
                             tokio::spawn(async move {
                                 // Everything before a peer is authenticated gets a
@@ -959,7 +1031,7 @@ impl ClusterService {
                                 match tokio::time::timeout_at(deadline, stream.peek(&mut peek)).await {
                                     Ok(Ok(1)) if peek[0] == 0x16 => {
                                         match tokio::time::timeout_at(deadline, acceptor2.accept(stream)).await {
-                                            Ok(Ok(tls)) => handle_peer(tls, raft2).await,
+                                            Ok(Ok(tls)) => handle_peer(tls, raft2, peer_ctx).await,
                                             Ok(Err(e)) => warn!(peer = %peer_addr, error = %e, "cluster: TLS accept error"),
                                             Err(_) => warn!(peer = %peer_addr, "cluster: TLS handshake timed out"),
                                         }
@@ -1009,6 +1081,8 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
         config_rx,
+        node_yaml: Arc::new(opts.node_yaml.clone()),
+        config_dir: opts.config_dir.clone(),
         certs_rx,
         challenges_rx,
         control_ca_rx,
@@ -1030,12 +1104,110 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
 
 // Cluster operations
 
-/// Submit a config YAML to the cluster via Raft. Returns when committed.
-pub async fn push_config(raft: &ClusterRaft, yaml: String) -> Result<()> {
-    raft.client_write(ClientRequest::SetConfig { yaml })
-        .await
-        .map_err(|e| anyhow::anyhow!("config push failed: {e:?}"))?;
-    Ok(())
+/// How long a config push may take to commit on the leader.
+const PUSH_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Commit `files` as the cluster's next config version and return it. The set
+/// is first built against this node's `node.yaml`, so a version that does not
+/// load is never committed. Without a reachable majority the push fails at
+/// once instead of waiting for a commit that cannot happen; traffic is not
+/// affected either way. A follower forwards the push to the leader, which
+/// checks it again against its own `node.yaml`.
+pub async fn push_config(
+    raft: &ClusterRaft,
+    tls: Arc<rustls::ClientConfig>,
+    node_yaml: &str,
+    files: FileSet,
+) -> Result<u64> {
+    crate::config::assemble(node_yaml, &files).context("config not pushed")?;
+
+    let m = raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership();
+    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    let others: Vec<(NodeId, String)> = membership
+        .nodes()
+        .filter(|(id, _)| voters.contains(id) && **id != m.id)
+        .map(|(id, n)| (*id, n.addr.clone()))
+        .collect();
+    let reachable = probe_reachable(&others).await + usize::from(voters.contains(&m.id));
+    if reachable < voters.len() / 2 + 1 {
+        anyhow::bail!("no quorum: {reachable} of {} members reachable; config not pushed", voters.len());
+    }
+
+    if m.current_leader == Some(m.id) {
+        let write = raft.client_write(ClientRequest::SetConfigFiles { files });
+        return match tokio::time::timeout(PUSH_COMMIT_TIMEOUT, write).await {
+            Ok(Ok(resp)) => Ok(resp.log_id.index),
+            Ok(Err(e)) => anyhow::bail!("config push failed: {e}"),
+            Err(_) => anyhow::bail!("config push did not commit within {}s", PUSH_COMMIT_TIMEOUT.as_secs()),
+        };
+    }
+    let leader = m
+        .current_leader
+        .and_then(|l| membership.nodes().find(|(id, _)| **id == l).map(|(_, n)| n.addr.clone()))
+        .context("no leader known; try again")?;
+    crate::cluster::network::send_config(&leader, tls, files).await
+}
+
+/// Whether this node's config files become a new version at startup. A node
+/// whose files differ from the version it last applied pushes them — they
+/// were edited while it was stopped, and the later push wins. A leader with
+/// nothing committed yet seeds version 1 from them. Otherwise nothing is
+/// pushed, and the committed version reaches the node through the log.
+async fn reconcile_config(
+    raft: Arc<ClusterRaft>,
+    tls: Arc<rustls::ClientConfig>,
+    node_yaml: Arc<String>,
+    state_dir: std::path::PathBuf,
+    files: FileSet,
+    config: watch::Receiver<Option<ConfigVersion>>,
+) {
+    let applied = match applied::read(&state_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(error = %format!("{e:#}"), "cluster: cannot read the last applied config version");
+            return;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let leader = loop {
+        let m = raft.metrics().borrow().clone();
+        if let Some(leader) = m.current_leader {
+            break leader == m.id;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    let push = match &applied {
+        Some(a) if a.hash != applied::hash(&files) => {
+            info!(last_applied = a.version, "cluster: config files changed while stopped; pushing them as a new version");
+            true
+        }
+        Some(_) => false,
+        None => leader && config.borrow().is_none(),
+    };
+    if !push {
+        return;
+    }
+    loop {
+        match push_config(&raft, Arc::clone(&tls), &node_yaml, files.clone()).await {
+            Ok(version) => {
+                info!(version, "cluster: config files committed as a new version");
+                return;
+            }
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                error!(error = %format!("{e:#}"), "cluster: config files not pushed");
+                return;
+            }
+            Err(e) if e.to_string().starts_with("config not pushed") => {
+                error!(error = %format!("{e:#}"), "cluster: config files not pushed");
+                return;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        }
+    }
 }
 
 /// Replicate an ACME certificate to the cluster via Raft. Returns when
@@ -1085,6 +1257,14 @@ async fn commit_cluster_ca(raft: Arc<ClusterRaft>, cert_pem: String, key_pem: St
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
         }
     }
+}
+
+/// Generate a new control CA and commit it. Run on the leader.
+async fn replace_control_ca(raft: &ClusterRaft) -> Result<()> {
+    let (cert_pem, key_pem) = crate::control::ca::ControlCa::generate()?;
+    push_control_ca(raft, cert_pem, key_pem).await?;
+    info!("cluster: control CA replaced; every earlier keelconfig is revoked");
+    Ok(())
 }
 
 /// Commit the control CA so every node serves and issues from the same one.
@@ -1311,6 +1491,9 @@ mod tests {
             advertise: "10.0.0.1:7654".into(),
             state_dir,
             force_new_cluster: false,
+            node_yaml: String::new(),
+            config_dir: std::path::PathBuf::new(),
+            startup_files: Default::default(),
             secret: Some("s".into()),
             bootstrap,
             join: join.map(str::to_owned),
