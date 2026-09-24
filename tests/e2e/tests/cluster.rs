@@ -636,7 +636,7 @@ fn a_push_without_quorum_fails_at_once() -> Result<()> {
 #[ignore = "needs Docker"]
 fn sighup_pushes_the_node_config_directory() -> Result<()> {
     let cluster = Cluster::up("config-sighup")?;
-    cluster.stack.write_file("node2-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.write_node_file("node2-config/keel.yaml", &lb_config(MARKER_VHOST))?;
     cluster.stack.signal("node2", "HUP")?;
     for node in NODES {
         cluster.serves_marker(node)?;
@@ -653,7 +653,7 @@ fn files_edited_while_a_node_was_stopped_become_the_next_version() -> Result<()>
         Ok(cluster.stack.on_volume("node3-state", "cat /state/applied_config.json").ok())
     })?;
     cluster.stack.stop("node3")?;
-    cluster.stack.write_file("node3-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.write_node_file("node3-config/keel.yaml", &lb_config(MARKER_VHOST))?;
     cluster.stack.start("node3")?;
     for node in NODES {
         cluster.serves_marker(node)?;

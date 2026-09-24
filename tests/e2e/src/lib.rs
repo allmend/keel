@@ -114,7 +114,7 @@ impl Stack {
         let project = format!("{PROJECT_PREFIX}{name}");
         // Inside the repo: Docker can bind-mount it wherever it can build it.
         let dir = repo_root().join("target/e2e").join(&project);
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_tree(&dir, &image);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         for (file, content) in files {
             let path = dir.join(file);
@@ -136,6 +136,27 @@ impl Stack {
     /// the node reads it on its next start.
     pub fn write_file(&self, file: &str, content: &str) -> Result<()> {
         std::fs::write(self.dir.join(file), content).with_context(|| format!("write {file}"))
+    }
+
+    /// Write a file below a directory a node owns (a bind-mounted config
+    /// directory the node handed to its own user), as root in a helper
+    /// container: the host user may not write there, and the node may be
+    /// stopped.
+    pub fn write_node_file(&self, file: &str, content: &str) -> Result<()> {
+        let image = image()?;
+        let path = std::path::Path::new(file);
+        let (dir, name) = (path.parent().context("file in a directory")?, path.file_name().context("file name")?);
+        let mount = format!("{}:/w", self.dir.join(dir).display());
+        let mut child = Command::new("docker")
+            .args(["run", "--rm", "-i", "-v", &mount, "--entrypoint", "sh", &image, "-c"])
+            .arg(format!("cat > /w/{}", name.to_string_lossy()))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("cannot run docker")?;
+        child.stdin.take().context("stdin")?.write_all(content.as_bytes())?;
+        let status = child.wait()?;
+        anyhow::ensure!(status.success(), "writing {file} in a helper container failed");
+        Ok(())
     }
 
     /// A file of the stack directory, as a bind-mounted node left it.
@@ -269,8 +290,24 @@ impl Drop for Stack {
             return;
         }
         let _ = self.compose(&["down", "--volumes", "--remove-orphans", "--timeout", "5"]);
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Ok(image) = image() {
+            remove_tree(&self.dir, &image);
+        }
     }
+}
+
+/// Remove a stack directory. Nodes hand their bind-mounted directories to
+/// their own user, so on Linux the host user cannot delete what they wrote:
+/// what is left is removed as root in a helper container.
+fn remove_tree(dir: &Path, image: &str) {
+    if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+        return;
+    }
+    let mount = format!("{}:/d", dir.display());
+    let _ = Command::new("docker")
+        .args(["run", "--rm", "-v", &mount, "--entrypoint", "sh", image, "-c", "rm -rf /d/* /d/.[!.]*"])
+        .output();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Bring down projects a previous run left behind (killed test process, no
