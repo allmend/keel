@@ -1248,7 +1248,7 @@ impl AcmeRef {
 /// Issuer name that `tls: { acme: true }` refers to.
 pub const DEFAULT_ISSUER: &str = "default";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AcmeConfig {
     /// Directory for certificates, keys, accounts, and challenge tokens.
     #[serde(default = "default_acme_storage")]
@@ -1277,7 +1277,7 @@ impl Default for AcmeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AcmeIssuer {
     /// Contact email for this issuer's ACME account (expiry warnings).
     pub email: Option<String>,

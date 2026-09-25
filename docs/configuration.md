@@ -417,13 +417,13 @@ What reloads without restart:
 - Virtual host rules: hosts, routes and the pools they reference, `forwarded_headers`, cache rules, `redirect_http`, `default_action`
 - TLS certificates: certificate files of vhosts and `certificates:` entries are re-read
 - Backends removed from a pool — they are moved to `draining`
+- ACME: hosts, issuers and `certificates:` entries. A new host is issued at once; a vhost switched from its own certificate to `tls.acme` serves the old one until the issued one arrives
 
 What requires a process restart:
 - Backends added to a pool — logged as a warning (`hot reload: new backend requires restart to take effect`) and otherwise ignored
 - Backend weights and pool algorithms — ignored without a log line
 - Pools added to or removed from the config. A new pool has no backends until restart, so a route to it fails with `no_backend`; the backends of a removed pool are not drained
 - `health_check` and `passive` settings — the running checks and rules keep their startup values
-- ACME: hosts, issuers and `certificates:` entries added on reload are not issued until restart
 - `cache` storage, `access_log`, `metrics` and `control`
 - Every setting in the node file
 - Listeners (`listeners[]`)

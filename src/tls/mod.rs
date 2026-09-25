@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 // Cert store
 
+#[derive(Clone)]
 struct CertPair {
     rustls: Arc<CertifiedKey>,
 }
@@ -56,7 +57,7 @@ impl CertStore {
     /// Load all vhost TLS certificates from the paths in `cfg`.
     /// Returns an error if any cert or key file cannot be read or parsed.
     pub fn build(cfg: &crate::config::Config) -> anyhow::Result<Self> {
-        Ok(CertStore::from_map(load_cert_map(cfg)?))
+        Ok(CertStore::from_map(load_cert_map(cfg)?.0))
     }
 
     fn from_map(map: CertMap) -> Self {
@@ -119,8 +120,17 @@ impl CertStore {
 
     /// Re-read all cert/key files from the new config and atomically swap them in.
     /// On failure, keeps the previous certificates and returns the error.
+    /// A host whose ACME certificate is not issued yet keeps the certificate
+    /// it had, so switching a vhost to ACME serves the old one until then.
     pub fn reload(&self, cfg: &crate::config::Config) -> anyhow::Result<()> {
-        let map = load_cert_map(cfg)?;
+        let (mut map, pending) = load_cert_map(cfg)?;
+        let current = self.inner.load();
+        for host in pending {
+            if let Some(pair) = current.get(&host) {
+                info!(host, "TLS: serving the previous certificate until the ACME certificate is issued");
+                map.insert(host, pair.clone());
+            }
+        }
         self.inner.store(Arc::new(map));
         Ok(())
     }
@@ -131,8 +141,11 @@ pub fn acme_cert_paths(storage: &str, host: &str) -> (String, String) {
     (format!("{storage}/{host}.crt"), format!("{storage}/{host}.key"))
 }
 
-fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
+/// The certificates `cfg` names, and the hosts whose ACME certificate is not
+/// issued yet.
+fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<(CertMap, Vec<String>)> {
     let mut map = HashMap::new();
+    let mut pending = Vec::new();
     let acme = cfg.acme_effective();
 
     for vhost in &cfg.vhosts {
@@ -144,7 +157,8 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
             // Before first issuance the files don't exist — start without a cert
             // for this host; AcmeService hot-swaps it in once issued.
             if !std::path::Path::new(&cert).exists() {
-                info!(vhost = vhost.host, "TLS: ACME certificate not yet issued; serving without it until issuance");
+                info!(vhost = vhost.host, "TLS: ACME certificate not yet issued");
+                pending.push(vhost.host.clone());
                 continue;
             }
             (cert, key)
@@ -172,7 +186,8 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
                 let Some(acme) = acme.as_ref() else { continue };
                 let (cert, key) = acme_cert_paths(&acme.storage, &c.host);
                 if !std::path::Path::new(&cert).exists() {
-                    info!(host = c.host, "TLS: ACME certificate not yet issued; TLS listeners for it wait until issuance");
+                    info!(host = c.host, "TLS: ACME certificate not yet issued");
+                    pending.push(c.host.clone());
                     continue;
                 }
                 (cert, key)
@@ -188,7 +203,7 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
         map.insert(c.host.clone(), pair);
     }
 
-    Ok(map)
+    Ok((map, pending))
 }
 
 /// Common Name of the client certificate a TLS peer presented, if any.
@@ -365,6 +380,43 @@ mod tests {
             map.insert(h.to_string(), pair);
         }
         (CertStore::from_map(map), leaves)
+    }
+
+    fn config(keel_yaml: &str, extra: &[(&str, &[u8])]) -> crate::config::Config {
+        let mut set: keel_control::FileSet = extra
+            .iter()
+            .map(|(p, b)| (p.to_string(), String::from_utf8(b.to_vec()).unwrap()))
+            .collect();
+        set.insert("keel.yaml".into(), keel_yaml.into());
+        crate::config::assemble("", &set).unwrap()
+    }
+
+    #[test]
+    fn a_vhost_switched_to_acme_keeps_its_certificate_until_one_is_issued() {
+        let storage = std::env::temp_dir().join(format!("keel-acme-switch-{}", std::process::id()));
+        let (c, k) = pem_pair("a.test");
+        let head = "pools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n";
+        let byo = format!("{head}    tls:\n      cert: a.crt\n      key: a.key\n");
+        let acme = format!("acme:\n  storage: {}\n{head}    tls:\n      acme: true\n", storage.display());
+
+        let store = CertStore::build(&config(&byo, &[("a.crt", &c), ("a.key", &k)])).unwrap();
+        let leaf = || store.rustls_resolver().resolve_name(Some("a.test")).map(|key| key.cert[0].to_vec());
+        let byo_leaf = leaf().expect("BYO certificate served");
+
+        store.reload(&config(&acme, &[])).unwrap();
+        assert_eq!(leaf(), Some(byo_leaf), "the BYO certificate serves until issuance");
+
+        let (c2, k2) = pem_pair("a.test");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("a.test.crt"), &c2).unwrap();
+        std::fs::write(storage.join("a.test.key"), &k2).unwrap();
+        store.reload(&config(&acme, &[])).unwrap();
+        let issued = rustls_pemfile::certs(&mut &c2[..]).next().unwrap().unwrap();
+        assert_eq!(leaf(), Some(issued.to_vec()), "the issued certificate replaces it");
+
+        store.reload(&config(head, &[])).unwrap();
+        assert_eq!(leaf(), None, "a vhost without TLS has no certificate");
+        let _ = std::fs::remove_dir_all(&storage);
     }
 
     #[test]

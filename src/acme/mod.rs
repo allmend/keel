@@ -8,10 +8,13 @@
 //! Managed hostnames come from two places:
 //!   - vhosts with `tls.acme` — issued certs are hot-swapped into the
 //!     `CertStore` so Keel terminates TLS with them;
-//!   - `acme.issuers.<name>.domains` — hostnames Keel does not terminate TLS
-//!     for (plain TCP / TLS-passthrough backends). Keel answers the HTTP-01
+//!   - `certificates:` entries — hostnames Keel does not terminate TLS for
+//!     (plain TCP / TLS-passthrough backends). Keel answers the HTTP-01
 //!     challenge and writes the cert/key files for the operator or backend to
-//!     consume, the way Lego's standalone HTTP-01 mode works.
+//!     consume.
+//!
+//! Both are read from the applied config on every check, so a reload or a
+//! pushed version changes them without a restart.
 //!
 //! Renewal: when less than `renew_before` of the certificate's lifetime
 //! remains — a percentage ("30%", scales from 90-day to 6-day certs) or an
@@ -85,29 +88,20 @@ struct ManagedCert {
     host: String,
     issuer: String,
     /// True when the cert is served by Keel's own TLS listeners (vhost);
-    /// false for standalone `domains` entries (cert files only).
+    /// false for `certificates:` entries (cert files only).
     vhost_managed: bool,
 }
 
-pub struct AcmeService {
-    cfg: Config,
+/// What the applied config asks of ACME: `None` when no host uses it.
+struct Plan {
     acme: AcmeConfig,
-    cert_store: Arc<CertStore>,
     managed: Vec<ManagedCert>,
-    /// Present in cluster mode: certs replicate via Raft, only the leader
-    /// talks to the CAs.
-    cluster: Option<crate::cluster::ClusterHandle>,
 }
 
-impl AcmeService {
-    /// Returns None when the config uses no ACME at all.
-    pub fn from_config(
-        cfg: &Config,
-        cert_store: Arc<CertStore>,
-        cluster: Option<crate::cluster::ClusterHandle>,
-    ) -> Option<Self> {
+impl Plan {
+    fn of(cfg: &Config) -> Option<Plan> {
         let acme = cfg.acme_effective()?;
-        let managed: Vec<ManagedCert> = cfg
+        let managed = cfg
             .acme_assignments()
             .into_iter()
             .map(|(host, issuer, vhost_managed)| ManagedCert {
@@ -116,10 +110,30 @@ impl AcmeService {
                 vhost_managed,
             })
             .collect();
-        if managed.is_empty() {
-            return None;
-        }
-        Some(Self { cfg: cfg.clone(), acme, cert_store, managed, cluster })
+        Some(Plan { acme, managed })
+    }
+}
+
+/// Issues and renews certificates for the config this node has applied: a
+/// reload or a pushed version that adds, removes or switches an ACME host
+/// takes effect at once, without a restart.
+pub struct AcmeService {
+    config: tokio::sync::watch::Receiver<Arc<Config>>,
+    cert_store: Arc<CertStore>,
+    /// Present in cluster mode: certs replicate via Raft, only the leader
+    /// talks to the CAs.
+    cluster: Option<crate::cluster::ClusterHandle>,
+}
+
+impl AcmeService {
+    /// `config` carries the applied config; the reload paths publish every
+    /// version they apply.
+    pub fn new(
+        config: tokio::sync::watch::Receiver<Arc<Config>>,
+        cert_store: Arc<CertStore>,
+        cluster: Option<crate::cluster::ClusterHandle>,
+    ) -> Self {
+        Self { config, cert_store, cluster }
     }
 }
 
@@ -130,28 +144,28 @@ impl pingora::services::background::BackgroundService for AcmeService {
         // standalone mode nothing else installs one (idempotent).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        if let Err(e) = prepare_storage(&self.acme.storage) {
-            error!(error = %format!("{e:#}"), "acme: cannot prepare storage directory; ACME disabled");
-            return;
-        }
-        for m in &self.managed {
-            info!(host = m.host, issuer = m.issuer, vhost = m.vhost_managed, "acme: managing certificate");
-        }
-
         // Cluster: mirror the replicated challenge map into the local
         // challenge directory, so THIS node answers HTTP-01 requests for
         // orders started by the leader. Every node runs this; the map is the
         // single source of truth for the directory in cluster mode.
         if let Some(cluster) = &self.cluster {
             let mut rx = cluster.challenges_rx.clone();
-            let dir = challenge_dir(&self.acme.storage);
+            let mut config = self.config.clone();
             let mut shutdown_c = shutdown.clone();
             tokio::spawn(async move {
                 loop {
                     let map = rx.borrow_and_update().clone();
-                    sync_challenge_dir(&dir, &map);
+                    let storage = config.borrow_and_update().acme_effective().map(|a| a.storage);
+                    if let Some(storage) = storage {
+                        if prepare_storage(&storage).is_ok() {
+                            sync_challenge_dir(&challenge_dir(&storage), &map);
+                        }
+                    }
                     tokio::select! {
                         changed = rx.changed() => {
+                            if changed.is_err() { break; }
+                        }
+                        changed = config.changed() => {
                             if changed.is_err() { break; }
                         }
                         _ = shutdown_c.changed() => {
@@ -162,48 +176,44 @@ impl pingora::services::background::BackgroundService for AcmeService {
             });
         }
 
-        let mut issuers = IssuerPool::new(&self.acme);
+        let mut config = self.config.clone();
+        let mut issuers: Option<IssuerPool> = None;
+        let mut managed: Vec<(String, String)> = Vec::new();
         let mut cert_mtimes: HashMap<String, SystemTime> = HashMap::new();
 
         loop {
-            // Cluster: adopt any replicated cert that is better (longer valid)
-            // than what this node has on disk — BEFORE the issuance check, so
-            // a node never re-issues something the cluster already holds.
-            self.pull_cluster_certs().await;
-            if let Some(cluster) = &self.cluster {
-                sync_account_files(&self.acme.storage, &cluster.acme_accounts_rx.borrow().clone());
-            }
-
-            // Only the leader talks to the CAs in cluster mode; standalone
-            // always may. The flock additionally serializes across workers.
-            if self.may_issue().await {
-                match try_issuer_lock(&self.acme.storage) {
-                    Ok(Some(_lock)) => {
-                        for m in &self.managed {
-                            if *shutdown.borrow() {
-                                break;
-                            }
-                            issuers.maybe_issue(&m.host, &m.issuer, self.cluster.as_ref()).await;
-                        }
-                        // _lock drops here, releasing the flock.
+            let cfg = config.borrow_and_update().clone();
+            match Plan::of(&cfg) {
+                None => {
+                    if !managed.is_empty() {
+                        info!("acme: no certificate managed any more");
+                        managed.clear();
                     }
-                    Ok(None) => {} // another worker is the issuer this cycle
-                    Err(e) => warn!(error = %format!("{e:#}"), "acme: issuer lock failed"),
                 }
+                Some(plan) => match prepare_storage(&plan.acme.storage) {
+                    Err(e) => error!(error = %format!("{e:#}"), "acme: cannot prepare storage directory; nothing issued"),
+                    Ok(()) => {
+                        let now: Vec<(String, String)> =
+                            plan.managed.iter().map(|m| (m.host.clone(), m.issuer.clone())).collect();
+                        for m in plan.managed.iter().filter(|m| !managed.contains(&(m.host.clone(), m.issuer.clone()))) {
+                            info!(host = m.host, issuer = m.issuer, vhost = m.vhost_managed, "acme: managing certificate");
+                        }
+                        managed = now;
+                        if issuers.as_ref().is_none_or(|p| p.acme != plan.acme) {
+                            issuers = Some(IssuerPool::new(&plan.acme));
+                        }
+                        let pool = issuers.as_mut().expect("set above");
+                        self.check(&cfg, &plan, pool, &mut cert_mtimes, &shutdown).await;
+                    }
+                },
             }
-
-            // Cluster leader: replicate any disk cert that is better than (or
-            // missing from) the Raft state — covers fresh issuance and certs
-            // that survived a full-cluster restart on disk only.
-            self.push_cluster_certs().await;
-
-            // Every worker: hot-swap certs that changed on disk (issued here,
-            // by another worker, or adopted from the cluster).
-            self.reload_changed_certs(&mut cert_mtimes);
 
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { break; }
+                }
+                changed = config.changed() => {
+                    if changed.is_err() { break; }
                 }
                 _ = tokio::time::sleep(CHECK_INTERVAL) => {}
             }
@@ -212,6 +222,52 @@ impl pingora::services::background::BackgroundService for AcmeService {
 }
 
 impl AcmeService {
+    /// One round: adopt, issue what is due, replicate, hot-swap.
+    async fn check(
+        &self,
+        cfg: &Config,
+        plan: &Plan,
+        issuers: &mut IssuerPool,
+        cert_mtimes: &mut HashMap<String, SystemTime>,
+        shutdown: &pingora::server::ShutdownWatch,
+    ) {
+        let storage = &plan.acme.storage;
+        // Cluster: adopt any replicated cert that is better (longer valid)
+        // than what this node has on disk — BEFORE the issuance check, so
+        // a node never re-issues something the cluster already holds.
+        self.pull_cluster_certs(plan).await;
+        if let Some(cluster) = &self.cluster {
+            sync_account_files(storage, &cluster.acme_accounts_rx.borrow().clone());
+        }
+
+        // Only the leader talks to the CAs in cluster mode; standalone
+        // always may. The flock additionally serializes across workers.
+        if self.may_issue().await {
+            match try_issuer_lock(storage) {
+                Ok(Some(_lock)) => {
+                    for m in &plan.managed {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                        issuers.maybe_issue(&m.host, &m.issuer, self.cluster.as_ref()).await;
+                    }
+                    // _lock drops here, releasing the flock.
+                }
+                Ok(None) => {} // another worker is the issuer this cycle
+                Err(e) => warn!(error = %format!("{e:#}"), "acme: issuer lock failed"),
+            }
+        }
+
+        // Cluster leader: replicate any disk cert that is better than (or
+        // missing from) the Raft state — covers fresh issuance and certs
+        // that survived a full-cluster restart on disk only.
+        self.push_cluster_certs(plan).await;
+
+        // Every worker: hot-swap certs that changed on disk (issued here,
+        // by another worker, or adopted from the cluster).
+        self.reload_changed_certs(cfg, plan, cert_mtimes);
+    }
+
     /// In cluster mode: true only on the current Raft leader.
     async fn may_issue(&self) -> bool {
         let Some(cluster) = &self.cluster else { return true };
@@ -223,22 +279,22 @@ impl AcmeService {
     /// Adopt replicated certs that are strictly better than the local disk
     /// copy. "Better" = valid with more remaining lifetime; the loser is
     /// overwritten so disk and Raft converge on one source of truth.
-    async fn pull_cluster_certs(&self) {
+    async fn pull_cluster_certs(&self, plan: &Plan) {
         let Some(cluster) = &self.cluster else { return };
         let replicated = cluster.certs_rx.borrow().clone();
-        for m in &self.managed {
+        for m in &plan.managed {
             let Some((cert_pem, key_pem)) = replicated.get(&m.host) else { continue };
             let raft_remaining = match pem_remaining_secs(cert_pem) {
                 Some(r) if r > 0 => r,
                 _ => continue, // expired or unparsable — never adopt
             };
-            let (cert_path, _) = acme_cert_paths(&self.acme.storage, &m.host);
+            let (cert_path, _) = acme_cert_paths(&plan.acme.storage, &m.host);
             let disk_remaining = std::fs::read(&cert_path)
                 .ok()
                 .and_then(|pem| pem_remaining_secs(std::str::from_utf8(&pem).unwrap_or("")))
                 .unwrap_or(0);
             if raft_remaining > disk_remaining {
-                match write_cert_pair(&self.acme.storage, &m.host, cert_pem, key_pem) {
+                match write_cert_pair(&plan.acme.storage, &m.host, cert_pem, key_pem) {
                     Ok(()) => info!(host = m.host, "acme: adopted replicated certificate from cluster"),
                     Err(e) => error!(host = m.host, error = %format!("{e:#}"), "acme: failed to write replicated certificate"),
                 }
@@ -248,7 +304,7 @@ impl AcmeService {
 
     /// Leader only: replicate disk certs that beat (or are missing from) the
     /// Raft state, so followers and future joiners receive them.
-    async fn push_cluster_certs(&self) {
+    async fn push_cluster_certs(&self, plan: &Plan) {
         let Some(cluster) = &self.cluster else { return };
         let Some(raft) = cluster.raft().await else { return };
         {
@@ -258,8 +314,8 @@ impl AcmeService {
             }
         }
         let replicated = cluster.certs_rx.borrow().clone();
-        for m in &self.managed {
-            let (cert_path, key_path) = acme_cert_paths(&self.acme.storage, &m.host);
+        for m in &plan.managed {
+            let (cert_path, key_path) = acme_cert_paths(&plan.acme.storage, &m.host);
             let Ok(cert_pem) = std::fs::read_to_string(&cert_path) else { continue };
             let Ok(key_pem) = std::fs::read_to_string(&key_path) else { continue };
             let disk_remaining = match pem_remaining_secs(&cert_pem) {
@@ -279,11 +335,12 @@ impl AcmeService {
         }
     }
 
-    /// Reload the CertStore when any vhost-managed cert file changed on disk.
-    fn reload_changed_certs(&self, seen: &mut HashMap<String, SystemTime>) {
+    /// Reload the CertStore from the applied config when any vhost-managed
+    /// cert file changed on disk.
+    fn reload_changed_certs(&self, cfg: &Config, plan: &Plan, seen: &mut HashMap<String, SystemTime>) {
         let mut changed = false;
-        for m in self.managed.iter().filter(|m| m.vhost_managed) {
-            let (cert_path, _) = acme_cert_paths(&self.acme.storage, &m.host);
+        for m in plan.managed.iter().filter(|m| m.vhost_managed) {
+            let (cert_path, _) = acme_cert_paths(&plan.acme.storage, &m.host);
             let Ok(meta) = std::fs::metadata(&cert_path) else { continue };
             let Ok(mtime) = meta.modified() else { continue };
             if seen.insert(m.host.clone(), mtime) != Some(mtime) {
@@ -291,7 +348,7 @@ impl AcmeService {
             }
         }
         if changed {
-            match self.cert_store.reload(&self.cfg) {
+            match self.cert_store.reload(cfg) {
                 Ok(()) => info!("acme: certificates hot-swapped into TLS store"),
                 Err(e) => error!(error = %format!("{e:#}"), "acme: cert store reload failed"),
             }
@@ -363,6 +420,8 @@ fn try_issuer_lock(storage: &str) -> Result<Option<nix::fcntl::Flock<std::fs::Fi
 // Issuer pool — the part that talks to the CAs
 
 struct IssuerPool {
+    /// The `acme:` section this pool was built from.
+    acme: AcmeConfig,
     storage: String,
     global_renew: RenewBefore,
     issuers: HashMap<String, AcmeIssuer>,
@@ -379,6 +438,7 @@ impl IssuerPool {
         let global_renew =
             RenewBefore::parse(&acme.renew_before).unwrap_or(RenewBefore::Percent(30));
         Self {
+            acme: acme.clone(),
             storage: acme.storage.clone(),
             global_renew,
             issuers: acme.issuers.clone(),

@@ -17,6 +17,8 @@ pub struct RoutingTable {
     redirect_http: HashSet<String>,
     /// host → direct response without a pool (redirect or static status)
     default_actions: HashMap<String, DefaultAction>,
+    /// Where HTTP-01 tokens are served from; `None` when the config uses no ACME.
+    acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
 struct Route {
@@ -76,7 +78,12 @@ impl RoutingTable {
             }
         }
 
-        RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions }
+        let acme_challenge_dir = cfg.acme_effective().map(|a| crate::acme::challenge_dir(&a.storage));
+        RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions, acme_challenge_dir }
+    }
+
+    pub fn acme_challenge_dir(&self) -> Option<&std::path::Path> {
+        self.acme_challenge_dir.as_deref()
     }
 
     /// Returns the default action for the given host: exact match first, then

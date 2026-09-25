@@ -188,8 +188,8 @@ config version 42 committed; every node applies it
 
 Versions apply like a local [hot reload](configuration.md#hot-reload):
 
-- Applied: vhost rules, TLS certificates, removed backends (they drain).
-- Restart needed: added backends, weights, algorithms, `health_check`, `passive`, listeners, and the `cache`, `access_log` and `acme` sections.
+- Applied: vhost rules, TLS certificates, the `acme` section, removed backends (they drain).
+- Restart needed: added backends, weights, algorithms, `health_check`, `passive`, listeners, and the `cache` and `access_log` sections.
 
 ---
 

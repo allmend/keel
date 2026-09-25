@@ -66,8 +66,6 @@ pub struct KProxy {
     pools: Arc<PoolRegistry>,
     access_logger: Arc<AccessLogger>,
     cache: Option<CacheHandle>,
-    /// HTTP-01 challenge token directory — Some when any host is ACME-managed.
-    acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
 /// The name the client asked for: the `Host` header, or HTTP/2's `:authority`
@@ -311,7 +309,8 @@ impl ProxyHttp for KProxy {
         // directory; unknown tokens fall through to normal routing so backends
         // managing their own certificates keep working.
         if !is_tls {
-            if let Some(dir) = &self.acme_challenge_dir {
+            let dir = self.routing.load().acme_challenge_dir().map(std::path::Path::to_path_buf);
+            if let Some(dir) = dir {
                 let path = session.req_header().uri.path();
                 if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
                     if crate::acme::valid_token(token) {
@@ -749,6 +748,8 @@ struct ReloadService {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
+    /// The applied config, for services that follow it (ACME).
+    applied: tokio::sync::watch::Sender<Arc<Config>>,
     config_path: String,
 }
 
@@ -776,6 +777,7 @@ impl pingora::services::background::BackgroundService for ReloadService {
                             if let Err(e) = self.cert_store.reload(&new_cfg) {
                                 error!(error = %e, "TLS cert reload failed, keeping previous certs");
                             }
+                            self.applied.send_replace(Arc::new(new_cfg));
                             info!(path = self.config_path, "config reloaded");
                         }
                         Err(e) => {
@@ -1090,26 +1092,21 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     };
 
     // Register the hot-reload background service.
+    let (applied_tx, applied_rx) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
     server.add_service(background_service(
         "reload",
         ReloadService {
             routing: Arc::clone(&routing),
             pools: Arc::clone(&pools),
             cert_store: Arc::clone(&cert_store),
+            applied: applied_tx,
             config_path: cfg.path.clone(),
         },
     ));
-
-    // ACME: register the issuance/renewal service and enable the HTTP-01
-    // responder when any host is ACME-managed.
-    let acme_challenge_dir = cfg
-        .acme_effective()
-        .map(|a| crate::acme::challenge_dir(&a.storage));
-    if let Some(acme_svc) =
-        crate::acme::AcmeService::from_config(cfg, Arc::clone(&cert_store), None)
-    {
-        server.add_service(background_service("acme", acme_svc));
-    }
+    server.add_service(background_service(
+        "acme",
+        crate::acme::AcmeService::new(applied_rx, Arc::clone(&cert_store), None),
+    ));
 
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
@@ -1119,7 +1116,6 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         pools: Arc::clone(&pools),
         access_logger,
         cache,
-        acme_challenge_dir,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     add_proxy_protocol_tls_services(&mut server, cfg, proxy.clone(), &cert_store);
@@ -1399,6 +1395,8 @@ struct ClusterReloadWatcher {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
+    /// The applied config, for services that follow it (ACME).
+    applied: tokio::sync::watch::Sender<Arc<Config>>,
     config_rx: tokio::sync::watch::Receiver<Option<crate::cluster::types::ConfigVersion>>,
     node_yaml: String,
     config_dir: std::path::PathBuf,
@@ -1419,6 +1417,7 @@ impl ClusterReloadWatcher {
                 if let Err(e) = self.cert_store.reload(&cfg) {
                     error!(error = %e, "cluster: TLS cert reload failed");
                 }
+                self.applied.send_replace(Arc::new(cfg));
                 let written = applied::write_config_dir(&self.config_dir, &next.files)
                     .and_then(|()| applied::save(&self.state_dir, next.version, &next.files));
                 match written {
@@ -1544,12 +1543,14 @@ pub fn run_cluster(
     };
 
     server.add_service(background_service("cluster", cluster_svc));
+    let (applied_tx, applied_rx) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
     server.add_service(background_service(
         "cluster-reload",
         ClusterReloadWatcher {
             routing: Arc::clone(&routing),
             pools: Arc::clone(&pools),
             cert_store: Arc::clone(&cert_store),
+            applied: applied_tx,
             config_rx: cluster.config_rx.clone(),
             node_yaml: cfg.node_yaml.clone(),
             config_dir: std::path::PathBuf::from(&cfg.keel.config_dir),
@@ -1558,16 +1559,10 @@ pub fn run_cluster(
     ));
     server.add_service(background_service("reload", ClusterReconcileOnSighup { cluster: cluster.clone() }));
 
-    let acme_challenge_dir = cfg
-        .acme_effective()
-        .map(|a| crate::acme::challenge_dir(&a.storage));
-    if let Some(acme_svc) = crate::acme::AcmeService::from_config(
-        cfg,
-        Arc::clone(&cert_store),
-        Some(cluster.clone()),
-    ) {
-        server.add_service(background_service("acme", acme_svc));
-    }
+    server.add_service(background_service(
+        "acme",
+        crate::acme::AcmeService::new(applied_rx, Arc::clone(&cert_store), Some(cluster.clone())),
+    ));
 
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
@@ -1577,7 +1572,6 @@ pub fn run_cluster(
         pools: Arc::clone(&pools),
         access_logger,
         cache,
-        acme_challenge_dir,
     };
     add_proxy_protocol_services(&mut server, cfg, proxy.clone());
     add_proxy_protocol_tls_services(&mut server, cfg, proxy.clone(), &cert_store);

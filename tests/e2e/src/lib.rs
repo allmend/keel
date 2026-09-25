@@ -78,6 +78,41 @@ pub fn file_from_image(image: &str, path: &str) -> Result<String> {
     text
 }
 
+// ACME
+
+/// Test ACME CA image.
+pub const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest";
+
+/// A compose service running Pebble at `ip`, answering as `pebble`: it
+/// validates every challenge without contacting anyone.
+pub fn pebble_service(ip: &str) -> String {
+    format!(
+        r#"  pebble:
+    image: {PEBBLE}
+    environment: [PEBBLE_VA_ALWAYS_VALID=1, PEBBLE_VA_NOSLEEP=1, PEBBLE_WFE_NONCEREJECT=0]
+    networks: {{ net: {{ ipv4_address: {ip} }} }}
+"#
+    )
+}
+
+/// The trust root of Pebble's API certificate.
+pub fn pebble_root() -> Result<String> {
+    file_from_image(PEBBLE, "/test/certs/pebble.minica.pem")
+}
+
+/// An `acme:` section with the issuer `test` on Pebble, its root at
+/// `certs/pebble.minica.pem` in the config directory. Pebble certificates last
+/// years; a renew_before larger than that renews on every check, so a test
+/// sees a renewal within a minute.
+pub const PEBBLE_ACME: &str = r#"
+acme:
+  renew_before: 99999d
+  issuers:
+    test:
+      directory: https://pebble:14000/dir
+      root_ca: certs/pebble.minica.pem
+"#;
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("repo root exists")
 }

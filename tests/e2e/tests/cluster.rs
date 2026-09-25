@@ -16,12 +16,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use keel_control::ControlRequest;
-use keel_e2e::{http_get, served_certificate, wait_until, Control, Runtime, Stack};
+use keel_e2e::{
+    http_get, pebble_root, pebble_service, served_certificate, wait_until, Control, Runtime, Stack, PEBBLE_ACME,
+};
 use serde_json::Value;
 
 const NODES: [&str; 3] = ["node1", "node2", "node3"];
 const SECRET: &str = "e2e-cluster-secret";
 const NODE_ID_FILE: &str = "/var/lib/keel/node_id";
+const PEBBLE_IP: &str = "172.29.83.30";
 
 fn ip(node: &str) -> String {
     format!("172.29.83.1{}", &node[4..])
@@ -742,39 +745,17 @@ fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -
     Ok(())
 }
 
-const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest";
-
-/// A test ACME CA that validates every challenge without contacting anyone.
-fn pebble_service() -> String {
-    format!(
-        r#"  pebble:
-    image: {PEBBLE}
-    environment: [PEBBLE_VA_ALWAYS_VALID=1, PEBBLE_VA_NOSLEEP=1, PEBBLE_WFE_NONCEREJECT=0]
-    networks: {{ net: {{ ipv4_address: 172.29.83.30 }} }}
-"#
-    )
-}
-
 #[test]
 #[ignore = "needs Docker"]
 fn every_leader_uses_the_one_acme_account_the_cluster_holds() -> Result<()> {
-    // Pebble certificates last years; renew_before larger than that makes
-    // the leader renew on every check, so a new leader needs the account
-    // without anyone restarting it.
-    let acme = r#"
-acme:
-  renew_before: 99999d
-  issuers:
-    test:
-      directory: https://pebble:14000/dir
-      root_ca: certs/pebble.minica.pem
-"#;
+    // The leader renews on every check (PEBBLE_ACME), so a new leader needs
+    // the account without anyone restarting it.
     let vhost = "  - host: acme.test\n    pool: web\n    tls: { acme: test }\n";
     let config = [
-        ("keel.yaml", format!("{}{acme}", lb_config(vhost))),
-        ("certs/pebble.minica.pem", keel_e2e::file_from_image(PEBBLE, "/test/certs/pebble.minica.pem")?),
+        ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(vhost))),
+        ("certs/pebble.minica.pem", pebble_root()?),
     ];
-    let cluster = Cluster::up_with("acme-account", &pebble_service(), &config)?;
+    let cluster = Cluster::up_with("acme-account", &pebble_service(PEBBLE_IP), &config)?;
     let first = cluster.leader()?;
     wait_until(&format!("{first} commits the account"), Duration::from_secs(120), || {
         Ok(cluster.logged(&first, "acme: account committed to the cluster")?.then_some(()))
@@ -813,6 +794,71 @@ acme:
     assert_eq!(registered, 1, "one account registered in the cluster's lifetime");
     for node in NODES {
         assert_eq!(account(node)?.as_ref(), Some(&committed), "{node} keeps the cluster's account");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn acme_follows_pushed_config_and_a_vhost_switches_to_acme_live() -> Result<()> {
+    let tls_vhost = |host: &str, tls: &str| format!("  - host: {host}\n    pool: web\n    tls: {tls}\n");
+    let byo = |host: &str| tls_vhost(host, &format!("{{ cert: certs/{host}.crt, key: certs/{host}.key }}"));
+    let acme = |host: &str| tls_vhost(host, "{ acme: test }");
+    let cert = |host: &str| -> Result<(String, String, Vec<u8>)> {
+        let key = rcgen::KeyPair::generate()?;
+        let cert = rcgen::CertificateParams::new(vec![host.to_owned()])?.self_signed(&key)?;
+        Ok((cert.pem(), key.serialize_pem(), cert.der().to_vec()))
+    };
+    let (gone_crt, gone_key, _) = cert("gone.test")?;
+    let (byo_crt, byo_key, byo_leaf) = cert("byo.test")?;
+    let root = pebble_root()?;
+
+    // No ACME host at startup.
+    let cluster = Cluster::up_with(
+        "acme-live",
+        &pebble_service(PEBBLE_IP),
+        &[
+            ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(&byo("gone.test")))),
+            ("certs/gone.test.crt", gone_crt),
+            ("certs/gone.test.key", gone_key),
+            ("certs/pebble.minica.pem", root.clone()),
+        ],
+    )?;
+    let https = |node: &str| cluster.stack.addr(node, 443);
+
+    // Push: gone.test leaves, byo.test and the ACME host acme.test arrive.
+    let set = |vhosts: String| {
+        file_set(&[
+            ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(&vhosts))),
+            ("certs/byo.test.crt", byo_crt.clone()),
+            ("certs/byo.test.key", byo_key.clone()),
+            ("certs/pebble.minica.pem", root.clone()),
+        ])
+    };
+    cluster.push(&cluster.leader()?, set(format!("{}{}", byo("byo.test"), acme("acme.test"))))?;
+    let leader = cluster.leader()?;
+    let first = wait_until("acme.test issued without a restart", Duration::from_secs(120), || {
+        Ok(served_certificate(https(&leader)?, "acme.test").ok())
+    })?;
+    wait_until("acme.test renewed", Duration::from_secs(150), || {
+        Ok(served_certificate(https(&leader)?, "acme.test").ok().filter(|leaf| *leaf != first))
+    })?;
+    for node in NODES {
+        let addr = https(node)?;
+        wait_until(&format!("{node} serves acme.test"), Duration::from_secs(90), || {
+            Ok(served_certificate(addr, "acme.test").ok())
+        })?;
+        assert_eq!(served_certificate(addr, "byo.test").ok(), Some(byo_leaf.clone()), "{node}: byo.test survives renewals");
+        assert!(served_certificate(addr, "gone.test").is_err(), "{node}: gone.test does not come back");
+    }
+
+    // Push: byo.test switches to ACME and gets an issued certificate.
+    cluster.push(&leader, set(format!("{}{}", acme("byo.test"), acme("acme.test"))))?;
+    for node in NODES {
+        let addr = https(node)?;
+        wait_until(&format!("{node} serves an issued byo.test"), Duration::from_secs(120), || {
+            Ok(served_certificate(addr, "byo.test").ok().filter(|leaf| *leaf != byo_leaf))
+        })?;
     }
     Ok(())
 }

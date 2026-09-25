@@ -161,9 +161,11 @@ Certificate files are flat (`{host}.crt` / `{host}.key`) regardless of issuer, b
 
 ---
 
-## Restarts and persistence
+## Reloads, restarts and persistence
 
-Certificates persist on disk and are not re-issued on restart, reload, or reboot. The set of ACME-managed hostnames is read at startup: a vhost with `tls.acme` or a `certificates:` entry added by a reload is issued after the next restart. On startup Keel loads whatever is in `storage`; the CA is contacted only when a certificate is missing, expired, unparsable, or inside its renewal window. A node that restarts while the CA is unreachable keeps serving its existing certificates.
+A reload, or a pushed version in a cluster, applies ACME changes at once. A new `tls.acme` vhost or `certificates:` entry is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
+
+Certificates persist on disk and are not re-issued on restart, reload, or reboot. On startup Keel loads whatever is in `storage`; the CA is contacted only when a certificate is missing, expired, unparsable, or inside its renewal window. A node that restarts while the CA is unreachable keeps serving its existing certificates.
 
 ---
 

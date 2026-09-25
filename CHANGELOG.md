@@ -8,6 +8,19 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **ACME follows a reload.** Hosts, issuers and `certificates:` entries added
+  by a reload or a pushed version are issued at once, without a restart. A
+  vhost switched from its own certificate to `tls.acme` serves the old one
+  until the issued one arrives.
+
+### Fixed
+
+- An ACME issuance or renewal rebuilt the TLS certificates from the config
+  the node started with: certificates added by a later reload disappeared and
+  vhosts it removed came back, until the next reload.
+
 ---
 
 ## [0.22.0] — 2026-09-25
