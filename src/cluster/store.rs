@@ -12,7 +12,7 @@ use openraft::{
 
 use crate::cluster::persist::{Disk, Loaded, StoredSnapshot};
 use crate::cluster::types::{
-    CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, NodeId, TypeConfig, ControlCaPair};
+    AcmeAccountMap, CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, NodeId, TypeConfig, ControlCaPair};
 
 fn disk_err(e: anyhow::Error) -> openraft::StorageError<NodeId> {
     openraft::StorageIOError::write(openraft::AnyError::error(format!("{e:#}"))).into()
@@ -178,6 +178,7 @@ struct StateMachineData {
     challenges_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ChallengeMap>>>,
     control_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>>,
     cluster_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>>,
+    acme_accounts_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<AcmeAccountMap>>>,
     disk: Option<Arc<Disk>>,
 }
 
@@ -206,6 +207,9 @@ impl StateMachineData {
         }
         if let Some(tx) = &self.cluster_ca_tx {
             let _ = tx.send(self.state.cluster_ca.clone());
+        }
+        if let Some(tx) = &self.acme_accounts_tx {
+            let _ = tx.send(self.state.acme_accounts.clone());
         }
         if let (Some(tx), Some(config)) = (&self.config_tx, &self.state.config) {
             let _ = tx.send(Some(config.clone()));
@@ -245,6 +249,10 @@ impl StateMachine {
 
     pub fn set_cluster_ca_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>) {
         self.0.write().unwrap().cluster_ca_tx = Some(tx);
+    }
+
+    pub fn set_acme_accounts_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<AcmeAccountMap>>) {
+        self.0.write().unwrap().acme_accounts_tx = Some(tx);
     }
 
     /// Persist snapshots to `disk` from here on, and start from the stored
@@ -369,6 +377,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             d.state.cluster_ca = Some((cert_pem, key_pem));
                             if let Some(tx) = &d.cluster_ca_tx {
                                 let _ = tx.send(d.state.cluster_ca.clone());
+                            }
+                            ClientResponse::ok()
+                        }
+                        ClientRequest::SetAcmeAccount { issuer, account } => {
+                            d.state.acme_accounts.insert(issuer, account);
+                            if let Some(tx) = &d.acme_accounts_tx {
+                                let _ = tx.send(d.state.acme_accounts.clone());
                             }
                             ClientResponse::ok()
                         }

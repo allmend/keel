@@ -8,6 +8,20 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **One ACME account per issuer for the whole cluster.** The account is
+  committed to the Raft log when first registered; every node writes it to
+  `acme.storage/<issuer>/account.json`, and a new leader uses it instead of
+  registering another. See [Cluster mode](docs/acme.md#cluster-mode).
+- A relative `acme.issuers.<name>.root_ca` is a file of the config directory
+  and travels with a push, like other certificate paths.
+
+### Changed
+
+- **BREAKING:** a relative `root_ca` resolves against the config directory,
+  no longer against Keel's working directory.
+
 ---
 
 ## [0.21.0] — 2026-09-25

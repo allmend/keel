@@ -144,7 +144,7 @@ Files that can hold a private key are `0600` in a `0700` directory:
 | Path | Holds |
 |---|---|
 | `keel.state_dir` (`/var/lib/keel`) | `node.key`, the node's mTLS key |
-| `raft/store.redb` in the state directory | cluster and control CA keys, ACME keys, pushed config including its keys |
+| `raft/store.redb` in the state directory | cluster and control CA keys, ACME account and certificate keys, pushed config including its keys |
 | `control/` in the state directory | the control CA key, which signs operator credentials |
 | `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys, ACME account keys |
 | the config directory, in a cluster | keys the config names by relative path |

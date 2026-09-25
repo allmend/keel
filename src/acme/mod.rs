@@ -170,6 +170,9 @@ impl pingora::services::background::BackgroundService for AcmeService {
             // than what this node has on disk — BEFORE the issuance check, so
             // a node never re-issues something the cluster already holds.
             self.pull_cluster_certs().await;
+            if let Some(cluster) = &self.cluster {
+                sync_account_files(&self.acme.storage, &cluster.acme_accounts_rx.borrow().clone());
+            }
 
             // Only the leader talks to the CAs in cluster mode; standalone
             // always may. The flock additionally serializes across workers.
@@ -363,8 +366,9 @@ struct IssuerPool {
     storage: String,
     global_renew: RenewBefore,
     issuers: HashMap<String, AcmeIssuer>,
-    /// Lazily created ACME accounts, one per issuer.
-    accounts: HashMap<String, Account>,
+    /// Lazily created ACME accounts, one per issuer, with the stored JSON
+    /// each came from (to notice when the cluster's account replaces it).
+    accounts: HashMap<String, (Account, String)>,
     /// Per-host failure backoff: (next attempt allowed at, current delay).
     backoff: HashMap<String, (Instant, Duration)>,
 }
@@ -442,7 +446,7 @@ impl IssuerPool {
         issuer: &AcmeIssuer,
         cluster: Option<&crate::cluster::ClusterHandle>,
     ) -> Result<()> {
-        let account = self.account(issuer_name, issuer).await?;
+        let account = self.account(issuer_name, issuer, cluster).await?;
 
         let identifier = Identifier::Dns(host.to_owned());
         let mut order = account
@@ -576,28 +580,49 @@ impl IssuerPool {
         anyhow::bail!("challenge token committed but never appeared in {}", local.display())
     }
 
-    /// Load the persisted ACME account for `issuer_name`, or register one.
-    /// Reused across all renewals to stay within CA rate limits.
-    async fn account(&mut self, issuer_name: &str, issuer: &AcmeIssuer) -> Result<&Account> {
-        if !self.accounts.contains_key(issuer_name) {
-            let dir = Path::new(&self.storage).join(issuer_name);
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
-            let path = dir.join("account.json");
+    /// The ACME account for `issuer_name`. In a cluster the account committed
+    /// to Raft wins, so every leader uses the same one. Otherwise this node's
+    /// stored account is used, or one is registered; in a cluster either is
+    /// then committed, so the next leader finds it. Reused across renewals to
+    /// stay within CA rate limits.
+    async fn account(
+        &mut self,
+        issuer_name: &str,
+        issuer: &AcmeIssuer,
+        cluster: Option<&crate::cluster::ClusterHandle>,
+    ) -> Result<&Account> {
+        let dir = Path::new(&self.storage).join(issuer_name);
+        private_dir(&dir)?;
+        let path = dir.join("account.json");
 
-            let stored: Option<StoredAccount> = std::fs::read(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_slice(&raw).ok())
-                .filter(|s: &StoredAccount| s.directory == issuer.directory);
-
-            let account = match stored {
-                Some(s) => builder(issuer)?
-                    .from_credentials(s.credentials)
+        let replicated = cluster
+            .and_then(|c| c.acme_accounts_rx.borrow().get(issuer_name).cloned())
+            .filter(|json| stored_for(json, &issuer.directory).is_some());
+        if let Some(json) = replicated {
+            if self.accounts.get(issuer_name).map(|(_, j)| j) != Some(&json) {
+                let stored = stored_for(&json, &issuer.directory).expect("checked above");
+                let account = builder(issuer)?
+                    .from_credentials(stored.credentials)
                     .await
-                    .context("restore ACME account")?,
+                    .context("restore the cluster's ACME account")?;
+                write_if_changed(&path, &json)?;
+                info!(issuer = issuer_name, "acme: using the cluster's account");
+                self.accounts.insert(issuer_name.to_owned(), (account, json));
+            }
+            return Ok(&self.accounts[issuer_name].0);
+        }
+
+        if !self.accounts.contains_key(issuer_name) {
+            let local = std::fs::read_to_string(&path).ok().filter(|json| stored_for(json, &issuer.directory).is_some());
+            let (account, json) = match local {
+                Some(json) => {
+                    let stored = stored_for(&json, &issuer.directory).expect("checked above");
+                    let account =
+                        builder(issuer)?.from_credentials(stored.credentials).await.context("restore ACME account")?;
+                    (account, json)
+                }
                 None => {
-                    let contact: Vec<String> =
-                        issuer.email.iter().map(|e| format!("mailto:{e}")).collect();
+                    let contact: Vec<String> = issuer.email.iter().map(|e| format!("mailto:{e}")).collect();
                     let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
                     let (account, credentials) = builder(issuer)?
                         .create(
@@ -611,17 +636,58 @@ impl IssuerPool {
                         )
                         .await
                         .context("create ACME account")?;
-                    let stored =
-                        StoredAccount { directory: issuer.directory.clone(), credentials };
-                    write_private(&path, serde_json::to_string(&stored)?.as_bytes())
-                        .context("persist ACME account")?;
+                    let json = serde_json::to_string(&StoredAccount { directory: issuer.directory.clone(), credentials })?;
+                    write_private(&path, json.as_bytes()).context("persist ACME account")?;
                     info!(issuer = issuer_name, directory = issuer.directory, "acme: account registered");
-                    account
+                    (account, json)
                 }
             };
-            self.accounts.insert(issuer_name.to_owned(), account);
+            self.accounts.insert(issuer_name.to_owned(), (account, json));
         }
-        Ok(self.accounts.get(issuer_name).unwrap())
+
+        if let Some(raft) = match cluster {
+            Some(c) => c.raft().await,
+            None => None,
+        } {
+            let json = self.accounts[issuer_name].1.clone();
+            match crate::cluster::push_acme_account(&raft, issuer_name.to_owned(), json).await {
+                Ok(()) => info!(issuer = issuer_name, "acme: account committed to the cluster"),
+                Err(e) => warn!(issuer = issuer_name, error = %format!("{e:#}"), "acme: account not committed; retried at the next issuance"),
+            }
+        }
+        Ok(&self.accounts[issuer_name].0)
+    }
+}
+
+/// The stored account in `json`, if it belongs to the ACME directory
+/// `directory`: pointing an issuer at another CA registers a fresh account.
+fn stored_for(json: &str, directory: &str) -> Option<StoredAccount> {
+    serde_json::from_str::<StoredAccount>(json).ok().filter(|s| s.directory == directory)
+}
+
+/// Create `dir` if needed and keep it private: it holds account keys.
+fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("chmod {}", dir.display()))
+}
+
+fn write_if_changed(path: &Path, text: &str) -> Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    write_private(path, text.as_bytes())
+}
+
+/// Every node keeps the cluster's accounts on disk too, in the same place a
+/// standalone node would, so a node that becomes leader, or loses its Raft
+/// state, still has them.
+fn sync_account_files(storage: &str, accounts: &crate::cluster::types::AcmeAccountMap) {
+    for (issuer, json) in accounts {
+        let dir = Path::new(storage).join(issuer);
+        if let Err(e) = private_dir(&dir).and_then(|()| write_if_changed(&dir.join("account.json"), json)) {
+            warn!(issuer, error = %format!("{e:#}"), "acme: cannot write the cluster's account");
+        }
     }
 }
 

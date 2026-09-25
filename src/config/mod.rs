@@ -160,6 +160,16 @@ pub fn assemble(node_yaml: &str, files: &FileSet) -> Result<Config> {
 
     cfg.files = files.clone();
     cfg.validate()?;
+    // The ACME client reads its extra trust root from disk: a relative
+    // root_ca is the config directory's file there.
+    let config_dir = std::path::PathBuf::from(&cfg.keel.config_dir);
+    if let Some(acme) = cfg.acme.as_mut() {
+        for issuer in acme.issuers.values_mut() {
+            if let Some(key) = issuer.root_ca.as_deref().and_then(relative_key) {
+                issuer.root_ca = Some(config_dir.join(key).to_string_lossy().into_owned());
+            }
+        }
+    }
     Ok(cfg)
 }
 
@@ -534,6 +544,11 @@ impl Config {
         }
         for l in &self.listeners {
             carried(format!("listener '{}'", l.address), "tls_ca", &l.tls_ca)?;
+        }
+        if let Some(acme) = &self.acme {
+            for (name, issuer) in &acme.issuers {
+                carried(format!("acme issuer '{name}'"), "root_ca", &issuer.root_ca)?;
+            }
         }
 
         let absolute = |field: &str, path: &str| -> Result<()> {
@@ -1510,6 +1525,15 @@ mod tests {
         assert!(err.contains("inside the config directory"), "{err}");
         let err = assemble_err("", &files(&[("keel.yaml", &acme("acme"))]));
         assert!(err.contains("acme.storage must be an absolute path"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_acme_root_ca_is_the_config_directory_file() {
+        let root = format!("{ROOT}acme:\n  issuers:\n    test:\n      directory: https://ca.test/dir\n      root_ca: certs/ca.pem\n");
+        let err = assemble_err("", &files(&[("keel.yaml", &root)]));
+        assert!(err.contains("acme issuer 'test': root_ca 'certs/ca.pem' is not in the config directory"), "{err}");
+        let cfg = assemble("keel:\n  config_dir: /srv/lb\n", &files(&[("keel.yaml", &root), ("certs/ca.pem", "PEM")])).unwrap();
+        assert_eq!(cfg.acme.unwrap().issuers["test"].root_ca.as_deref(), Some("/srv/lb/certs/ca.pem"));
     }
 
     #[test]

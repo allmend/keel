@@ -41,6 +41,9 @@ pub enum ClientRequest {
     /// Replicate the cluster CA (cert + key), committed once by the bootstrap
     /// node, so every member can issue certificates to joining nodes.
     SetClusterCa { cert_pem: String, key_pem: String },
+    /// Replicate an issuer's ACME account (the stored account JSON), so a
+    /// new leader keeps using it instead of registering another one.
+    SetAcmeAccount { issuer: String, account: String },
 }
 
 /// host → (cert PEM, key PEM). Replicated ACME certificates.
@@ -55,6 +58,10 @@ pub type ControlCaPair = Option<(String, String)>;
 
 /// (cert PEM, key PEM) of the cluster CA, once the bootstrap node committed it.
 pub type ClusterCaPair = Option<(String, String)>;
+
+/// ACME issuer name → the stored account (JSON). One account per issuer
+/// for the whole cluster.
+pub type AcmeAccountMap = BTreeMap<String, String>;
 
 /// A committed config: the file set and its version, the index of the log
 /// entry that committed it.
@@ -97,4 +104,7 @@ pub struct ClusterState {
     /// The cluster CA every member issues node certificates from.
     #[serde(default)]
     pub cluster_ca: ClusterCaPair,
+    /// ACME accounts, one per issuer, shared by every node.
+    #[serde(default)]
+    pub acme_accounts: AcmeAccountMap,
 }

@@ -381,14 +381,14 @@ Names starting with `.` (editor and temporary files) are skipped. Every file mus
 
 ### Files the config names
 
-`tls.cert`, `tls.key`, `cert` and `key` of `certificates:` entries, and a listener's `tls_ca` name files:
+`tls.cert`, `tls.key`, `cert` and `key` of `certificates:` entries, a listener's `tls_ca` and an ACME issuer's `root_ca` name files:
 
 | Path | Read from | Distributed by |
 |---|---|---|
 | relative, e.g. `certs/api.crt` | the config directory | the config directory; in a cluster, every push |
 | absolute, e.g. `/etc/keel/certs/int.crt` | each node's disk | the operator |
 
-A relative path the config directory does not hold is a load error, and in a cluster a refused push. A missing absolute file is a load error. Both errors name the vhost, certificate entry or listener. Keys are PEM files, never inline in the config.
+A relative path the config directory does not hold is a load error, and in a cluster a refused push. A missing absolute file is a load error. Both errors name the vhost, certificate entry, listener or issuer. Keys are PEM files, never inline in the config.
 
 `access_log.dir`, `cache.disk.path` and `acme.storage` are directories Keel writes to on each node, and must be absolute. `acme.storage` must be outside the config directory, which a push replaces.
 

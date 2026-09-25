@@ -62,6 +62,22 @@ pub fn image() -> Result<String> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+/// A text file from an image, which need not have a shell: `docker cp` out of
+/// a created, never started container.
+pub fn file_from_image(image: &str, path: &str) -> Result<String> {
+    let out = Command::new("docker").args(["create", image]).output().context("cannot run docker")?;
+    anyhow::ensure!(out.status.success(), "docker create {image}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let container = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let dest = std::env::temp_dir().join(format!("keel-e2e-{container}"));
+    let copied = Command::new("docker").args(["cp", &format!("{container}:{path}")]).arg(&dest).output();
+    let _ = Command::new("docker").args(["rm", &container]).output();
+    let copied = copied.context("cannot run docker")?;
+    anyhow::ensure!(copied.status.success(), "docker cp {path}: {}", String::from_utf8_lossy(&copied.stderr).trim());
+    let text = std::fs::read_to_string(&dest).with_context(|| format!("read {}", dest.display()));
+    let _ = std::fs::remove_file(&dest);
+    text
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("repo root exists")
 }

@@ -40,8 +40,9 @@ fn start_args(node: &str) -> String {
     }
 }
 
-fn compose() -> String {
-    let mut s = String::from(
+/// The stack; `extra` is appended to `services:`.
+fn compose(extra: &str) -> String {
+    let mut s = format!(
         r#"
 networks:
   net:
@@ -51,8 +52,8 @@ networks:
 services:
   backend:
     image: traefik/whoami
-    networks: { net: { ipv4_address: 172.29.83.20 } }
-"#,
+    networks: {{ net: {{ ipv4_address: 172.29.83.20 }} }}
+{extra}"#,
     );
     for node in NODES {
         s.push_str(&format!(
@@ -143,12 +144,21 @@ impl Cluster {
     /// Three nodes up, every one a voter, and operator credentials that work
     /// against any node.
     fn up(name: &str) -> Result<Cluster> {
-        let mut files: Vec<(&str, String)> =
-            vec![("node4.yaml", node_yaml("172.29.83.14")), ("node4-config/keel.yaml", lb_config(""))];
-        files.extend([("node1.yaml", "node1"), ("node2.yaml", "node2"), ("node3.yaml", "node3")].map(|(f, n)| (f, node_yaml(&ip(n)))));
-        files.extend(["node1-config/keel.yaml", "node2-config/keel.yaml", "node3-config/keel.yaml"].map(|f| (f, lb_config(""))));
-        files.extend([("node1.args", "node1"), ("node2.args", "node2"), ("node3.args", "node3")].map(|(f, n)| (f, start_args(n))));
-        let stack = Stack::up(name, &compose(), &files)?;
+        Cluster::up_with(name, "", &[("keel.yaml", lb_config(""))])
+    }
+
+    /// [`Cluster::up`] with `extra` services and `config` as every node's
+    /// config directory.
+    fn up_with(name: &str, extra: &str, config: &[(&str, String)]) -> Result<Cluster> {
+        let mut files: Vec<(String, String)> =
+            vec![("node4.yaml".into(), node_yaml("172.29.83.14")), ("node4-config/keel.yaml".into(), lb_config(""))];
+        for node in NODES {
+            files.push((format!("{node}.yaml"), node_yaml(&ip(node))));
+            files.push((format!("{node}.args"), start_args(node)));
+            files.extend(config.iter().map(|(f, text)| (format!("{node}-config/{f}"), text.clone())));
+        }
+        let files: Vec<(&str, String)> = files.iter().map(|(f, text)| (f.as_str(), text.clone())).collect();
+        let stack = Stack::up(name, &compose(extra), &files)?;
 
         // The control CA reaches every node through Raft and is written to
         // ca_dir; credentials must be signed by that CA, not a local one.
@@ -728,6 +738,81 @@ fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -
         wait_until(&format!("{node} dropped the certificate files"), Duration::from_secs(60), || {
             Ok(cluster.config_file(node, "certs/tls.key")?.is_none().then_some(()))
         })?;
+    }
+    Ok(())
+}
+
+const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest";
+
+/// A test ACME CA that validates every challenge without contacting anyone.
+fn pebble_service() -> String {
+    format!(
+        r#"  pebble:
+    image: {PEBBLE}
+    environment: [PEBBLE_VA_ALWAYS_VALID=1, PEBBLE_VA_NOSLEEP=1, PEBBLE_WFE_NONCEREJECT=0]
+    networks: {{ net: {{ ipv4_address: 172.29.83.30 }} }}
+"#
+    )
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn every_leader_uses_the_one_acme_account_the_cluster_holds() -> Result<()> {
+    // Pebble certificates last years; renew_before larger than that makes
+    // the leader renew on every check, so a new leader needs the account
+    // without anyone restarting it.
+    let acme = r#"
+acme:
+  renew_before: 99999d
+  issuers:
+    test:
+      directory: https://pebble:14000/dir
+      root_ca: certs/pebble.minica.pem
+"#;
+    let vhost = "  - host: acme.test\n    pool: web\n    tls: { acme: test }\n";
+    let config = [
+        ("keel.yaml", format!("{}{acme}", lb_config(vhost))),
+        ("certs/pebble.minica.pem", keel_e2e::file_from_image(PEBBLE, "/test/certs/pebble.minica.pem")?),
+    ];
+    let cluster = Cluster::up_with("acme-account", &pebble_service(), &config)?;
+    let first = cluster.leader()?;
+    wait_until(&format!("{first} commits the account"), Duration::from_secs(120), || {
+        Ok(cluster.logged(&first, "acme: account committed to the cluster")?.then_some(()))
+    })?;
+
+    let account = |node: &str| -> Result<Option<String>> {
+        let out = cluster.stack.exec(node, &["cat", "/var/lib/keel/acme/test/account.json"])?;
+        Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
+    };
+    let committed = wait_until("the leader's account file", Duration::from_secs(10), || account(&first))?;
+    for node in NODES {
+        wait_until(&format!("{node} holds the cluster's account"), Duration::from_secs(90), || {
+            Ok((account(node)?.as_ref() == Some(&committed)).then_some(()))
+        })?;
+    }
+
+    // The next leader renews with the same account instead of registering one.
+    cluster.stack.stop(&first)?;
+    let rest: Vec<&str> = NODES.into_iter().filter(|n| *n != first).collect();
+    let next = wait_until("a new leader", Duration::from_secs(60), || {
+        let status = cluster.status(rest[0]).or_else(|_| cluster.status(rest[1]))?;
+        Ok(status["leader_id"].as_u64().filter(|id| *id != cluster.id(&first)))
+    })?;
+    let next = cluster.name(next)?;
+    wait_until(&format!("{next} renews with the cluster's account"), Duration::from_secs(180), || {
+        let logs = cluster.stack.logs(&next)?;
+        let using = logs.find("acme: using the cluster's account");
+        Ok(using.filter(|at| logs[*at..].contains("acme: certificate issued")).map(drop))
+    })?;
+    cluster.stack.start(&first)?;
+
+    let registered: usize = NODES
+        .into_iter()
+        .map(|n| cluster.stack.logs(n).map(|l| l.matches("acme: account registered").count()))
+        .sum::<Result<usize>>()?;
+    assert_eq!(registered, 1, "one account registered in the cluster's lifetime");
+    for node in NODES {
+        assert_eq!(account(node)?.as_ref(), Some(&committed), "{node} keeps the cluster's account");
     }
     Ok(())
 }

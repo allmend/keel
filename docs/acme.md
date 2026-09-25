@@ -27,7 +27,7 @@ HTTP → HTTPS redirect is enabled automatically for ACME vhosts, with the chall
 
 ## Issuers
 
-An issuer is a named CA relationship: a directory URL, an account contact, and optionally a trust root. Each issuer has one ACME account, stored under `storage/<issuer>/account.json` and reused for every issuance. Reusing one account per issuer is what keeps Keel inside the CA's rate limits.
+An issuer is a named CA relationship: a directory URL, an account contact, and optionally a trust root. Each issuer has one ACME account, stored under `storage/<issuer>/account.json` and reused for every issuance — in a cluster, one account for all nodes. Reusing one account per issuer is what keeps Keel inside the CA's rate limits.
 
 Vhosts select an issuer by name:
 
@@ -41,7 +41,7 @@ acme:
     internal:
       email: infra@example.com
       directory: https://ca.corp.internal/acme/acme/directory
-      root_ca: /etc/keel/corp-root.pem
+      root_ca: certs/corp-root.pem
 
 vhosts:
   - host: www.example.com
@@ -65,7 +65,7 @@ Config validation rejects three cases:
 |---|---|---|
 | `email` | none | Account contact. Optional but recommended. |
 | `directory` | `https://acme-v02.api.letsencrypt.org/directory` | Any ACME v2 directory URL. Staging: `https://acme-staging-v02.api.letsencrypt.org/directory` |
-| `root_ca` | none | PEM trust root for the ACME API itself. Needed for internal or self-signed CAs; not for public ones. |
+| `root_ca` | none | PEM trust root for the ACME API itself. Needed for internal or self-signed CAs; not for public ones. A relative path is a file of the config directory and travels with a push. |
 | `renew_before` | global value | Per-issuer renewal override. |
 
 ---
@@ -171,7 +171,8 @@ Certificates persist on disk and are not re-issued on restart, reload, or reboot
 
 In cluster mode certificates are replicated through the Raft log:
 
-- Only the leader contacts the CAs. One account, one issuance, no duplicate certificates across nodes.
+- Only the leader contacts the CAs. One issuance, no duplicate certificates across nodes.
+- Each issuer's account is committed to the Raft log when first registered. Every node writes it to `storage/<issuer>/account.json`, and a new leader uses it instead of registering another. A node's own account file is committed only when the log holds none for that issuer's directory.
 - Issued and renewed certificates are committed as Raft entries. Every node — including any node that joins later, via snapshot — writes them to its own `storage` and hot-swaps them into its listeners.
 - On startup, and continuously afterwards, disk and Raft state are reconciled per hostname: the valid certificate with the most remaining lifetime wins and overwrites the other side. A full-cluster restart recovers certificates from disk, and the leader pushes them back into Raft.
 - HTTP-01 challenge tokens are committed to the Raft log during issuance. The leader confirms every node holds the token before telling the CA to validate, so validation requests — which may come from multiple vantage points and land on any node — are answered wherever they arrive. Port 80 for the domain may reach any cluster node. Tokens are retracted from all nodes when the order completes.

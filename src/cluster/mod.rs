@@ -151,6 +151,8 @@ pub struct ClusterOpts {
 pub struct ClusterHandle {
     /// Becomes Some once ClusterService::start() completes Raft initialization.
     pub raft: Arc<Mutex<Option<Arc<ClusterRaft>>>>,
+    /// ACME accounts committed to the cluster, one per issuer.
+    pub acme_accounts_rx: watch::Receiver<crate::cluster::types::AcmeAccountMap>,
     /// The committed config version; fires on every new one.
     pub config_rx: watch::Receiver<Option<ConfigVersion>>,
     /// This node's `node.yaml`, which every config version is built against.
@@ -885,6 +887,7 @@ pub struct ClusterService {
     challenges_tx: Arc<watch::Sender<crate::cluster::types::ChallengeMap>>,
     control_ca_tx: Arc<watch::Sender<crate::cluster::types::ControlCaPair>>,
     cluster_ca_tx: Arc<watch::Sender<crate::cluster::types::ClusterCaPair>>,
+    acme_accounts_tx: Arc<watch::Sender<crate::cluster::types::AcmeAccountMap>>,
 }
 
 #[async_trait]
@@ -957,6 +960,7 @@ impl ClusterService {
         sm.set_challenges_tx(Arc::clone(&self.challenges_tx));
         sm.set_control_ca_tx(Arc::clone(&self.control_ca_tx));
         sm.set_cluster_ca_tx(Arc::clone(&self.cluster_ca_tx));
+        sm.set_acme_accounts_tx(Arc::clone(&self.acme_accounts_tx));
         sm.persisted(Arc::clone(&disk), loaded.snapshot.as_ref())?;
 
         let log_store = LogStore::persisted(disk, &loaded);
@@ -1077,9 +1081,12 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let (control_ca_tx, control_ca_rx) = watch::channel(None);
     let control_ca_tx = Arc::new(control_ca_tx);
     let cluster_ca_tx = Arc::new(watch::channel(None).0);
+    let (acme_accounts_tx, acme_accounts_rx) = watch::channel(crate::cluster::types::AcmeAccountMap::new());
+    let acme_accounts_tx = Arc::new(acme_accounts_tx);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
+        acme_accounts_rx,
         config_rx,
         node_yaml: Arc::new(opts.node_yaml.clone()),
         config_dir: opts.config_dir.clone(),
@@ -1097,6 +1104,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         challenges_tx,
         control_ca_tx,
         cluster_ca_tx,
+        acme_accounts_tx,
     };
 
     (handle, service)
@@ -1264,6 +1272,15 @@ async fn replace_control_ca(raft: &ClusterRaft) -> Result<()> {
     let (cert_pem, key_pem) = crate::control::ca::ControlCa::generate()?;
     push_control_ca(raft, cert_pem, key_pem).await?;
     info!("cluster: control CA replaced; every earlier keelconfig is revoked");
+    Ok(())
+}
+
+/// Commit an ACME issuer's account so every node, and every later leader,
+/// uses the same one.
+pub async fn push_acme_account(raft: &ClusterRaft, issuer: String, account: String) -> Result<()> {
+    raft.client_write(ClientRequest::SetAcmeAccount { issuer, account })
+        .await
+        .map_err(|e| anyhow::anyhow!("ACME account replication failed: {e:?}"))?;
     Ok(())
 }
 
