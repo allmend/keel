@@ -137,6 +137,24 @@ A Raft snapshot that fails to deserialize is returned as a storage error and sur
 
 ---
 
+## Where secrets are stored
+
+Everything Keel writes that can hold a private key is mode `0600` in a `0700` directory:
+
+| Path | Holds |
+|---|---|
+| `keel.state_dir` (`/var/lib/keel`), `0700` | `node.key` — the node's mTLS key |
+| `raft/store.redb` in the state directory | the replicated state: cluster CA key, control CA key, ACME certificates and keys, pushed config — including keys a pushed set carries |
+| `control/` in the state directory | the control CA (`ca.key`), which signs operator credentials |
+| `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys and ACME account keys |
+| the config directory (`/etc/keel/config/`) in a cluster | private keys the config names by relative path, written `0600`; Keel makes the directory `0700` |
+
+Leave these out of backups that are not handled as secrets, or back them up deliberately. The node file, `/etc/keel/node.yaml`, can hold the cluster secret; it is the operator's file, and Keel never writes it.
+
+Keel gives a directory it needs to `keel.user` only when that user does not own it yet — a new directory, or a volume that appears owned by root. Once Keel's user owns it, Keel leaves it alone, so a group set afterwards (for example, for a log shipper reading `access_log.dir`) survives restarts.
+
+---
+
 ## Operator checklist
 
 | Requirement | Action |

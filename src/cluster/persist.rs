@@ -79,9 +79,13 @@ fn io(e: impl std::fmt::Display) -> anyhow::Error {
 impl Disk {
     /// Open (or create) the store in `dir` and read all of it back.
     pub fn open(dir: &Path) -> Result<(Arc<Disk>, Loaded)> {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         let path = dir.join(STORE_FILE);
         let db = Database::create(&path).map_err(io).with_context(|| format!("cannot open {}", path.display()))?;
+        // The store holds the cluster and control CA keys.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
 
         // Create both tables so a new store reads back as empty, not as missing.
         let txn = db.begin_write().map_err(io)?;
@@ -215,10 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_store_is_empty() {
+    fn a_new_store_is_empty_and_private() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = temp_dir("empty");
         let (_, loaded) = Disk::open(&dir).unwrap();
         assert!(loaded.is_empty());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&dir), mode(&dir.join(STORE_FILE))), (0o700, 0o600), "the store holds CA keys");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

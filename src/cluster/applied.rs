@@ -7,6 +7,8 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -43,11 +45,13 @@ pub fn read(state_dir: &Path) -> Result<Option<Applied>> {
 
 pub fn save(state_dir: &Path, version: u64, files: &FileSet) -> Result<()> {
     let text = serde_json::to_string(&Applied { version, hash: hash(files) })?;
-    write_atomic(state_dir, APPLIED_FILE, &text)
+    write_atomic(state_dir, APPLIED_FILE, &text, 0o644)
 }
 
 /// Make `dir` hold exactly `files`: write what is new or changed (each file
 /// replaced whole, via a temporary file), delete what the set no longer has.
+/// A file holding a private key is written `0600`; directories Keel creates
+/// are `0700`, since a version can carry keys.
 pub fn write_config_dir(dir: &Path, files: &FileSet) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let current = keel_control::read_file_set(dir)?;
@@ -57,9 +61,14 @@ pub fn write_config_dir(dir: &Path, files: &FileSet) -> Result<()> {
         }
         let path = dir.join(rel);
         let parent = path.parent().unwrap_or(dir);
-        std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
         let name = path.file_name().and_then(|n| n.to_str()).context("config file without a name")?;
-        write_atomic(parent, name, text)?;
+        let mode = if text.contains("PRIVATE KEY-----") { 0o600 } else { 0o644 };
+        write_atomic(parent, name, text, mode)?;
     }
     for rel in current.keys().filter(|rel| !files.contains_key(*rel)) {
         let path = dir.join(rel);
@@ -68,9 +77,19 @@ pub fn write_config_dir(dir: &Path, files: &FileSet) -> Result<()> {
     Ok(())
 }
 
-fn write_atomic(dir: &Path, name: &str, text: &str) -> Result<()> {
+fn write_atomic(dir: &Path, name: &str, text: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
     let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&tmp)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    f.write_all(text.as_bytes()).with_context(|| format!("cannot write {}", tmp.display()))?;
+    // OpenOptions::mode applies only when the file is created.
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
     std::fs::rename(&tmp, dir.join(name)).with_context(|| format!("cannot write {}", dir.join(name).display()))
 }
 
@@ -98,6 +117,13 @@ mod tests {
         let next = set(&[("keel.yaml", "v2"), ("pools/a.yaml", "a"), ("certs/b.crt", "pem")]);
         write_config_dir(&dir, &next).unwrap();
         assert_eq!(keel_control::read_file_set(&dir).unwrap(), next);
+
+        let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777;
+        write_config_dir(&dir, &set(&[("keel.yaml", "v2"), ("certs/b.key", "-----BEGIN PRIVATE KEY-----\nx\n")])).unwrap();
+        assert_eq!(mode("certs/b.key"), 0o600, "a private key is private");
+        assert_eq!(mode("keel.yaml"), 0o644);
+        assert_eq!(mode("certs"), 0o700, "directories Keel creates hold keys");
+        write_config_dir(&dir, &next).unwrap();
 
         save(&dir, 7, &next).unwrap();
         assert_eq!(read(&dir).unwrap(), Some(Applied { version: 7, hash: hash(&next) }));

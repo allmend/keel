@@ -7,6 +7,7 @@
 //! at once. Before pingora 0.9 the proxy listeners needed an OpenSSL pair of
 //! their own, because rustls had no per-handshake certificate callback there.
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -154,10 +155,8 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
             )
         };
 
-        let cert_bytes = std::fs::read(&cert_path)
-            .map_err(|e| anyhow::anyhow!("cannot read cert '{cert_path}': {e}"))?;
-        let key_bytes = std::fs::read(&key_path)
-            .map_err(|e| anyhow::anyhow!("cannot read key '{key_path}': {e}"))?;
+        let cert_bytes = cfg.read_file(&cert_path).with_context(|| format!("vhost '{}': tls.cert", vhost.host))?;
+        let key_bytes = cfg.read_file(&key_path).with_context(|| format!("vhost '{}': tls.key", vhost.host))?;
 
         let pair = CertPair::from_pem(&cert_bytes, &key_bytes, &cert_path)?;
         info!(vhost = vhost.host, cert = cert_path, "TLS: certificate loaded");
@@ -182,10 +181,8 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
         if map.contains_key(&c.host) {
             continue; // the vhost entry already covers this host
         }
-        let cert_bytes = std::fs::read(&cert_path)
-            .map_err(|e| anyhow::anyhow!("cannot read cert '{cert_path}': {e}"))?;
-        let key_bytes = std::fs::read(&key_path)
-            .map_err(|e| anyhow::anyhow!("cannot read key '{key_path}': {e}"))?;
+        let cert_bytes = cfg.read_file(&cert_path).with_context(|| format!("certificate '{}': cert", c.host))?;
+        let key_bytes = cfg.read_file(&key_path).with_context(|| format!("certificate '{}': key", c.host))?;
         let pair = CertPair::from_pem(&cert_bytes, &key_bytes, &cert_path)?;
         info!(host = c.host, cert = cert_path, "TLS: certificate loaded");
         map.insert(c.host.clone(), pair);
@@ -194,9 +191,6 @@ fn load_cert_map(cfg: &crate::config::Config) -> anyhow::Result<CertMap> {
     Ok(map)
 }
 
-/// Client configuration that accepts any backend certificate: wire
-/// encryption without backend authentication (NLB behaviour), the default
-/// for re-encrypting TCP listeners and for TLS health probes.
 /// Common Name of the client certificate a TLS peer presented, if any.
 pub fn peer_common_name(conn: &rustls::ServerConnection) -> Option<String> {
     let der = conn.peer_certificates()?.first()?;
@@ -211,6 +205,9 @@ pub fn peer_common_name(conn: &rustls::ServerConnection) -> Option<String> {
     Some(cn)
 }
 
+/// Client configuration that accepts any backend certificate: wire
+/// encryption without backend authentication, the default for
+/// re-encrypting TCP listeners and for TLS health probes.
 pub fn insecure_client_config() -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Arc::new(

@@ -159,15 +159,6 @@ impl Stack {
         Ok(())
     }
 
-    /// A file of the stack directory, as a bind-mounted node left it.
-    pub fn read_file(&self, file: &str) -> Result<Option<String>> {
-        match std::fs::read_to_string(self.dir.join(file)) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("read {file}")),
-        }
-    }
-
     /// Send a signal to a service's main process (init forwards it to keel).
     pub fn signal(&self, service: &str, signal: &str) -> Result<()> {
         self.compose(&["kill", "--signal", signal, service]).map(drop)
@@ -422,6 +413,65 @@ pub fn http_get(addr: SocketAddr, host: &str, path: &str) -> Result<(u16, String
         .with_context(|| format!("no HTTP status in response: {:?}", text.lines().next()))?;
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned()).unwrap_or_default();
     Ok((status, body))
+}
+
+// TLS
+
+/// The leaf certificate (DER) a TLS listener serves for `sni`, or an error
+/// when the handshake fails — no certificate for that name, say. The chain
+/// is not verified: tests compare it with the certificate they expect.
+pub fn served_certificate(addr: SocketAddr, sni: &str) -> Result<Vec<u8>> {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    #[derive(Debug)]
+    struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+        .with_no_client_auth();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), ServerName::try_from(sni.to_owned())?)?;
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock)?;
+    }
+    let leaf = conn.peer_certificates().and_then(|c| c.first()).context("no certificate served")?;
+    Ok(leaf.as_ref().to_vec())
 }
 
 // Control protocol (keelctl's mTLS)

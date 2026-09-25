@@ -94,20 +94,42 @@ fn prepare_runtime_dir(cfg: &Config) -> Result<()> {
     for dir in dirs {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("master: cannot create {}", dir.display()))?;
-        chown(&dir, uid, gid).with_context(|| format!("master: cannot chown {}", dir.display()))?;
+        take_ownership(&dir, uid, gid)?;
         info!(dir = %dir.display(), user = cfg.keel.user, "master: runtime directory ready");
     }
+    // The state directory holds the node key and the Raft store, which holds
+    // both CA keys.
+    let state_dir = std::path::Path::new(&cfg.keel.state_dir);
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("master: cannot restrict {}", state_dir.display()))?;
     Ok(())
+}
+
+/// Give `path` to `keel.user` unless that user already owns it. Once Keel's
+/// user owns a directory it is left alone, so a group an administrator sets
+/// afterwards (say, for a log shipper) survives restarts.
+fn take_ownership(
+    path: &std::path::Path,
+    uid: Option<nix::unistd::Uid>,
+    gid: Option<nix::unistd::Gid>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(path).with_context(|| format!("master: cannot stat {}", path.display()))?.uid();
+    if uid.is_some_and(|u| u.as_raw() == owner) {
+        return Ok(());
+    }
+    nix::unistd::chown(path, uid, gid).with_context(|| format!("master: cannot chown {}", path.display()))
 }
 
 /// A cluster node writes every applied version into the config directory
 /// after dropping privileges, so the directory tree belongs to `keel.user`.
 fn hand_over_config_dir(cfg: &Config) -> Result<()> {
-    use nix::unistd::{chown, Group, User};
+    use nix::unistd::{Group, User};
+    use std::os::unix::fs::PermissionsExt;
     let uid = User::from_name(&cfg.keel.user)?.map(|u| u.uid);
     let gid = Group::from_name(&cfg.keel.group)?.map(|g| g.gid);
     fn walk(path: &std::path::Path, uid: Option<nix::unistd::Uid>, gid: Option<nix::unistd::Gid>) -> Result<()> {
-        chown(path, uid, gid).with_context(|| format!("master: cannot chown {}", path.display()))?;
+        take_ownership(path, uid, gid)?;
         if path.is_dir() {
             for entry in std::fs::read_dir(path)? {
                 walk(&entry?.path(), uid, gid)?;
@@ -118,6 +140,9 @@ fn hand_over_config_dir(cfg: &Config) -> Result<()> {
     let dir = std::path::Path::new(&cfg.keel.config_dir);
     std::fs::create_dir_all(dir).with_context(|| format!("master: cannot create {}", dir.display()))?;
     walk(dir, uid, gid)?;
+    // A pushed version can carry private keys.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("master: cannot restrict {}", dir.display()))?;
     info!(dir = %dir.display(), user = cfg.keel.user, "master: config directory ready");
     Ok(())
 }

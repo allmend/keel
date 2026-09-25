@@ -93,7 +93,7 @@ listeners:
 | `tls_mode` | string | `passthrough` | `tcp_pool` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-handling--three-modes) |
 | `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificates:` entry or a vhost with `tls`, served when the client's SNI has no certificate of its own |
 | `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's configured hostname |
-| `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs |
+| `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs. A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
 
 A `tcp_pool` or `udp_pool` listener references an ordinary entry in `pools` — health checks, weights, algorithms, and drain behave the same as for HTTP. Validation fails at startup for an unknown pool name, a `tcp_pool` or `udp_pool` + `tls` combination, or `tcp_pool` and `udp_pool` on the same listener entry (use two entries with the same `address` to serve both protocols on one port).
 
@@ -139,7 +139,7 @@ access_log:
 | Field | Type | Default |
 |---|---|---|
 | `enabled` | bool | `true` |
-| `dir` | string | `/var/log/keel` |
+| `dir` | string | `/var/log/keel` (absolute, or `-` for stdout) |
 
 Set `dir: "-"` to write to stdout. See [Access logging](access-logging.md) for the full log format.
 
@@ -160,7 +160,7 @@ Size values use binary prefixes: `K`, `M`, `G` (case-insensitive). A bare number
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `memory` | string | none | Memory budget; omit to disable memory cache |
-| `disk.path` | string | none | Directory for disk cache files |
+| `disk.path` | string | none | Directory for disk cache files; absolute |
 | `disk.size` | string | none | Disk budget |
 
 Omit `cache` entirely to disable caching globally. See [Caching](caching.md) for tier behavior and per-vhost configuration.
@@ -238,8 +238,8 @@ vhosts:
 | `host` | string | required | Exact hostname or `*` wildcard |
 | `pool` | string | none | Default pool; required if no `routes` |
 | `routes` | list | none | Path-prefix routing; see [Virtual hosts](virtual-hosts.md) |
-| `tls.cert` | string | none | Path to PEM certificate (BYO cert) |
-| `tls.key` | string | none | Path to PEM private key (BYO cert) |
+| `tls.cert` | string | none | PEM certificate (BYO cert). A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
+| `tls.key` | string | none | PEM private key (BYO cert), same resolution as `tls.cert` |
 | `tls.acme` | bool or string | `false` | `true` = ACME via issuer `default`; a string names an issuer from `acme.issuers` — see [ACME](acme.md) |
 | `redirect_http` | bool | `false` (`true` when `tls.acme`) | 301 plain HTTP to HTTPS |
 | `forwarded_headers.mode` | string | `replace` | `replace`, `append`, or `off` |
@@ -272,7 +272,7 @@ acme:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `storage` | string | `/var/lib/keel/acme` | Certs, keys, accounts, challenge tokens |
+| `storage` | string | `/var/lib/keel/acme` | Certs, keys, accounts, challenge tokens. Absolute, and outside the config directory |
 | `renew_before` | string | `30%` | Renew when less than this remains: `%` of lifetime or absolute `Nd` |
 | `issuers.<name>.email` | string | none | ACME account contact for this issuer |
 | `issuers.<name>.directory` | string | `https://acme-v02.api.letsencrypt.org/directory` | ACME v2 directory URL |
@@ -299,7 +299,7 @@ certificates:
 |---|---|---|---|
 | `host` | string | required | Hostname to issue for (no wildcards) |
 | `issuer` | string | `default` | Issuer name from `acme.issuers`. Ignored when `cert`/`key` are set |
-| `cert`, `key` | string | none | Bring-your-own PEM files instead of ACME issuance; see [TCP proxying](tcp-proxying.md) |
+| `cert`, `key` | string | none | Bring-your-own PEM files instead of ACME issuance, resolved like `tls.cert`; see [TCP proxying](tcp-proxying.md) |
 
 ---
 
@@ -378,6 +378,19 @@ Merge rules for the files after `keel.yaml`:
 - `include:` is refused: every `*.yaml` in the directory is loaded
 
 Names starting with `.` (editor and temporary files) are skipped. Every file must be UTF-8 text.
+
+### Files the config names
+
+`tls.cert`, `tls.key`, the `cert` and `key` of `certificates:` entries, and a listener's `tls_ca` name files Keel reads:
+
+| Path | Resolves to | Reaches every node by |
+|---|---|---|
+| relative, e.g. `certs/api.crt` | a file of the config directory (`/etc/keel/config/certs/api.crt`) | the config directory itself — in a cluster, every push carries it |
+| absolute, e.g. `/etc/keel/certs/int.crt` | as written, on each node's disk | the operator (configuration management) |
+
+A relative path the config directory does not hold is a load error — and in a cluster a refused push — naming the vhost, certificate entry or listener. A missing absolute file is a load error naming the file and where it is used. Certificates are PEM files; the config never holds a key inline.
+
+Directories Keel writes to — `access_log.dir`, `cache.disk.path`, `acme.storage` — must be absolute: they are node-local. `acme.storage` must also lie outside the config directory: a push replaces that directory, and issued certificates are Keel's, not the operator's.
 
 ### In a cluster
 

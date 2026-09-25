@@ -11,3 +11,6 @@ anyhow = "1"
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+
+[dev-dependencies]
+rcgen = "0.14"

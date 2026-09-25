@@ -1314,7 +1314,7 @@ fn add_l4_services(
                     let ca = l
                         .tls_ca
                         .as_ref()
-                        .map(|p| std::fs::read(p).map_err(|e| anyhow::anyhow!("cannot read tls_ca '{p}': {e}")))
+                        .map(|p| cfg.read_file(p).map_err(|e| anyhow::anyhow!("listener '{}': tls_ca: {e:#}", l.address)))
                         .transpose()?;
                     Some(crate::tls::verifying_client_config(ca.as_deref())?)
                 }

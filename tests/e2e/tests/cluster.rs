@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use keel_control::ControlRequest;
-use keel_e2e::{http_get, wait_until, Control, Runtime, Stack};
+use keel_e2e::{http_get, served_certificate, wait_until, Control, Runtime, Stack};
 use serde_json::Value;
 
 const NODES: [&str; 3] = ["node1", "node2", "node3"];
@@ -62,7 +62,7 @@ services:
     entrypoint: ["sh", "-c", "exec /usr/local/bin/keel $$(cat /etc/keel/args)"]
     environment: [NO_COLOR=1]
     volumes: ["./{node}.yaml:/etc/keel/node.yaml:ro", "./{node}-config:/etc/keel/config", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
-    ports: ["80", "10789"]
+    ports: ["80", "443", "10789"]
     networks: {{ net: {{ ipv4_address: {ip} }} }}
 "#,
             ip = ip(node)
@@ -113,6 +113,8 @@ fn lb_config(extra_vhosts: &str) -> String {
         r#"
 listeners:
   - address: 0.0.0.0:80
+  - address: 0.0.0.0:443
+    tls: true
 pools:
   web:
     backends:
@@ -277,6 +279,14 @@ impl Cluster {
         wait_until(&format!("voters {want:?}"), Duration::from_secs(90), || {
             Ok((self.voters(from).ok() == Some(want.clone())).then_some(()))
         })
+    }
+
+    /// A file of `node`'s config directory, read inside the node: the
+    /// directory belongs to the node's user and is private to it.
+    fn config_file(&self, node: &str, rel: &str) -> Result<Option<String>> {
+        let path = format!("/etc/keel/config/{rel}");
+        let out = self.stack.exec(node, &["sh", "-c", &format!("test -f {path} && cat {path}")])?;
+        Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 
     fn read_node_id_file(&self, node: &str) -> Result<String> {
@@ -586,7 +596,7 @@ fn a_pushed_file_set_is_written_to_every_config_directory_and_replaces_it() -> R
     for node in NODES {
         cluster.serves_marker(node)?;
         wait_until(&format!("{node} wrote the pushed file"), Duration::from_secs(30), || {
-            Ok((cluster.stack.read_file(&format!("{node}-config/vhosts/pushed.yaml"))?.as_deref() == Some(marker.as_str())).then_some(()))
+            Ok((cluster.config_file(node, "vhosts/pushed.yaml")?.as_deref() == Some(marker.as_str())).then_some(()))
         })?;
     }
 
@@ -595,7 +605,7 @@ fn a_pushed_file_set_is_written_to_every_config_directory_and_replaces_it() -> R
     for node in NODES {
         cluster.not_serving_marker(node)?;
         wait_until(&format!("{node} deleted the file"), Duration::from_secs(30), || {
-            Ok(cluster.stack.read_file(&format!("{node}-config/vhosts/pushed.yaml"))?.is_none().then_some(()))
+            Ok(cluster.config_file(node, "vhosts/pushed.yaml")?.is_none().then_some(()))
         })?;
     }
     Ok(())
@@ -610,7 +620,7 @@ fn an_invalid_push_is_refused_and_changes_nothing() -> Result<()> {
     let err = cluster.push(&leader, file_set(&[("keel.yaml", broken)])).expect_err("must be refused").to_string();
     assert!(err.contains("config not pushed") && err.contains("nowhere"), "{err}");
     for node in NODES {
-        assert_eq!(cluster.stack.read_file(&format!("{node}-config/keel.yaml"))?, Some(lb_config("")), "{node} files unchanged");
+        assert_eq!(cluster.config_file(node, "keel.yaml")?, Some(lb_config("")), "{node} files unchanged");
     }
     Ok(())
 }
@@ -682,6 +692,41 @@ fn revoke_all_locks_out_every_earlier_keelconfig() -> Result<()> {
         let addr = cluster.stack.addr(node, 10789)?;
         wait_until(&format!("{node} accepts the new keelconfig"), Duration::from_secs(30), || {
             Ok(fresh.request(addr, &ControlRequest::Status).ok())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -> Result<()> {
+    let cluster = Cluster::up("config-cert-file")?;
+    let key = rcgen::KeyPair::generate()?;
+    let cert = rcgen::CertificateParams::new(vec!["tls.test".to_owned()])?.self_signed(&key)?;
+    let vhost = "  - host: tls.test\n    pool: web\n    tls:\n      cert: certs/tls.crt\n      key: certs/tls.key\n";
+
+    // The certificate exists only in the pushed set; no node has it on disk.
+    cluster.push(
+        &cluster.leader()?,
+        file_set(&[
+            ("keel.yaml", lb_config(vhost)),
+            ("certs/tls.crt", cert.pem()),
+            ("certs/tls.key", key.serialize_pem()),
+        ]),
+    )?;
+    for node in NODES {
+        let addr = cluster.stack.addr(node, 443)?;
+        wait_until(&format!("{node} serves the pushed certificate"), Duration::from_secs(60), || {
+            Ok(served_certificate(addr, "tls.test").ok().filter(|der| der == cert.der().as_ref()))
+        })?;
+        assert!(cluster.config_file(node, "certs/tls.crt")?.is_some(), "{node} wrote it");
+    }
+
+    // A set without the vhost and the files removes both everywhere.
+    cluster.push(&cluster.leader()?, file_set(&[("keel.yaml", lb_config(""))]))?;
+    for node in NODES {
+        wait_until(&format!("{node} dropped the certificate files"), Duration::from_secs(60), || {
+            Ok(cluster.config_file(node, "certs/tls.key")?.is_none().then_some(()))
         })?;
     }
     Ok(())

@@ -108,6 +108,8 @@ certificates:
     issuer: default        # optional; "default" when omitted
 ```
 
+Issued certificates live in `acme.storage` (default `/var/lib/keel/acme`), never in the config directory: a push replaces that directory, and the storage path must be absolute and outside it.
+
 Because `certificates:` is a top-level list, like `vhosts:`, any file of the config directory can declare its own entries alongside its pools:
 
 ```yaml

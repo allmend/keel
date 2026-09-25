@@ -200,6 +200,7 @@ mod tests {
         Config {
             path: String::new(),
             node_yaml: String::new(),
+            files: Default::default(),
             keel: KeelConfig::default(),
             listeners: vec![],
             metrics: MetricsConfig::default(),

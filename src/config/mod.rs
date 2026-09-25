@@ -158,8 +158,14 @@ pub fn assemble(node_yaml: &str, files: &FileSet) -> Result<Config> {
         cfg.certificates.extend(fragment.certificates);
     }
 
+    cfg.files = files.clone();
     cfg.validate()?;
     Ok(cfg)
+}
+
+/// A relative path in the config names a file of the config directory.
+fn relative_key(path: &str) -> Option<&str> {
+    (!std::path::Path::new(path).is_absolute()).then(|| path.trim_start_matches("./"))
 }
 
 /// A file of the config directory other than its root `keel.yaml`.
@@ -188,6 +194,11 @@ pub struct Config {
     /// every replicated version against it.
     #[serde(skip, default)]
     pub node_yaml: String,
+
+    /// The config directory's files this config was built from — set by
+    /// assemble(). Relative file paths in the config resolve against it.
+    #[serde(skip, default)]
+    pub files: FileSet,
 
     #[serde(default)]
     pub keel: KeelConfig,
@@ -478,6 +489,76 @@ impl Config {
             }
         }
         self.validate_acme()?;
+        self.validate_paths()?;
+        Ok(())
+    }
+
+    /// Read a file the config names. A relative path is a file of the config
+    /// directory, taken from the set this config was built from — so a pushed
+    /// version brings its certificates with it, before any of it is written
+    /// to disk. An absolute path is read from this node's disk.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        match relative_key(path) {
+            Some(key) => self
+                .files
+                .get(key)
+                .map(|text| text.as_bytes().to_vec())
+                .with_context(|| format!("{path} is not in the config directory")),
+            None => fs::read(path).with_context(|| format!("cannot read {path}")),
+        }
+    }
+
+    /// Relative file paths must be files of the config directory, so a set
+    /// that names a certificate it does not carry is refused before it is
+    /// committed. Directories Keel writes to are node-local and absolute, and
+    /// issued certificates never go into the config directory, which a push
+    /// replaces.
+    fn validate_paths(&self) -> Result<()> {
+        let carried = |owner: String, field: &str, path: &Option<String>| -> Result<()> {
+            match path.as_deref().and_then(relative_key) {
+                Some(key) if !self.files.contains_key(key) => {
+                    anyhow::bail!("{owner}: {field} '{key}' is not in the config directory")
+                }
+                _ => Ok(()),
+            }
+        };
+        for v in &self.vhosts {
+            if let Some(tls) = &v.tls {
+                carried(format!("vhost '{}'", v.host), "tls.cert", &tls.cert)?;
+                carried(format!("vhost '{}'", v.host), "tls.key", &tls.key)?;
+            }
+        }
+        for c in &self.certificates {
+            carried(format!("certificate '{}'", c.host), "cert", &c.cert)?;
+            carried(format!("certificate '{}'", c.host), "key", &c.key)?;
+        }
+        for l in &self.listeners {
+            carried(format!("listener '{}'", l.address), "tls_ca", &l.tls_ca)?;
+        }
+
+        let absolute = |field: &str, path: &str| -> Result<()> {
+            if !std::path::Path::new(path).is_absolute() {
+                anyhow::bail!("{field} must be an absolute path, got '{path}': Keel writes there, on each node");
+            }
+            Ok(())
+        };
+        if self.access_log.dir != "-" {
+            absolute("access_log.dir", &self.access_log.dir)?;
+        }
+        if let Some(disk) = &self.cache.disk {
+            absolute("cache.disk.path", &disk.path)?;
+        }
+        if let Some(acme) = &self.acme {
+            absolute("acme.storage", &acme.storage)?;
+            let config_dir = std::path::Path::new(&self.keel.config_dir);
+            if std::path::Path::new(&acme.storage).starts_with(config_dir) {
+                anyhow::bail!(
+                    "acme.storage '{}' is inside the config directory ({}); a push replaces that directory, so issued certificates live elsewhere",
+                    acme.storage,
+                    config_dir.display()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1396,6 +1477,39 @@ mod tests {
         let set = read_config_dir(&dir).unwrap();
         assert_eq!(set.keys().map(String::as_str).collect::<Vec<_>>(), vec!["keel.yaml", "vhosts/b.yaml"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const TLS_ROOT: &str = "listeners:\n  - address: 0.0.0.0:443\n    tls: true\npools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n    tls:\n      cert: certs/a.crt\n      key: ./certs/a.key\n";
+
+    #[test]
+    fn relative_file_paths_come_from_the_config_directory() {
+        let set = files(&[("keel.yaml", TLS_ROOT), ("certs/a.crt", "CERT"), ("certs/a.key", "KEY")]);
+        let cfg = assemble("", &set).unwrap();
+        assert_eq!(cfg.read_file("certs/a.crt").unwrap(), b"CERT");
+        assert_eq!(cfg.read_file("./certs/a.key").unwrap(), b"KEY");
+        let abs = std::env::temp_dir().join(format!("keel-abs-{}.crt", std::process::id()));
+        std::fs::write(&abs, "DISK").unwrap();
+        assert_eq!(cfg.read_file(abs.to_str().unwrap()).unwrap(), b"DISK", "absolute paths read from disk");
+        let _ = std::fs::remove_file(&abs);
+    }
+
+    #[test]
+    fn a_relative_file_the_set_does_not_carry_is_refused() {
+        let err = assemble_err("", &files(&[("keel.yaml", TLS_ROOT), ("certs/a.crt", "CERT")]));
+        assert!(err.contains("vhost 'a.test': tls.key 'certs/a.key' is not in the config directory"), "{err}");
+    }
+
+    #[test]
+    fn directories_keel_writes_to_are_absolute_and_outside_the_config_directory() {
+        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}access_log:\n  dir: logs\n"))]));
+        assert!(err.contains("access_log.dir must be an absolute path"), "{err}");
+        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}cache:\n  disk:\n    path: cache\n    size: 1M\n"))]));
+        assert!(err.contains("cache.disk.path must be an absolute path"), "{err}");
+        let acme = |storage: &str| format!("{ROOT}acme:\n  storage: {storage}\n  issuers:\n    default:\n      email: a@b.test\n");
+        let err = assemble_err("", &files(&[("keel.yaml", &acme("/etc/keel/config/acme"))]));
+        assert!(err.contains("inside the config directory"), "{err}");
+        let err = assemble_err("", &files(&[("keel.yaml", &acme("acme"))]));
+        assert!(err.contains("acme.storage must be an absolute path"), "{err}");
     }
 
     #[test]

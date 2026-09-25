@@ -8,6 +8,32 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Certificates travel with the config.** A relative `tls.cert`, `tls.key`,
+  `certificates:` `cert`/`key` or `tls_ca` is a file of the config directory:
+  in a cluster the push carries it, and every node reads it from the pushed
+  version itself. Absolute paths are read from each node's disk, as before.
+  A set that names a relative file it does not hold is refused, naming the
+  vhost, certificate entry or listener. See
+  [Files the config names](docs/configuration.md#files-the-config-names).
+
+### Changed
+
+- **BREAKING:** a relative certificate or CA path resolves against the config
+  directory, no longer against Keel's working directory.
+- **BREAKING:** `access_log.dir`, `cache.disk.path` and `acme.storage` must be
+  absolute, and `acme.storage` must lie outside the config directory.
+
+### Security
+
+- Everything Keel writes that can hold a private key is `0600` in a `0700`
+  directory: the state directory, the Raft store, and private keys a pushed
+  version writes into the config directory. Keel takes ownership of a
+  directory only when its user does not own it yet, so a group set by an
+  administrator afterwards is kept. [Where secrets are stored](docs/security.md#where-secrets-are-stored)
+  lists every such path.
+
 ---
 
 ## [0.20.0] — 2026-09-24
