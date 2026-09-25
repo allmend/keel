@@ -189,10 +189,10 @@ keel config push /etc/keel/config
 config version 42 committed; every node applies it
 ```
 
-- A directory is pushed as it is: every file by relative path, certificates included. A single file is pushed as the set's `keel.yaml`, and the set holds nothing else.
-- The set replaces the current version: files it no longer has are deleted on every node.
-- It is built against this node's node file before it is committed; a set that does not load is refused with the reason (`config not pushed: …`).
-- Any node: a follower forwards the push to the leader.
+- A directory is pushed with every file by relative path, certificates included. A single file is pushed as `keel.yaml`, alone.
+- The set replaces the current version. Files it no longer has are deleted on every node.
+- It is validated before commit. An invalid set is refused with the reason (`config not pushed: …`).
+- Any node accepts it. A follower forwards it to the leader.
 - Without a reachable majority it fails at once: `no quorum: 1 of 3 members reachable; config not pushed`.
 
 See [Config replication](cluster.md#config-replication).

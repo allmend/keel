@@ -381,30 +381,31 @@ Names starting with `.` (editor and temporary files) are skipped. Every file mus
 
 ### Files the config names
 
-`tls.cert`, `tls.key`, the `cert` and `key` of `certificates:` entries, and a listener's `tls_ca` name files Keel reads:
+`tls.cert`, `tls.key`, `cert` and `key` of `certificates:` entries, and a listener's `tls_ca` name files:
 
-| Path | Resolves to | Reaches every node by |
+| Path | Read from | Distributed by |
 |---|---|---|
-| relative, e.g. `certs/api.crt` | a file of the config directory (`/etc/keel/config/certs/api.crt`) | the config directory itself — in a cluster, every push carries it |
-| absolute, e.g. `/etc/keel/certs/int.crt` | as written, on each node's disk | the operator (configuration management) |
+| relative, e.g. `certs/api.crt` | the config directory | the config directory; in a cluster, every push |
+| absolute, e.g. `/etc/keel/certs/int.crt` | each node's disk | the operator |
 
-A relative path the config directory does not hold is a load error — and in a cluster a refused push — naming the vhost, certificate entry or listener. A missing absolute file is a load error naming the file and where it is used. Certificates are PEM files; the config never holds a key inline.
+A relative path the config directory does not hold is a load error, and in a cluster a refused push. A missing absolute file is a load error. Both errors name the vhost, certificate entry or listener. Keys are PEM files, never inline in the config.
 
-Directories Keel writes to — `access_log.dir`, `cache.disk.path`, `acme.storage` — must be absolute: they are node-local. `acme.storage` must also lie outside the config directory: a push replaces that directory, and issued certificates are Keel's, not the operator's.
+`access_log.dir`, `cache.disk.path` and `acme.storage` are directories Keel writes to on each node, and must be absolute. `acme.storage` must be outside the config directory, which a push replaces.
 
 ### In a cluster
 
-The config directory is the replicated config: every node holds the same files. The same content exists in three forms — the committed entry in Raft, its copy in each node's Raft store on disk, and the files under `/etc/keel/config/`, which a node rewrites after it applied a version. The files are for editing and inspection; the node file is never replicated.
+The config directory is identical on every node. The same content exists three times: the committed entry in Raft, each node's Raft store on disk, and the files under `/etc/keel/config/`. The files are for editing and inspection. The node file is never replicated.
 
-Each push is a **version**: the whole file set, keyed by relative path, committed through Raft (the version number is its log index). Every node builds the version against its own node file, applies it, and only then writes it into its config directory — so the directory always holds the last version that worked on that node. Files a version no longer has are deleted. A version that fails on a node leaves that node serving the previous one, logged as `config version cannot be applied`, files untouched.
+Each push is a version: the whole file set by relative path, committed through Raft. The version number is its log index. Each node builds a version against its own node file, applies it, then writes the files. The directory therefore holds the last version that worked on that node. Files missing from a version are deleted. A version that fails on a node leaves it on the previous one, logs `config version cannot be applied`, and leaves the files unchanged.
 
 A new version comes from:
-- `keel config push <dir>` or `keelctl config push <dir>` — a directory as it is, or a single file as its `keel.yaml`; a follower forwards the push to the leader
-- `SIGHUP` or `keel config reload` on a node — that node's config directory becomes the next version
-- starting a node whose config files differ from the version it last applied — they were edited while it was stopped, and the later push wins
-- the first start of a new cluster — the bootstrap node's files become the first version
 
-A push is built against the node file before it is committed, so a version that does not load is refused. Without a reachable majority a push fails at once: `no quorum: 1 of 3 members reachable; config not pushed`. Traffic is unaffected either way.
+- `keel config push <dir>` or `keelctl config push <dir>`. A single file is pushed as `keel.yaml`. A follower forwards the push to the leader.
+- `SIGHUP` or `keel config reload` on a node: its config directory becomes the next version.
+- Starting a node whose files differ from the version it last applied. The later push wins.
+- The first start of a new cluster: the bootstrap node's files become version 1.
+
+A push is validated before it is committed. Without a reachable majority it fails at once: `no quorum: 1 of 3 members reachable; config not pushed`. Traffic is unaffected either way.
 
 ---
 

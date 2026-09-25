@@ -22,9 +22,9 @@ See [Cluster](cluster.md) for the full join flow.
 
 ## Peer identity
 
-Every node's certificate is issued by the cluster CA and names the node: `CN=keel-node-<id>`. The handshake proves a peer holds a certificate from the cluster CA; beyond that, each request that names a sender — a Raft message's vote, a stepdown's node — must name the node its certificate belongs to, or it is refused and logged. A member's certificate therefore cannot vote, replicate, or step down in another member's name.
+Node certificates are issued by the cluster CA and name the node: `CN=keel-node-<id>`. A request that names a sender (a Raft vote, replicated entries, a stepdown) is refused and logged unless the sender is the node in the certificate. One member's certificate cannot act for another member.
 
-The cluster CA's key is committed to Raft, so every member holds it — in memory and in its Raft store under `keel.state_dir` — and any member can admit joiners. A compromised member holds the key.
+Every member holds the cluster CA key, in memory and in its Raft store, so any member can admit joiners. A compromised member exposes the key.
 
 ---
 
@@ -139,19 +139,19 @@ A Raft snapshot that fails to deserialize is returned as a storage error and sur
 
 ## Where secrets are stored
 
-Everything Keel writes that can hold a private key is mode `0600` in a `0700` directory:
+Files that can hold a private key are `0600` in a `0700` directory:
 
 | Path | Holds |
 |---|---|
-| `keel.state_dir` (`/var/lib/keel`), `0700` | `node.key` — the node's mTLS key |
-| `raft/store.redb` in the state directory | the replicated state: cluster CA key, control CA key, ACME certificates and keys, pushed config — including keys a pushed set carries |
-| `control/` in the state directory | the control CA (`ca.key`), which signs operator credentials |
-| `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys and ACME account keys |
-| the config directory (`/etc/keel/config/`) in a cluster | private keys the config names by relative path, written `0600`; Keel makes the directory `0700` |
+| `keel.state_dir` (`/var/lib/keel`) | `node.key`, the node's mTLS key |
+| `raft/store.redb` in the state directory | cluster and control CA keys, ACME keys, pushed config including its keys |
+| `control/` in the state directory | the control CA key, which signs operator credentials |
+| `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys, ACME account keys |
+| the config directory, in a cluster | keys the config names by relative path |
 
-Leave these out of backups that are not handled as secrets, or back them up deliberately. The node file, `/etc/keel/node.yaml`, can hold the cluster secret; it is the operator's file, and Keel never writes it.
+Exclude these from backups, or back them up as secrets. `/etc/keel/node.yaml` can hold the cluster secret; Keel never writes it.
 
-Keel gives a directory it needs to `keel.user` only when that user does not own it yet — a new directory, or a volume that appears owned by root. Once Keel's user owns it, Keel leaves it alone, so a group set afterwards (for example, for a log shipper reading `access_log.dir`) survives restarts.
+Keel chowns a directory to `keel.user` only when that user does not own it, e.g. a new directory or a root-owned volume. A group set afterwards is kept.
 
 ---
 

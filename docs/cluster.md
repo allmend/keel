@@ -70,7 +70,7 @@ keel --cluster --join 10.0.0.1:7654 --secret mysecret
 
 The joining node contacts the address given to `--join`, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group.
 
-Any member admits new nodes: `--join` takes the announced address of any member, including the port. The member issues the node certificate from the replicated cluster CA; membership changes happen on the leader, so a member that is not the leader forwards the join there. A join that arrives before the bootstrap node has committed the CA — in the first seconds of a new cluster — is closed with `join before the cluster CA is committed` logged, and the joiner retries.
+Any member admits new nodes: `--join` takes the announced address of any member, including the port. The member issues the node certificate; a follower forwards the membership change to the leader. A join before the bootstrap node has committed the CA is closed (`join before the cluster CA is committed`), and the joiner retries.
 
 A new node joins as a **learner** (it receives the log but holds no quorum weight). Once its log has caught up — typically within seconds — the leader automatically promotes it to **voter**, at which point it counts toward quorum as described in the node count table above. `keel cluster status` shows each member's role.
 
@@ -84,29 +84,41 @@ segment cannot read them, and a peer without the secret cannot decrypt or forge 
 
 ### Restarts
 
-Each node keeps its Raft state on disk in `raft/store.redb` under `keel.state_dir` (default `/var/lib/keel`): the log, its vote, the committed index, and the latest snapshot. Everything the cluster replicates lives there — pushed config, the cluster and control CAs, ACME certificates and challenges, drain entries. Every write is on disk before Raft counts it.
+Each node stores its Raft state in `raft/store.redb` under `keel.state_dir` (default `/var/lib/keel`): log, vote, committed index and latest snapshot. The store holds everything the cluster replicates: pushed config, the cluster and control CAs, ACME certificates and challenges, drain entries.
 
-A node with stored state restarts from it: it recovers its membership, catches up from the leader, and takes part in a normal election. It needs neither `--bootstrap` nor `--join`; given either, it logs `restarting from stored state; --bootstrap and --join are ignored` — so a restarted bootstrap node never forms a second cluster, and it keeps the cluster CA. After a full cluster restart the nodes elect a leader among themselves and serve the committed config.
+A node with stored state restarts from it:
 
-Besides `raft/`, the state directory holds the node's identity: `node_id`, `node.crt`, `node.key` (mode `0600`), `cluster-ca.crt`, and `members.yaml`, the last known members (ID, address, role), rewritten on every membership change.
+- It recovers its membership, catches up from the leader and takes part in a normal election.
+- `--bootstrap` and `--join` are ignored, and logged as such. A restarted bootstrap node keeps its cluster and its CA.
+- After a full cluster restart the nodes elect a leader and serve the committed config.
+
+The state directory also holds `node_id`, `node.crt`, `node.key` (`0600`), `cluster-ca.crt` and `members.yaml`, the last known members, rewritten on every membership change.
 
 ### Lost or damaged Raft state
 
-A store Keel cannot read stops nothing but the control plane. The node logs `Raft store unreadable and set aside`, moves `raft/` to `raft.corrupt-<time>/` for inspection, and starts: its listeners serve its local config while it rejoins. A node without Raft state rejoins through the members listed in `members.yaml` (and `--join`, if given) — never by bootstrapping, whatever its flags say. The leader removes the old member and adds the node back as a **learner**: it receives the log but does not vote until its log has caught up and it is promoted. A voter that forgot its votes and log could otherwise help elect a leader missing a committed entry.
+If the store cannot be read, the node:
 
-A node whose `members.yaml` lists only itself was a one-member cluster: it starts a new one, logging that drain state and history are gone.
+1. Logs `Raft store unreadable and set aside` and moves `raft/` to `raft.corrupt-<time>/`.
+2. Serves traffic from its local config.
+3. Rejoins through the members in `members.yaml`, and `--join` if given. It never bootstraps.
 
-The same rejoin applies when a node's stored address differs from its `advertise`: it moves `raft/` to `raft.moved-<time>/` and rejoins at the new address under its node ID. A one-member cluster updates its own membership instead.
+The leader removes the old member and adds the node back as a learner. It votes again once its log has caught up and it is promoted: a voter that lost its log could help elect a leader missing a committed entry.
+
+If `members.yaml` lists only the node itself, it starts a new one-member cluster. Drain state and history are lost, and logged as lost.
+
+A node whose stored address differs from `advertise` rejoins the same way, with the store moved to `raft.moved-<time>/`. A one-member cluster updates its own membership instead.
 
 ### Forced recovery
 
-When a majority of the voters is gone for good, the survivors cannot commit anything, including a membership change. Start one survivor with `--force-new-cluster`:
+If a majority of the voters is gone for good, the rest cannot commit anything. Start one survivor with `--force-new-cluster`:
 
 ```bash
 keel --cluster --force-new-cluster --secret mysecret
 ```
 
-It keeps its stored state and makes itself the only member: the committed config, CAs and certificates stay, and it serves writes again. Other nodes join it with `--join` after their `raft/` directory is moved aside. Only use it for members that are gone for good: a member that comes back still holds the old membership and forms a cluster of its own with any peers it can reach.
+It keeps its stored state and becomes the only member. Other nodes join it with `--join` after moving their `raft/` aside.
+
+Use it only for members that will not return. A returning member still holds the old membership and forms a separate cluster with the peers it reaches.
 
 ---
 
@@ -131,53 +143,53 @@ The other nodes connect to `advertise`, or to `addr` when `advertise` is not set
 
 ## Node identity
 
-Each node has a random 64-bit node ID. It is generated on first start and stored in `node_id` in `keel.state_dir` (default `/var/lib/keel/node_id`); every later start, reboot, or upgrade reads it back. The ID is not a setting. A `node_id` file that cannot be read or parsed stops the node from starting — Keel never picks a new ID in its place. Started as root, Keel creates the state directory and assigns it to `keel.user` before dropping privileges.
+Each node has a random 64-bit node ID, generated on first start and stored in `node_id` in `keel.state_dir`. It is not a setting and never changes. A `node_id` file that cannot be read stops the node from starting.
 
-`keel cluster status` shows each member's ID and address, and the node's own ID. The node certificate carries it as `CN=keel-node-<id>`.
+`keel cluster status` shows every member's ID. The node certificate carries it as `CN=keel-node-<id>`.
 
-A join with an ID that is already a member is handled by where it comes from:
+A join with an ID that is already a member:
 
-| Join comes from | Result |
+| Join from | Result |
 |---|---|
-| The member's registered address | The node rejoins (a restart) |
-| Another address, and the registered address still answers | Refused: the joiner holds a copy of the member's state directory — a cloned VM or a copied disk. It exits with `join rejected: node ID … is a member at …, which still answers; … holds a copy of its state directory` |
-| Another address, and the registered address does not answer | The node has moved. The leader removes the old member; the node joins again as a learner at its new address and is promoted to voter once its log has caught up |
+| The member's address | The node lost its Raft state. The leader removes the member and adds it back as a learner |
+| Another address, member still answers | Refused: a copied state directory, e.g. a cloned VM. `join rejected: node ID … is a member at …, which still answers; … holds a copy of its state directory` |
+| Another address, member silent | The node moved. Handled like lost state, at the new address |
 
-To give a copied machine an identity of its own, delete `node_id` from its state directory before it first starts.
+To give a copied machine its own identity, delete its `node_id` before it first starts.
 
 ---
 
 ## Cluster CA
 
-The bootstrap node generates the cluster CA once and commits its certificate and key to Raft. Every member holds the CA in memory, so every member can issue node certificates to joining nodes; a node that joins later receives it with the rest of the replicated state.
+The bootstrap node generates the cluster CA once and commits certificate and key to Raft. Every member can issue node certificates to joining nodes.
 
-Each node certificate names its node: `CN=keel-node-<id>`. A peer request that names a sender — Raft messages carry the sender's vote, a stepdown names the node leaving — is refused unless the sender is the node the certificate names, so a member cannot speak for another member.
+A peer request that names a sender (a Raft vote, a stepdown) is refused unless the sender is the node in the certificate's `CN=keel-node-<id>`.
 
-Keel always generates the cluster CA; bringing your own is not supported, and `--ca-cert`, `--ca-key`, `cluster.ca_cert` and `cluster.ca_key` are refused. The cluster CA cannot be rotated in place.
+Bringing your own CA is not supported: `--ca-cert`, `--ca-key`, `cluster.ca_cert` and `cluster.ca_key` are refused. The cluster CA cannot be rotated in place.
 
 ---
 
 ## Config replication
 
-The config directory, `/etc/keel/config/`, is the replicated config: every node holds the same files, and every change is a new **version** committed through Raft. The node file, `/etc/keel/node.yaml`, is never replicated. See [Files and layout](configuration.md#in-a-cluster) for the full model.
+The config directory, `/etc/keel/config/`, is identical on every node. Each change is a new version, committed through Raft. `/etc/keel/node.yaml` is never replicated. See [In a cluster](configuration.md#in-a-cluster).
 
 ```bash
-keel config push /etc/keel/config     # or keelctl config push ./config from a workstation
+keel config push /etc/keel/config
 config version 42 committed; every node applies it
 ```
 
-- **Any node.** A follower forwards the push to the leader over the mTLS peer channel.
-- **The whole set.** A push carries every file of the directory by relative path, certificates included; a single file is pushed as the set's `keel.yaml`. Files a version no longer has are deleted on every node.
-- **Checked before commit.** The set is built against the receiving node's node file, and again on the leader; a set that does not load is refused with the reason, and nothing changes.
-- **Quorum.** Without a reachable majority the push fails at once, naming how many members are reachable. Traffic on every node is unaffected.
-- **Files after apply.** Each node applies a version, then writes it into its config directory and records it as the version it serves. A version that fails on a node leaves that node on the previous one, files untouched.
+- Any node accepts a push. A follower forwards it to the leader.
+- A push carries every file by relative path, certificates included. A single file is pushed as `keel.yaml`. Files missing from a version are deleted on every node.
+- The set is validated before commit, on the receiving node and on the leader. An invalid set is refused with the reason.
+- Without a reachable majority the push fails at once, naming how many members answered.
+- A node writes the files only after it applied the version. A version that fails on a node leaves it on the previous one, files unchanged.
 
-`SIGHUP` or `keel config reload` on a node pushes that node's config directory as the next version, and a node whose files were edited while it was stopped pushes them when it starts. The first start of a new cluster seeds the first version from the bootstrap node's files.
+`SIGHUP` or `keel config reload` pushes the node's config directory. A node whose files changed while it was stopped pushes them at start. A new cluster takes its first version from the bootstrap node's files.
 
-A version is applied the same way as a local [hot reload](configuration.md#hot-reload):
+Versions apply like a local [hot reload](configuration.md#hot-reload):
 
-- Applied: virtual host routing rules, TLS certificates, backends removed from a pool (they drain).
-- Not applied until restart: backends added to a pool, weights, algorithms, `health_check`, `passive`, listeners, and the `cache`, `access_log` and `acme` sections.
+- Applied: vhost rules, TLS certificates, removed backends (they drain).
+- Restart needed: added backends, weights, algorithms, `health_check`, `passive`, listeners, and the `cache`, `access_log` and `acme` sections.
 
 ---
 
