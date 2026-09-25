@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.21.0] — 2026-09-25
+
 ### Added
 
 - **Certificates travel with the config.** A relative `tls.cert`, `tls.key`,
@@ -918,7 +922,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/allmend/keel/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/allmend/keel/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/allmend/keel/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/allmend/keel/compare/v0.17.0...v0.18.0
