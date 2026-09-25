@@ -93,8 +93,8 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ### Container image
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.21.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.21.0
+docker pull ghcr.io/allmend/keel:0.22.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.22.0
 ```
 
 ### Prebuilt binaries
@@ -241,7 +241,7 @@ All inter-node traffic is mTLS and the join exchange itself is encrypted with a 
 
 ## Status
 
-Keel is at v0.21.0, alpha quality. Core proxy, TLS + ACME (HTTP-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, and protocol health checks with passive detection are implemented and working. TLS is terminated with rustls on Pingora 0.9, HTTPS offers HTTP/2, and FreeBSD binaries are published alongside the Linux ones. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
+Keel is at v0.22.0, alpha quality. Core proxy, TLS + ACME (HTTP-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, and protocol health checks with passive detection are implemented and working. TLS is terminated with rustls on Pingora 0.9, HTTPS offers HTTP/2, and FreeBSD binaries are published alongside the Linux ones. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
 
 v0.14.0 withdrew the API gateway rules and ACME DNS-01 (see above). Upgrading
 from 0.12.x or 0.13.x: delete `rate_limit`, `headers`, `rewrite`, and
