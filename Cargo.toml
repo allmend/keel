@@ -3,7 +3,7 @@ members = ["crates/keel-control", "crates/keelctl", "tests/e2e"]
 
 [package]
 name = "keel"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 authors = ["Allmend Contributors"]
 license = "Apache-2.0"

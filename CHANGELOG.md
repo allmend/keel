@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.23.0] — 2026-09-25
+
 ### Changed
 
 - **ACME follows a reload.** Hosts, issuers and `certificates:` entries added
@@ -953,7 +957,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/allmend/keel/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/allmend/keel/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/allmend/keel/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/allmend/keel/compare/v0.19.0...v0.20.0
