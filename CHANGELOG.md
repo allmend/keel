@@ -8,6 +8,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.24.0] — 2026-09-27
+
 ### Changed
 
 - **BREAKING: one process model for one node and many.** A node is always a
@@ -1018,7 +1022,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/allmend/keel/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/allmend/keel/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/allmend/keel/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/allmend/keel/compare/v0.20.0...v0.21.0
