@@ -19,7 +19,8 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/log/keel /var/run/keel /etc/keel/config /var/lib/keel
+    && mkdir -p /var/log/keel /var/run/keel /etc/keel/config /var/lib/keel \
+    && useradd --system --no-create-home --shell /usr/sbin/nologin keel-control
 
 COPY --from=builder /build/target/release/keel /usr/local/bin/keel
 

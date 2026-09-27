@@ -41,7 +41,7 @@ This listens on port 8080 and proxies all traffic to a single backend at `127.0.
 ./keel --config node.yaml
 ```
 
-Keel forks a root master process that binds the listening ports and spawns worker processes running as the `keel` user. For local testing as the current user, set `keel.user` and `keel.group` to your username, or run as root.
+Started as root, Keel binds the listening ports and the control socket, then forks a control worker running as `keel-control` and worker processes running as `keel`; create both users first. Started as another user, every process runs as that user. The node is a cluster of one: see [Cluster](cluster.md) to add nodes.
 
 ## Verify
 

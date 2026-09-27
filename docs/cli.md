@@ -12,26 +12,18 @@ These flags are used when starting Keel as a server (no subcommand).
 |---|---|---|
 | `--config <path>` | `/etc/keel/node.yaml` | The node file; it names the config directory (`keel.config_dir`). Missing at the default path = every node setting at its default. See [Files and layout](configuration.md#files-and-layout) |
 | `--socket <path>` | `/var/run/keel/keel.sock` | Control socket path |
-| `--cluster` | false | Enable cluster mode |
-| `--bootstrap` | false | Bootstrap a new cluster (requires `--cluster`) |
-| `--join <addr>` | none | Join an existing cluster at this address (requires `--cluster`) |
-| `--secret <secret>` | none | Shared secret for cluster join/bootstrap |
-| `--force-new-cluster` | false | Forced recovery: keep this node's Raft state and make it the only member (requires `--cluster`); see [Forced recovery](cluster.md#forced-recovery) |
+| `--force-new-cluster` | false | Forced recovery: keep this node's Raft state and make it the only member; see [Forced recovery](cluster.md#forced-recovery) |
+
+Whether a node starts a cluster or joins one is set in `node.yaml` (`cluster.join`), not by flags; see [Cluster](cluster.md#starting-a-cluster). `--cluster`, `--bootstrap`, `--join` and `--secret` are refused, with the field that replaced them.
 
 Examples:
 
 ```bash
-# Standalone: /etc/keel/node.yaml and /etc/keel/config/
+# /etc/keel/node.yaml and /etc/keel/config/
 keel
 
 # Another node file
 keel --config /srv/keel/node.yaml
-
-# Cluster — bootstrap first node
-keel --cluster --bootstrap --secret mytoken
-
-# Cluster — join existing cluster
-keel --cluster --join 10.0.0.1:7654 --secret mytoken
 ```
 
 ---
@@ -44,7 +36,7 @@ CLI subcommands communicate with a running Keel instance over a Unix socket. The
 keel --socket /tmp/keel.sock status
 ```
 
-The socket is served by the master process and every command covers the whole instance. Workers are separate processes with no shared memory, so each holds only its own drain state, connection counters and health results; the master queries all of them and merges the results. Each worker has its own socket for this, `worker-<index>.sock` in a `workers/` subdirectory beside the instance socket. In cluster mode the node is a single process and answers directly, for that node only.
+The master binds the socket and the control worker serves it; every command covers the whole node. Workers are separate processes with no shared memory, so each holds only its own connection counters, health results and drain progress; the control worker queries all of them and merges the results. Each worker has its own socket for this, `worker-<index>.sock` in a `workers/` subdirectory beside the instance socket. The socket belongs to `keel.control_user` and its group (`0660`); workers cannot open it.
 
 A worker that does not answer within five seconds is excluded from the merged result and logged; the command reports what the remaining workers returned. `keel backend drain` reports how many workers applied the drain and warns when that is fewer than all of them, since a worker that missed it continues to send new connections to the backend. `keel backend drain --wait` reports the connection count as unknown and keeps waiting when no worker answers, rather than treating it as zero.
 
@@ -115,11 +107,11 @@ Stop routing new requests to a backend and optionally wait until all active conn
 keel backend drain <address> [--wait]
 ```
 
-The `address` must match exactly how it appears in the config (e.g. `10.0.0.1:8080`). If the address appears in multiple pools it is drained from all of them.
+The `address` must match exactly how it appears in the config (e.g. `10.0.0.1:8080`). If the address appears in multiple pools it is drained from all of them. An address in no pool is refused before anything is committed.
 
 Without `--wait`, the command applies the drain, prints `Drain complete.` and returns. The message means the drain was applied; the backend is in the `draining` state and keeps its open connections until they end.
 
-The drain is applied in every worker, and the master re-applies it to any worker it restarts, so a worker that crashes mid-drain returns with the backend still draining. Drain state is held by the running master and is not written to the config: after a full restart every backend is `active` again.
+The drain is applied at once in every worker of the receiving node, then committed through Raft, which applies it on every other node. It is stored with the cluster state, not in the config: it outlives restarts of a worker, the control worker and the node. Committing needs a majority of the voters; without one the command fails after the receiving node has drained.
 
 With `--wait`, the command blocks until the backend reaches zero active connections, summed across all workers. The count is polled every 500 ms and updated in place on one line:
 
@@ -133,9 +125,7 @@ Draining 10.0.0.1:8080 from pools: web
 Drain complete (22s elapsed).
 ```
 
-A drained backend stays `removed` until Keel restarts; there is no command to return it to service, and a config reload does not re-activate it.
-
-In cluster mode the drain applies to the node that receives the command only; it is not replicated. See [Cluster](cluster.md#drain-in-cluster-mode).
+A drained backend stays drained; there is no command to return it to service yet, and a config reload does not re-activate it. See [Cluster](cluster.md#drain).
 
 ---
 
@@ -151,9 +141,7 @@ Not supported: the command always fails and prints the instruction to add the ba
 
 ## keel config reload
 
-On a single node: reload the node file and the config directory. Equivalent to sending `SIGHUP` to the master process — the master forwards it to every worker, so all of them reload.
-
-In a cluster: push this node's config directory as the next version, like `keel config push` with that directory; the answer names the committed version.
+Push this node's config directory as the next version, like `keel config push` with that directory; the answer names the committed version. `SIGHUP` to the master does the same.
 
 ```bash
 keel config reload
@@ -162,12 +150,12 @@ keel config reload
 On success:
 
 ```
-config reload triggered
+config version 43 committed; every node applies it
 ```
 
-The reload runs asynchronously after the command returns; a config that fails to load is logged and the previous one stays active.
+A directory that does not load is refused with the reason, and nothing is committed.
 
-What reloads: virtual host rules, TLS certificates, backends removed from a pool (they are drained).
+What reloads: virtual host rules, TLS certificates, ACME hosts, backends removed from a pool (they are drained).
 
 What does not reload without a restart: backends added to a pool, backend weights, algorithms, `health_check`, `passive`, listener ports, worker count. See [Hot reload](configuration.md#hot-reload) for the details.
 
@@ -176,7 +164,7 @@ What does not reload without a restart: backends added to a pool, backend weight
 
 ## keel config push
 
-Commit a config directory as the cluster's next version. Only available in cluster mode; in standalone the command fails with `not in cluster mode`.
+Commit a config directory as the next version; every node applies it.
 
 ```bash
 keel config push <dir|file>
@@ -224,8 +212,6 @@ Cluster:
 
 Members are shown with their Raft role — `voter` (counts toward quorum) or `learner` (still catching up after join).
 
-Only available in cluster mode.
-
 ---
 
 ## keel cluster demote
@@ -235,8 +221,6 @@ Trigger a new leader election from the current leader. The node stays a voting m
 ```bash
 keel cluster demote
 ```
-
-Only available in cluster mode.
 
 ---
 
@@ -267,8 +251,6 @@ node 3 removed from cluster membership (committed by quorum). It is safe to stop
 ```
 
 The node keeps serving traffic until you stop the process. See [Cluster — Stepping down](cluster.md#stepping-down-removing-a-node) for details and edge cases.
-
-Only available in cluster mode.
 
 ---
 

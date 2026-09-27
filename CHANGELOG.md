@@ -8,6 +8,67 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: one process model for one node and many.** A node is always a
+  cluster: a single node is a cluster of one, with the same processes,
+  commands and stored state as a member of a larger one. The root master
+  binds every socket and forks a **control worker** — Raft, the instance
+  control socket, `control.remote`, ACME — and the workers. The single-process
+  cluster mode is gone. See [Cluster](docs/cluster.md#one-node-or-many).
+- **BREAKING:** the control worker runs as `keel.control_user` (default
+  `keel-control`), which must exist and differ from `keel.user`. It alone can
+  read the state directory — node key, Raft store with both CA keys, ACME
+  account and certificates. Workers get the applied config and the ACME
+  certificates over their control sockets. See
+  [Security](docs/security.md#processes-and-what-each-can-read).
+- **BREAKING: `node.yaml` decides how a node starts.** `--cluster`,
+  `--bootstrap`, `--join` and `--secret` are refused. A node with no stored
+  state and no `cluster.join` starts a cluster of its own; with
+  `cluster.join` it only joins. A node alone in its stored cluster whose
+  `node.yaml` lists `join` refuses to start instead of ignoring it.
+- **BREAKING:** `keel backend drain` is committed through Raft: every node and
+  all its workers apply it, and it outlives restarts. It needs a majority.
+- The master has no async runtime and reads no input: it writes `SIGHUP` and
+  worker restarts to the control worker over a socketpair. A control worker
+  that dies is restarted, the control listeners stay bound meanwhile.
+- HTTP-01 challenge tokens moved from `acme.storage/challenges` to
+  `challenges/` in the runtime directory, readable by the workers.
+- The state and config directories belong to `keel.control_user`, mode
+  `0700`; directories an earlier version gave to `keel.user` are taken over
+  at start. A read-only config directory is served from; writing applied
+  versions back to it is skipped with a warning.
+
+### Added
+
+- `cluster.join` in `node.yaml`: members to join through on first start.
+- `keel status` and every other local command work on every node; before,
+  a cluster node never bound its local socket.
+- Control connections cap their request line (64 MiB); `control.remote`
+  serves at most 64 connections at once, handshakes included.
+- `control.remote.address` or `cluster.addr` on a `listeners:` port is a
+  config error.
+
+### Fixed
+
+- A leader reconnected in a busy loop to a member whose peer port was
+  closed — stopped, or still joining — and starved its own Raft traffic: a
+  refused connection now backs off like any unreachable peer.
+- A joiner waited for good when the member it asked could not get the join
+  committed; it now asks again after 60 seconds, and the leader gives up on
+  the membership change after 30.
+- A master that shut down after a new instance had bound the control socket
+  path removed the new instance's socket.
+- A node restarted from its stored state refused every join with `join
+  before the cluster CA is committed`: the replayed CA never reached the
+  join listener.
+
+### Known limitations
+
+- A cluster node now runs several workers: until metrics are merged per
+  node, `/metrics` shows one worker's view there too, and every worker runs
+  its own health checks.
+
 ---
 
 ## [0.23.0] — 2026-09-25

@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -38,6 +38,8 @@ pub enum RpcRequest {
     PushConfig { files: crate::config::FileSet },
     /// Ask the receiving node (must be the leader) to replace the control CA.
     RevokeOperatorCredentials,
+    /// Ask the receiving node (must be the leader) to commit a drain.
+    Drain { address: String },
 }
 
 /// The leader's answer to a forwarded config push: the committed version.
@@ -80,44 +82,72 @@ impl RaftNetworkFactory<TypeConfig> for ClusterNetworkFactory {
     }
 }
 
+/// Why an RPC failed: the peer could not be reached at all, or the exchange
+/// with it failed. Openraft backs off before retrying an unreachable peer and
+/// retries anything else at once, so a peer whose port is closed must be
+/// `Unreachable`: reported as a network error, the leader reconnects in a
+/// busy loop.
+pub enum CallError {
+    Unreachable(Unreachable),
+    Network(NetworkError),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Unreachable(e) => e.fmt(f),
+            CallError::Network(e) => e.fmt(f),
+        }
+    }
+}
+
+impl<E: std::error::Error> From<CallError> for RPCError<NodeId, BasicNode, E> {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Unreachable(e) => RPCError::Unreachable(e),
+            CallError::Network(e) => RPCError::Network(e),
+        }
+    }
+}
+
+fn network<E: std::error::Error + 'static>(e: &E) -> CallError {
+    CallError::Network(NetworkError::new(e))
+}
+
 impl ClusterNetwork {
-    async fn call<Resp>(&mut self, req: &RpcRequest) -> Result<Resp, NetworkError>
+    async fn call<Resp>(&mut self, req: &RpcRequest) -> Result<Resp, CallError>
     where
         Resp: for<'de> Deserialize<'de>,
     {
-        let body = serde_json::to_vec(req)
-            .map_err(|e| NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        let body = serde_json::to_vec(req).map_err(|e| network(&io::Error::new(io::ErrorKind::InvalidData, e)))?;
 
         let tcp = TcpStream::connect(&self.target_addr)
             .await
-            .map_err(|e| NetworkError::new(&e))?;
+            .map_err(|e| CallError::Unreachable(Unreachable::new(&e)))?;
 
         let connector = TlsConnector::from(Arc::clone(&self.tls));
         let domain: ServerName<'static> =
             ServerName::try_from("keel-cluster").expect("static valid server name");
-        let mut stream =
-            connector.connect(domain, tcp).await.map_err(|e| NetworkError::new(&e))?;
-
-        stream
-            .write_all(&(body.len() as u32).to_be_bytes())
+        let mut stream = connector
+            .connect(domain, tcp)
             .await
-            .map_err(|e| NetworkError::new(&e))?;
-        stream.write_all(&body).await.map_err(|e| NetworkError::new(&e))?;
-        stream.flush().await.map_err(|e| NetworkError::new(&e))?;
+            .map_err(|e| CallError::Unreachable(Unreachable::new(&e)))?;
+
+        stream.write_all(&(body.len() as u32).to_be_bytes()).await.map_err(|e| network(&e))?;
+        stream.write_all(&body).await.map_err(|e| network(&e))?;
+        stream.flush().await.map_err(|e| network(&e))?;
 
         let buf = crate::cluster::read_frame(&mut stream, crate::cluster::MAX_RPC_FRAME)
             .await
-            .map_err(|e| NetworkError::new(&e))?;
+            .map_err(|e| network(&e))?;
 
-        let resp: RpcResponse<Resp> = serde_json::from_slice(&buf)
-            .map_err(|e| NetworkError::new(&io::Error::new(io::ErrorKind::InvalidData, e)))?;
+        let resp: RpcResponse<Resp> =
+            serde_json::from_slice(&buf).map_err(|e| network(&io::Error::new(io::ErrorKind::InvalidData, e)))?;
 
         if let Some(err) = resp.err {
-            return Err(NetworkError::new(&io::Error::other(err)));
+            return Err(network(&io::Error::other(err)));
         }
-        resp.ok.ok_or_else(|| {
-            NetworkError::new(&io::Error::new(io::ErrorKind::UnexpectedEof, "empty response"))
-        })
+        resp.ok.ok_or_else(|| network(&io::Error::new(io::ErrorKind::UnexpectedEof, "empty response")))
     }
 }
 
@@ -162,6 +192,16 @@ pub(crate) async fn send_revoke(leader_addr: &str, tls: Arc<rustls::ClientConfig
     Ok(())
 }
 
+/// Forward a drain to the leader.
+pub(crate) async fn send_drain(leader_addr: &str, tls: Arc<rustls::ClientConfig>, address: String) -> anyhow::Result<()> {
+    let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let _: StepDownReply = net
+        .call(&RpcRequest::Drain { address })
+        .await
+        .map_err(|e| anyhow::anyhow!("drain request to the leader at {leader_addr} failed: {e}"))?;
+    Ok(())
+}
+
 /// Forward a config push to the leader; returns the version it committed.
 pub(crate) async fn send_config(
     leader_addr: &str,
@@ -183,7 +223,7 @@ impl RaftNetwork<TypeConfig> for ClusterNetwork {
         _opt: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
     {
-        self.call(&RpcRequest::AppendEntries(rpc)).await.map_err(RPCError::Network)
+        self.call(&RpcRequest::AppendEntries(rpc)).await.map_err(RPCError::from)
     }
 
     async fn install_snapshot(
@@ -194,7 +234,7 @@ impl RaftNetwork<TypeConfig> for ClusterNetwork {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        self.call(&RpcRequest::InstallSnapshot(rpc)).await.map_err(RPCError::Network)
+        self.call(&RpcRequest::InstallSnapshot(rpc)).await.map_err(RPCError::from)
     }
 
     async fn vote(
@@ -202,6 +242,6 @@ impl RaftNetwork<TypeConfig> for ClusterNetwork {
         rpc: VoteRequest<NodeId>,
         _opt: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.call(&RpcRequest::Vote(rpc)).await.map_err(RPCError::Network)
+        self.call(&RpcRequest::Vote(rpc)).await.map_err(RPCError::from)
     }
 }

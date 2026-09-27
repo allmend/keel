@@ -11,8 +11,7 @@ With more than one worker process, every worker tries to bind
 The endpoint then serves that one worker's registry: counters and histograms
 cover only the traffic that worker handled, and the gauges show that
 worker's view of connections, health, drain and ejection. Which worker
-serves the endpoint can change after a restart. Cluster mode runs one
-process and exposes complete numbers.
+serves the endpoint can change after a restart.
 
 A metric series appears after its first event: `keel_tcp_*` series exist
 once the first L4 connection arrives, `keel_udp_*` once the first flow

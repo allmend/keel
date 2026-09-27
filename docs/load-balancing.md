@@ -116,9 +116,7 @@ Drain complete (22s elapsed).
 
 Drain identifies the backend across all pools — you do not specify a pool name. If the address appears in multiple pools it is drained from all of them simultaneously.
 
-After drain completes the backend is in the `Removed` state until Keel restarts. There is no command to return it to service, and neither a config reload nor `keel config push` re-activates it — a restart does, since drain state is not persisted.
-
-In cluster mode, drain applies to the node that receives the command only. See [Cluster](cluster.md#drain-in-cluster-mode).
+After drain completes the backend is in the `Removed` state. There is no command to return it to service yet, and neither a config reload, `keel config push` nor a restart re-activates it: the drain is committed through Raft and applies on every node. See [Cluster](cluster.md#drain).
 
 ---
 

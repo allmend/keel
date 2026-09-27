@@ -12,7 +12,8 @@ use openraft::{
 
 use crate::cluster::persist::{Disk, Loaded, StoredSnapshot};
 use crate::cluster::types::{
-    AcmeAccountMap, CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, NodeId, TypeConfig, ControlCaPair};
+    AcmeAccountMap, CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, DrainedSet,
+    NodeId, TypeConfig, ControlCaPair};
 
 fn disk_err(e: anyhow::Error) -> openraft::StorageError<NodeId> {
     openraft::StorageIOError::write(openraft::AnyError::error(format!("{e:#}"))).into()
@@ -179,6 +180,7 @@ struct StateMachineData {
     control_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ControlCaPair>>>,
     cluster_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>>,
     acme_accounts_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<AcmeAccountMap>>>,
+    drained_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<DrainedSet>>>,
     disk: Option<Arc<Disk>>,
 }
 
@@ -186,7 +188,7 @@ impl StateMachineData {
     fn set_config(&mut self, version: u64, files: crate::config::FileSet) {
         self.state.config = Some(ConfigVersion { version, files });
         if let Some(tx) = &self.config_tx {
-            let _ = tx.send(self.state.config.clone());
+            tx.send_replace(self.state.config.clone());
         }
     }
 
@@ -197,22 +199,25 @@ impl StateMachineData {
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         if let Some(tx) = &self.certs_tx {
-            let _ = tx.send(self.state.certs.clone());
+            tx.send_replace(self.state.certs.clone());
         }
         if let Some(tx) = &self.challenges_tx {
-            let _ = tx.send(self.state.challenges.clone());
+            tx.send_replace(self.state.challenges.clone());
         }
         if let Some(tx) = &self.control_ca_tx {
-            let _ = tx.send(self.state.control_ca.clone());
+            tx.send_replace(self.state.control_ca.clone());
         }
         if let Some(tx) = &self.cluster_ca_tx {
-            let _ = tx.send(self.state.cluster_ca.clone());
+            tx.send_replace(self.state.cluster_ca.clone());
         }
         if let Some(tx) = &self.acme_accounts_tx {
-            let _ = tx.send(self.state.acme_accounts.clone());
+            tx.send_replace(self.state.acme_accounts.clone());
+        }
+        if let Some(tx) = &self.drained_tx {
+            tx.send_replace(self.state.drained.clone());
         }
         if let (Some(tx), Some(config)) = (&self.config_tx, &self.state.config) {
-            let _ = tx.send(Some(config.clone()));
+            tx.send_replace(Some(config.clone()));
         }
     }
 }
@@ -253,6 +258,10 @@ impl StateMachine {
 
     pub fn set_acme_accounts_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<AcmeAccountMap>>) {
         self.0.write().unwrap().acme_accounts_tx = Some(tx);
+    }
+
+    pub fn set_drained_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<DrainedSet>>) {
+        self.0.write().unwrap().drained_tx = Some(tx);
     }
 
     /// Persist snapshots to `disk` from here on, and start from the stored
@@ -337,53 +346,52 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             d.set_config(entry.log_id.index, files);
                             ClientResponse::ok()
                         }
-                        ClientRequest::DrainBackend { pool, address } => {
-                            d.state.draining.insert(format!("{pool}/{address}"), true);
-                            ClientResponse::ok()
-                        }
-                        ClientRequest::ActivateBackend { pool, address } => {
-                            d.state.draining.remove(&format!("{pool}/{address}"));
+                        ClientRequest::DrainBackend { address } => {
+                            d.state.drained.insert(address);
+                            if let Some(tx) = &d.drained_tx {
+                                tx.send_replace(d.state.drained.clone());
+                            }
                             ClientResponse::ok()
                         }
                         ClientRequest::SetCert { host, cert_pem, key_pem } => {
                             d.state.certs.insert(host, (cert_pem, key_pem));
                             if let Some(tx) = &d.certs_tx {
-                                let _ = tx.send(d.state.certs.clone());
+                                tx.send_replace(d.state.certs.clone());
                             }
                             ClientResponse::ok()
                         }
                         ClientRequest::SetChallenge { token, key_auth } => {
                             d.state.challenges.insert(token, key_auth);
                             if let Some(tx) = &d.challenges_tx {
-                                let _ = tx.send(d.state.challenges.clone());
+                                tx.send_replace(d.state.challenges.clone());
                             }
                             ClientResponse::ok()
                         }
                         ClientRequest::RemoveChallenge { token } => {
                             d.state.challenges.remove(&token);
                             if let Some(tx) = &d.challenges_tx {
-                                let _ = tx.send(d.state.challenges.clone());
+                                tx.send_replace(d.state.challenges.clone());
                             }
                             ClientResponse::ok()
                         }
                         ClientRequest::SetControlCa { cert_pem, key_pem } => {
                             d.state.control_ca = Some((cert_pem, key_pem));
                             if let Some(tx) = &d.control_ca_tx {
-                                let _ = tx.send(d.state.control_ca.clone());
+                                tx.send_replace(d.state.control_ca.clone());
                             }
                             ClientResponse::ok()
                         }
                         ClientRequest::SetClusterCa { cert_pem, key_pem } => {
                             d.state.cluster_ca = Some((cert_pem, key_pem));
                             if let Some(tx) = &d.cluster_ca_tx {
-                                let _ = tx.send(d.state.cluster_ca.clone());
+                                tx.send_replace(d.state.cluster_ca.clone());
                             }
                             ClientResponse::ok()
                         }
                         ClientRequest::SetAcmeAccount { issuer, account } => {
                             d.state.acme_accounts.insert(issuer, account);
                             if let Some(tx) = &d.acme_accounts_tx {
-                                let _ = tx.send(d.state.acme_accounts.clone());
+                                tx.send_replace(d.state.acme_accounts.clone());
                             }
                             ClientResponse::ok()
                         }

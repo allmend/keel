@@ -125,8 +125,9 @@ fn join_open(key: &ring::aead::LessSafeKey, framed: &[u8]) -> Option<Vec<u8>> {
 
 pub struct ClusterOpts {
     pub node_id: NodeId,
-    /// Peer listener bind address.
-    pub cluster_addr: String,
+    /// Peer listener bind address; `None` when `node.yaml` has no `cluster:`
+    /// section, and nothing listens.
+    pub cluster_addr: Option<String>,
     /// Address announced to the other nodes (`cluster.advertise`, or the bind address).
     pub advertise: String,
     /// `keel.state_dir`: node ID, certificates, `members.yaml`, and `raft/`.
@@ -141,8 +142,8 @@ pub struct ClusterOpts {
     /// committed version could be written over it.
     pub startup_files: FileSet,
     pub secret: Option<String>,
-    pub bootstrap: bool,
-    pub join: Option<String>,
+    /// `cluster.join`: members to join through when there is no stored state.
+    pub join: Vec<String>,
 }
 
 // Cluster handle
@@ -165,6 +166,8 @@ pub struct ClusterHandle {
     pub challenges_rx: watch::Receiver<crate::cluster::types::ChallengeMap>,
     /// The cluster-wide control CA, once committed; updated on commit and snapshot.
     pub control_ca_rx: watch::Receiver<crate::cluster::types::ControlCaPair>,
+    /// Backend addresses drained through the cluster.
+    pub drained_rx: watch::Receiver<crate::cluster::types::DrainedSet>,
     /// mTLS client config for peer RPCs (set together with `raft`). Used by the
     /// control plane to forward commands (e.g. stepdown) to the leader.
     pub client_tls: Arc<Mutex<Option<Arc<rustls::ClientConfig>>>>,
@@ -185,15 +188,22 @@ impl ClusterHandle {
         let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
             anyhow::bail!("cluster not yet initialized");
         };
-        let m = raft.metrics().borrow().clone();
-        if m.current_leader == Some(m.id) {
-            return replace_control_ca(&raft).await;
+        match leader_addr(&raft)? {
+            None => replace_control_ca(&raft).await,
+            Some(leader) => crate::cluster::network::send_revoke(&leader, tls).await,
         }
-        let leader = m
-            .current_leader
-            .and_then(|l| m.membership_config.membership().nodes().find(|(id, _)| **id == l).map(|(_, n)| n.addr.clone()))
-            .context("no leader known; try again")?;
-        crate::cluster::network::send_revoke(&leader, tls).await
+    }
+
+    /// Commit a drain of `address` through the leader: every node and its
+    /// workers stop sending it new connections.
+    pub async fn drain(&self, address: String) -> Result<()> {
+        let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
+            anyhow::bail!("cluster not yet initialized");
+        };
+        match leader_addr(&raft)? {
+            None => commit_drain(&raft, address).await,
+            Some(leader) => crate::cluster::network::send_drain(&leader, tls, address).await,
+        }
     }
 
     /// Commit `files` as the next config version; see [`push_config`].
@@ -203,6 +213,18 @@ impl ClusterHandle {
         };
         push_config(&raft, tls, &self.node_yaml, files).await
     }
+}
+
+/// `None` when this node is the leader; otherwise the leader's peer address.
+fn leader_addr(raft: &ClusterRaft) -> Result<Option<String>> {
+    let m = raft.metrics().borrow().clone();
+    if m.current_leader == Some(m.id) {
+        return Ok(None);
+    }
+    m.current_leader
+        .and_then(|l| m.membership_config.membership().nodes().find(|(id, _)| **id == l).map(|(_, n)| n.addr.clone()))
+        .map(Some)
+        .context("no leader known; try again")
 }
 
 // Certificate helpers
@@ -358,7 +380,12 @@ async fn do_join(
         stream.flush().await?;
         read_frame(&mut stream, MAX_JOIN_FRAME).await
     };
-    let buf = send.await.map_err(|e| JoinError::Retryable(e.into()))?;
+    // A member that cannot get the join committed (no majority reachable)
+    // never answers; ask again rather than wait for good.
+    let buf = tokio::time::timeout(JOIN_ANSWER_TIMEOUT, send)
+        .await
+        .map_err(|_| JoinError::Retryable(anyhow::anyhow!("no answer from {join_addr} within {}s", JOIN_ANSWER_TIMEOUT.as_secs())))?
+        .map_err(|e| JoinError::Retryable(e.into()))?;
 
     // A frame that fails to decrypt means the secrets differ — retrying with the
     // same secret can never succeed.
@@ -375,6 +402,10 @@ async fn do_join(
         }
     }
 }
+
+/// How long a joiner waits for the member's answer, which comes once the
+/// leader has committed the joiner as a learner.
+const JOIN_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Initial delay between join attempts; doubles per failure up to the max.
 const JOIN_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -439,7 +470,10 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
         RpcRequest::Vote(r) => r.vote.leader_id().voted_for(),
         RpcRequest::InstallSnapshot(r) => r.vote.leader_id().voted_for(),
         RpcRequest::StepDown { node_id } => Some(*node_id),
-        RpcRequest::Join { .. } | RpcRequest::PushConfig { .. } | RpcRequest::RevokeOperatorCredentials => None,
+        RpcRequest::Join { .. }
+        | RpcRequest::PushConfig { .. }
+        | RpcRequest::RevokeOperatorCredentials
+        | RpcRequest::Drain { .. } => None,
     }
 }
 
@@ -506,6 +540,14 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
         Ok(RpcRequest::RevokeOperatorCredentials) => match replace_control_ca(&raft).await {
             Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
                 ok: Some(crate::cluster::network::StepDownReply { message: "revoked".into() }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
+        Ok(RpcRequest::Drain { address }) => match commit_drain(&raft, address).await {
+            Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::StepDownReply { message: "drained".into() }),
                 err: None,
             })
             .unwrap(),
@@ -615,8 +657,10 @@ async fn handle_join(
 async fn admit_joiner(raft: Arc<ClusterRaft>, node_id: NodeId, addr: String) -> std::result::Result<(), String> {
     admit_known_id(&raft, node_id, &addr).await?;
     let deadline = tokio::time::Instant::now() + JOIN_MEMBERSHIP_TIMEOUT;
-    when_membership_free(deadline, || raft.add_learner(node_id, BasicNode { addr: addr.clone() }, false))
+    let added = when_membership_free(deadline, || raft.add_learner(node_id, BasicNode { addr: addr.clone() }, false));
+    tokio::time::timeout(JOIN_COMMIT_TIMEOUT, added)
         .await
+        .map_err(|_| format!("adding node {node_id} did not commit within {}s; is a majority reachable?", JOIN_COMMIT_TIMEOUT.as_secs()))?
         .map_err(|e| format!("cannot add node {node_id} as learner: {e}"))?;
     info!(node_id, addr, "cluster: node joined");
     tokio::spawn(promote_to_voter(raft, node_id, addr));
@@ -677,6 +721,9 @@ const PROMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a join waits for the cluster to accept the learner entry.
 const JOIN_MEMBERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the leader waits for a joiner's membership change to commit.
+const JOIN_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 type MembershipResult = std::result::Result<
     openraft::raft::ClientWriteResponse<TypeConfig>,
@@ -810,17 +857,25 @@ fn open_store(opts: &ClusterOpts) -> Result<(Arc<persist::Disk>, persist::Loaded
     Ok((disk, loaded))
 }
 
-/// Stored state always wins: a node with a store restarts from it and never
-/// bootstraps again, whatever its flags say. Without a store, members it
-/// remembers mean it lost its state: it rejoins through them, and a node that
-/// was alone starts over as a one-member cluster.
+/// Stored state wins: a node with a store restarts from it and never
+/// bootstraps again. One exception is refused rather than ignored: a node
+/// alone in its stored cluster whose `node.yaml` says to join others started
+/// a cluster of its own by mistake. Without a store, `cluster.join` and the
+/// members it remembers are where it joins; with neither it starts a cluster
+/// of one.
 fn decide_start(opts: &ClusterOpts, loaded: &persist::Loaded) -> Result<Start> {
+    let join: Vec<String> = opts.join.iter().filter(|a| **a != opts.advertise).cloned().collect();
     if !loaded.is_empty() {
-        if opts.bootstrap || opts.join.is_some() {
-            info!("cluster: restarting from stored state; --bootstrap and --join are ignored");
-        } else {
-            info!("cluster: restarting from stored state");
+        let alone = loaded.membership().is_some_and(|m| m.nodes().all(|(id, _)| *id == opts.node_id));
+        if alone && !join.is_empty() {
+            anyhow::bail!(
+                "this node is the only member of the cluster stored in {}, but node.yaml lists cluster.join: \
+                 it started a cluster of its own earlier. To join, stop keel, remove {} and start it again",
+                opts.state_dir.join("raft").display(),
+                opts.state_dir.join("raft").display()
+            );
         }
+        info!("cluster: restarting from stored state");
         return Ok(Start::Restore);
     }
     let remembered = identity::read_members(&opts.state_dir)?.unwrap_or_default();
@@ -832,17 +887,14 @@ fn decide_start(opts: &ClusterOpts, loaded: &persist::Loaded) -> Result<Start> {
         .collect();
     if !others.is_empty() {
         warn!(members = others.len(), "cluster: no Raft state but known members; rejoining as a learner");
-        return Ok(Start::Join(opts.join.iter().cloned().chain(others).collect()));
+    }
+    if !join.is_empty() || !others.is_empty() {
+        return Ok(Start::Join(join.into_iter().chain(others).collect()));
     }
     if !remembered.members.is_empty() {
         warn!("cluster: no Raft state for this one-member cluster; starting it again: drain state and history are gone");
-        return Ok(Start::Bootstrap);
     }
-    match (opts.bootstrap, &opts.join) {
-        (true, _) => Ok(Start::Bootstrap),
-        (false, Some(target)) => Ok(Start::Join(vec![target.clone()])),
-        (false, None) => anyhow::bail!("this node has no stored cluster state: start it with --bootstrap or --join"),
-    }
+    Ok(Start::Bootstrap)
 }
 
 /// Rewrite `members.yaml` whenever the membership changes.
@@ -888,6 +940,7 @@ pub struct ClusterService {
     control_ca_tx: Arc<watch::Sender<crate::cluster::types::ControlCaPair>>,
     cluster_ca_tx: Arc<watch::Sender<crate::cluster::types::ClusterCaPair>>,
     acme_accounts_tx: Arc<watch::Sender<crate::cluster::types::AcmeAccountMap>>,
+    drained_tx: Arc<watch::Sender<crate::cluster::types::DrainedSet>>,
 }
 
 #[async_trait]
@@ -907,15 +960,13 @@ impl ClusterService {
     async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
         let opts = &self.opts;
 
-        // A non-empty shared secret is mandatory. Without it the join listener would
-        // hand a CA-signed mTLS identity to any peer that can reach the cluster port,
-        // which is a full cluster takeover. Refuse to start rather than run open.
+        // A non-empty shared secret is mandatory wherever peers can connect.
+        // Without it the join listener would hand a CA-signed mTLS identity to
+        // any peer that can reach the cluster port: a full cluster takeover.
+        // Config validation refuses a `cluster:` section without one.
         let secret = opts.secret.as_deref().unwrap_or("").to_owned();
-        if secret.is_empty() {
-            anyhow::bail!(
-                "cluster mode requires a non-empty shared secret \
-                 (--secret or cluster.secret in config); refusing to start with an open join listener"
-            );
+        if opts.cluster_addr.is_some() && secret.is_empty() {
+            anyhow::bail!("cluster.secret is required; refusing to start with an open join listener");
         }
 
         let (disk, loaded) = open_store(opts)?;
@@ -961,6 +1012,7 @@ impl ClusterService {
         sm.set_control_ca_tx(Arc::clone(&self.control_ca_tx));
         sm.set_cluster_ca_tx(Arc::clone(&self.cluster_ca_tx));
         sm.set_acme_accounts_tx(Arc::clone(&self.acme_accounts_tx));
+        sm.set_drained_tx(Arc::clone(&self.drained_tx));
         sm.persisted(Arc::clone(&disk), loaded.snapshot.as_ref())?;
 
         let log_store = LogStore::persisted(disk, &loaded);
@@ -996,13 +1048,24 @@ impl ClusterService {
         // Publish the raft handle so ControlServer can use it.
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
 
+        let Some(cluster_addr) = &opts.cluster_addr else {
+            // A node without a `cluster:` section has no peers to talk to.
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            info!("cluster: shutting down");
+            raft.shutdown().await.ok();
+            return Ok(());
+        };
         let server_tls = build_server_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
         let acceptor = TlsAcceptor::from(server_tls);
-        let listener = TcpListener::bind(&opts.cluster_addr)
+        let listener = TcpListener::bind(cluster_addr)
             .await
-            .with_context(|| format!("cannot bind cluster addr {}", opts.cluster_addr))?;
+            .with_context(|| format!("cannot bind cluster addr {cluster_addr}"))?;
 
-        info!(addr = opts.cluster_addr, "cluster: peer listener ready");
+        info!(addr = cluster_addr, "cluster: peer listener ready");
 
         let cluster_ca_rx = self.cluster_ca_tx.subscribe();
 
@@ -1083,6 +1146,8 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let cluster_ca_tx = Arc::new(watch::channel(None).0);
     let (acme_accounts_tx, acme_accounts_rx) = watch::channel(crate::cluster::types::AcmeAccountMap::new());
     let acme_accounts_tx = Arc::new(acme_accounts_tx);
+    let (drained_tx, drained_rx) = watch::channel(crate::cluster::types::DrainedSet::new());
+    let drained_tx = Arc::new(drained_tx);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
@@ -1093,6 +1158,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         certs_rx,
         challenges_rx,
         control_ca_rx,
+        drained_rx,
         client_tls: Arc::clone(&tls_slot),
     };
     let service = ClusterService {
@@ -1105,6 +1171,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         control_ca_tx,
         cluster_ca_tx,
         acme_accounts_tx,
+        drained_tx,
     };
 
     (handle, service)
@@ -1281,6 +1348,13 @@ pub async fn push_acme_account(raft: &ClusterRaft, issuer: String, account: Stri
     raft.client_write(ClientRequest::SetAcmeAccount { issuer, account })
         .await
         .map_err(|e| anyhow::anyhow!("ACME account replication failed: {e:?}"))?;
+    Ok(())
+}
+
+async fn commit_drain(raft: &ClusterRaft, address: String) -> Result<()> {
+    raft.client_write(ClientRequest::DrainBackend { address })
+        .await
+        .map_err(|e| anyhow::anyhow!("drain not committed: {e:?}"))?;
     Ok(())
 }
 
@@ -1498,13 +1572,13 @@ async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
 mod tests {
     use super::{claimed_sender, decide_start, identity, join_key, join_open, join_seal, node_id_from_cn, persist, Ca, ClusterOpts, Start};
 
-    fn opts(name: &str, bootstrap: bool, join: Option<&str>) -> ClusterOpts {
+    fn opts(name: &str, join: &[&str]) -> ClusterOpts {
         let state_dir = std::env::temp_dir().join(format!("keel-start-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).unwrap();
         ClusterOpts {
             node_id: 1,
-            cluster_addr: "0.0.0.0:7654".into(),
+            cluster_addr: Some("0.0.0.0:7654".into()),
             advertise: "10.0.0.1:7654".into(),
             state_dir,
             force_new_cluster: false,
@@ -1512,8 +1586,7 @@ mod tests {
             config_dir: std::path::PathBuf::new(),
             startup_files: Default::default(),
             secret: Some("s".into()),
-            bootstrap,
-            join: join.map(str::to_owned),
+            join: join.iter().map(|a| a.to_string()).collect(),
         }
     }
 
@@ -1525,16 +1598,37 @@ mod tests {
         identity::write_members(&opts.state_dir, &identity::MemberList { members }).unwrap();
     }
 
+    /// A store whose membership is `ids`.
+    fn stored(ids: &[u64]) -> persist::Loaded {
+        let nodes: std::collections::BTreeMap<u64, openraft::BasicNode> =
+            ids.iter().map(|id| (*id, openraft::BasicNode { addr: format!("10.0.0.{id}:7654") })).collect();
+        let voters: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
+        let membership = openraft::Membership::new(vec![voters], nodes);
+        let entry = openraft::Entry::<crate::cluster::types::TypeConfig> {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: openraft::EntryPayload::Membership(membership),
+        };
+        persist::Loaded { vote: Some(openraft::Vote::new(1, 1)), log: [(1, entry)].into(), ..Default::default() }
+    }
+
     #[test]
-    fn stored_state_wins_over_the_flags() {
-        let o = opts("restore", true, None);
-        let loaded = persist::Loaded { vote: Some(openraft::Vote::new(1, 1)), ..Default::default() };
-        assert!(matches!(decide_start(&o, &loaded).unwrap(), Start::Restore));
+    fn stored_state_restores() {
+        assert!(matches!(decide_start(&opts("restore", &[]), &stored(&[1])).unwrap(), Start::Restore));
+        // A member of a larger cluster ignores a join list it no longer needs.
+        let o = opts("restore-member", &["10.0.0.9:7654"]);
+        assert!(matches!(decide_start(&o, &stored(&[1, 2, 3])).unwrap(), Start::Restore));
+    }
+
+    #[test]
+    fn a_node_alone_in_its_store_refuses_to_join_elsewhere() {
+        let o = opts("alone-join", &["10.0.0.2:7654"]);
+        let err = decide_start(&o, &stored(&[1])).err().expect("refused").to_string();
+        assert!(err.contains("started a cluster of its own") && err.contains("raft"), "{err}");
     }
 
     #[test]
     fn a_node_that_lost_its_state_rejoins_through_the_members_it_knew_never_bootstraps() {
-        let o = opts("rejoin", true, None);
+        let o = opts("rejoin", &[]);
         remember(&o, &[1, 2, 3]);
         match decide_start(&o, &persist::Loaded::default()).unwrap() {
             Start::Join(targets) => assert_eq!(targets, vec!["10.0.0.2:7654", "10.0.0.3:7654"]),
@@ -1544,21 +1638,22 @@ mod tests {
 
     #[test]
     fn a_lone_node_that_lost_its_state_starts_over() {
-        let o = opts("alone", false, None);
+        let o = opts("alone", &[]);
         remember(&o, &[1]);
         assert!(matches!(decide_start(&o, &persist::Loaded::default()).unwrap(), Start::Bootstrap));
     }
 
     #[test]
-    fn a_new_node_follows_its_flags() {
+    fn a_new_node_joins_when_told_to_and_starts_a_cluster_otherwise() {
         let empty = persist::Loaded::default();
-        assert!(matches!(decide_start(&opts("new-b", true, None), &empty).unwrap(), Start::Bootstrap));
-        match decide_start(&opts("new-j", false, Some("10.0.0.9:7654")), &empty).unwrap() {
+        assert!(matches!(decide_start(&opts("new", &[]), &empty).unwrap(), Start::Bootstrap));
+        match decide_start(&opts("new-j", &["10.0.0.9:7654"]), &empty).unwrap() {
             Start::Join(targets) => assert_eq!(targets, vec!["10.0.0.9:7654"]),
             _ => panic!("must join"),
         }
-        let err = decide_start(&opts("new-none", false, None), &empty).err().expect("no way in").to_string();
-        assert!(err.contains("--bootstrap or --join"), "{err}");
+        // One node file for every node: its own address in the list is skipped.
+        let only_self = opts("new-self", &["10.0.0.1:7654"]);
+        assert!(matches!(decide_start(&only_self, &empty).unwrap(), Start::Bootstrap));
     }
     use crate::cluster::network::RpcRequest;
     use openraft::raft::{AppendEntriesRequest, VoteRequest};

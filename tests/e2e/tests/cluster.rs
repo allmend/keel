@@ -5,10 +5,12 @@
 //! bootstrap node and node3 through node2, so every stack admits one node
 //! through a follower, which holds the replicated cluster CA.
 //!
-//! Each node reads its flags from `nodeN.args` (so a test can restart it with
-//! others), keeps `/var/lib/keel` on a named volume (so a test can reach a
-//! stopped node's Raft store), and has its config directory bind-mounted from
-//! `nodeN-config/` (so a test can read what the node wrote, or edit it).
+//! Each node's `node.yaml` names the member it joins through (node1 has none:
+//! it starts the cluster). A node reads extra flags from `nodeN.args` (so a
+//! test can restart it with `--force-new-cluster`), keeps `/var/lib/keel` on a
+//! named volume (so a test can reach a stopped node's Raft store), and has its
+//! config directory bind-mounted from `nodeN-config/` (so a test can read what
+//! the node wrote, or edit it).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -24,23 +26,26 @@ use serde_json::Value;
 const NODES: [&str; 3] = ["node1", "node2", "node3"];
 const SECRET: &str = "e2e-cluster-secret";
 const NODE_ID_FILE: &str = "/var/lib/keel/node_id";
+/// uid of `nobody` in the debian image.
+const NOBODY: u32 = 65534;
 const PEBBLE_IP: &str = "172.29.83.30";
 
 fn ip(node: &str) -> String {
     format!("172.29.83.1{}", &node[4..])
 }
 
-fn join_args(target: &str) -> String {
-    format!("--cluster --join {}:7654 --secret {SECRET}", ip(target))
+/// The member a node joins through: node1 starts the cluster, node2 joins
+/// through node1, node3 and node4 through node2.
+fn joins_through(node: &str) -> Option<&'static str> {
+    match node {
+        "node1" => None,
+        "node2" => Some("node1"),
+        _ => Some("node2"),
+    }
 }
 
-/// Start flags: node1 bootstraps, node2 joins through node1, node3 through node2.
-fn start_args(node: &str) -> String {
-    match node {
-        "node1" => format!("--cluster --bootstrap --secret {SECRET}"),
-        "node2" => join_args("node1"),
-        _ => join_args("node2"),
-    }
+fn node_file(node: &str, advertise_ip: &str) -> String {
+    node_yaml(advertise_ip, joins_through(node))
 }
 
 /// The stack; `extra` is appended to `services:`.
@@ -78,7 +83,7 @@ services:
         r#"  node4:
     image: {{image}}
     init: true
-    entrypoint: ["sh", "-c", "while [ ! -s {NODE_ID_FILE} ]; do sleep 0.2; done; exec /usr/local/bin/keel {join}"]
+    entrypoint: ["sh", "-c", "while [ ! -s {NODE_ID_FILE} ]; do sleep 0.2; done; exec /usr/local/bin/keel"]
     environment: [NO_COLOR=1]
     volumes: ["./node4.yaml:/etc/keel/node.yaml:ro", "./node4-config:/etc/keel/config"]
     networks: {{ net: {{ ipv4_address: 172.29.83.14 }} }}
@@ -86,18 +91,19 @@ volumes:
   node1-state: {{}}
   node2-state: {{}}
   node3-state: {{}}
-"#,
-        join = join_args("node2")
+"#
     ));
     s
 }
 
 /// The node file: binds the unspecified address and announces the node's own
 /// IP, so every test exercises the difference between `addr` and `advertise`.
-fn node_yaml(advertise_ip: &str) -> String {
+fn node_yaml(advertise_ip: &str, join: Option<&str>) -> String {
+    let join = join.map(|n| format!("  join: [\"{}:7654\"]\n", ip(n))).unwrap_or_default();
     format!(
         r#"
 keel:
+  workers: 2
   user: nobody
   group: nogroup
 control:
@@ -107,7 +113,7 @@ cluster:
   addr: 0.0.0.0:7654
   advertise: {advertise_ip}:7654
   secret: {SECRET}
-"#
+{join}"#
     )
 }
 
@@ -154,10 +160,10 @@ impl Cluster {
     /// config directory.
     fn up_with(name: &str, extra: &str, config: &[(&str, String)]) -> Result<Cluster> {
         let mut files: Vec<(String, String)> =
-            vec![("node4.yaml".into(), node_yaml("172.29.83.14")), ("node4-config/keel.yaml".into(), lb_config(""))];
+            vec![("node4.yaml".into(), node_file("node4", "172.29.83.14")), ("node4-config/keel.yaml".into(), lb_config(""))];
         for node in NODES {
-            files.push((format!("{node}.yaml"), node_yaml(&ip(node))));
-            files.push((format!("{node}.args"), start_args(node)));
+            files.push((format!("{node}.yaml"), node_file(node, &ip(node))));
+            files.push((format!("{node}.args"), String::new()));
             files.extend(config.iter().map(|(f, text)| (format!("{node}-config/{f}"), text.clone())));
         }
         let files: Vec<(&str, String)> = files.iter().map(|(f, text)| (f.as_str(), text.clone())).collect();
@@ -360,15 +366,21 @@ fn remote_control_answers_on_every_node_and_requires_a_client_certificate() -> R
 
 #[test]
 #[ignore = "needs Docker"]
-fn cluster_nodes_run_unprivileged() -> Result<()> {
+fn every_node_runs_a_root_master_a_control_worker_and_unprivileged_workers() -> Result<()> {
     let cluster = Cluster::up("cluster-privileges")?;
+    let control_uid: u32 = {
+        let out = cluster.stack.exec("node1", &["id", "-u", "keel-control"])?;
+        String::from_utf8_lossy(&out.stdout).trim().parse()?
+    };
     for node in NODES {
         let procs = cluster.stack.procs(node)?;
         let keel: Vec<_> = procs.iter().filter(|p| p.cmd.starts_with("/usr/local/bin/keel")).collect();
-        assert!(!keel.is_empty(), "{node} runs keel: {procs:?}");
-        for p in keel {
-            assert_ne!(p.uid, 0, "{node}: keel pid {} runs as root", p.pid);
-        }
+        let master = keel.iter().find(|p| !keel.iter().any(|q| q.pid == p.ppid)).expect("a master");
+        assert_eq!(master.uid, 0, "{node}: the master binds as root");
+        let children: Vec<_> = keel.iter().filter(|p| p.ppid == master.pid).collect();
+        assert_eq!(children.iter().filter(|p| p.uid == control_uid).count(), 1, "{node}: one control worker: {keel:?}");
+        assert!(children.iter().any(|p| p.uid == NOBODY), "{node}: workers run as nobody: {keel:?}");
+        assert!(children.iter().all(|p| p.uid != 0), "{node}: no child runs as root: {keel:?}");
     }
     Ok(())
 }
@@ -443,7 +455,7 @@ fn a_node_that_moves_to_a_new_address_keeps_its_id() -> Result<()> {
     let new_ip = "172.29.83.23";
 
     cluster.stack.stop("node3")?;
-    cluster.stack.write_file("node3.yaml", &node_yaml(new_ip))?;
+    cluster.stack.write_file("node3.yaml", &node_yaml(new_ip, joins_through("node3")))?;
     cluster.stack.set_ip("node3", new_ip)?;
     cluster.stack.start("node3")?;
 
@@ -514,7 +526,9 @@ fn members_file_lists_the_cluster() -> Result<()> {
 #[ignore = "needs Docker"]
 fn a_node_restarts_from_its_stored_state_without_join() -> Result<()> {
     let cluster = Cluster::up("cluster-restore")?;
-    cluster.restart_with("node3", &format!("--cluster --secret {SECRET}"))?;
+    cluster.stack.stop("node3")?;
+    cluster.stack.write_file("node3.yaml", &node_yaml(&ip("node3"), None))?;
+    cluster.stack.start("node3")?;
     wait_until("node3 restored", Duration::from_secs(60), || Ok(cluster.logged("node3", "restarting from stored state")?.then_some(())))?;
     cluster.wait_for_voters("node1", &cluster.all_ids())?;
     assert_eq!(cluster.node_id("node3")?, cluster.id("node3"));
@@ -540,8 +554,8 @@ fn a_full_cluster_restart_recovers_membership_and_config() -> Result<()> {
         cluster.serves_marker(node)?;
         assert_eq!(cluster.node_id(node)?, cluster.id(node), "{node} kept its ID");
     }
-    // node1 still carries --bootstrap: stored state wins, no second cluster.
-    assert!(cluster.logged("node1", "--bootstrap and --join are ignored")?);
+    // Stored state wins: node1 started the cluster once and does not again.
+    assert!(cluster.logged("node1", "restarting from stored state")?);
     Ok(())
 }
 
@@ -581,7 +595,7 @@ fn forced_recovery_makes_the_survivor_the_only_member() -> Result<()> {
 
     cluster.stack.stop("node2")?;
     cluster.stack.stop("node3")?;
-    cluster.restart_with("node1", &format!("--cluster --force-new-cluster --secret {SECRET}"))?;
+    cluster.restart_with("node1", "--force-new-cluster")?;
 
     let id = cluster.id("node1");
     cluster.wait_for_voters("node1", &[id])?;
@@ -858,6 +872,127 @@ fn acme_follows_pushed_config_and_a_vhost_switches_to_acme_live() -> Result<()> 
         let addr = https(node)?;
         wait_until(&format!("{node} serves an issued byo.test"), Duration::from_secs(120), || {
             Ok(served_certificate(addr, "byo.test").ok().filter(|leaf| *leaf != byo_leaf))
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn the_local_control_socket_answers_on_every_node() -> Result<()> {
+    let cluster = Cluster::up("local-socket")?;
+    for node in NODES {
+        let out = cluster.stack.exec(node, &["keel", "status"])?;
+        assert!(out.status.success(), "{node}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = cluster.stack.exec(node, &["keel", "cluster", "status"])?;
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Members:"), "{node} answers cluster status");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_drain_sent_to_one_node_is_applied_on_every_node() -> Result<()> {
+    let cluster = Cluster::up("cluster-drain")?;
+    let follower = NODES.iter().find(|n| **n != cluster.leader().unwrap_or_default()).expect("a follower").to_string();
+    cluster.request(&follower, &ControlRequest::BackendDrain { address: "172.29.83.20:80".into(), wait: false })?;
+    for node in NODES {
+        wait_until(&format!("{node} drains the backend"), Duration::from_secs(30), || {
+            let list = cluster.request(node, &ControlRequest::BackendList { pool: "web".into() })?;
+            let state = list["backends"][0]["state"].as_str().unwrap_or_default().to_owned();
+            Ok((state == "draining" || state == "removed").then_some(()))
+        })?;
+    }
+    let err = cluster
+        .request("node1", &ControlRequest::BackendDrain { address: "10.9.9.9:80".into(), wait: false })
+        .expect_err("an address in no pool")
+        .to_string();
+    assert!(err.contains("not found in any pool"), "{err}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn an_even_split_serves_on_both_sides_and_commits_on_neither() -> Result<()> {
+    let cluster = Cluster::up("even-split")?;
+    // node4 becomes the fourth voter: two sites of two.
+    let out = cluster.stack.exec("node4", &["sh", "-c", &format!("mkdir -p /var/lib/keel && echo 4343434343 > {NODE_ID_FILE}")])?;
+    anyhow::ensure!(out.status.success(), "write node ID on node4");
+    wait_until("four voters", Duration::from_secs(90), || Ok((cluster.voters("node1")?.len() == 4).then_some(())))?;
+
+    cluster.stack.disconnect("node3")?;
+    cluster.stack.disconnect("node4")?;
+    let push = |node: &str| cluster.stack.exec(node, &["keel", "config", "push", "/etc/keel/config"]);
+
+    // Site A: serves, refuses writes.
+    for node in ["node1", "node2"] {
+        let out = push(node)?;
+        assert!(!out.status.success(), "{node} committed without a majority");
+        let (status, _) = http_get(cluster.stack.addr(node, 80)?, "e2e.test", "/")?;
+        assert_eq!(status, 200, "{node} serves during the split");
+    }
+    // Site B: its workers keep running, and it refuses writes too.
+    for node in ["node3", "node4"] {
+        let out = push(node)?;
+        assert!(!out.status.success(), "{node} committed without a majority");
+        let out = cluster.stack.exec(node, &["keel", "status"])?;
+        assert!(String::from_utf8_lossy(&out.stdout).contains("web"), "{node} still serves its pools");
+    }
+
+    // Healed: one cluster again, and writes commit.
+    cluster.stack.reconnect("node3", &ip("node3"))?;
+    cluster.stack.reconnect("node4", "172.29.83.14")?;
+    wait_until("a push commits after the split", Duration::from_secs(90), || Ok(push("node1")?.status.success().then_some(())))?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_single_node_grows_into_a_cluster_and_keeps_its_state() -> Result<()> {
+    // node1 starts alone: no cluster section, so no peer port. node2 and
+    // node3 keep trying to join it meanwhile.
+    let mut files: Vec<(String, String)> = vec![
+        ("node4.yaml".into(), node_file("node4", "172.29.83.14")),
+        ("node4-config/keel.yaml".into(), lb_config("")),
+        ("node1.yaml".into(), "keel:\n  workers: 2\n  user: nobody\n  group: nogroup\n".into()),
+    ];
+    for node in NODES {
+        if node != "node1" {
+            files.push((format!("{node}.yaml"), node_file(node, &ip(node))));
+        }
+        files.push((format!("{node}.args"), String::new()));
+        files.push((format!("{node}-config/keel.yaml"), lb_config("")));
+    }
+    let files: Vec<(&str, String)> = files.iter().map(|(f, t)| (f.as_str(), t.clone())).collect();
+    let stack = Stack::up("grow", &compose(""), &files)?;
+    let local = |node: &str, args: &[&str]| -> Result<String> {
+        let mut full = vec!["keel"];
+        full.extend_from_slice(args);
+        let out = stack.exec(node, &full)?;
+        anyhow::ensure!(out.status.success(), "{node}: keel {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let id_of = |status: &str| status.lines().find_map(|l| l.trim().strip_prefix("Node ID:").map(|v| v.trim().to_owned()));
+    let alone = wait_until("node1 leads its cluster of one", Duration::from_secs(60), || {
+        Ok(local("node1", &["cluster", "status"]).ok().filter(|s| s.contains("leader")))
+    })?;
+    // State worth keeping: a drain, committed on the node alone, once its
+    // workers answer.
+    wait_until("node1 drains", Duration::from_secs(30), || Ok(local("node1", &["backend", "drain", "172.29.83.20:80"]).ok()))?;
+
+    // node1 gets its cluster section and a restart; the others join it.
+    stack.stop("node1")?;
+    stack.write_file("node1.yaml", &node_file("node1", &ip("node1")))?;
+    stack.start("node1")?;
+    let grown = wait_until("three voters", Duration::from_secs(120), || {
+        Ok(local("node1", &["cluster", "status"]).ok().filter(|s| s.matches("(voter)").count() == 3))
+    })?;
+    assert_eq!(id_of(&grown), id_of(&alone), "node1 kept its ID:\n{grown}");
+    assert!(grown.contains(&format!("{}:7654", ip("node1"))), "node1 announces its address:\n{grown}");
+    for node in NODES {
+        wait_until(&format!("{node} has the drain"), Duration::from_secs(60), || {
+            let list = local(node, &["backend", "list", "--pool", "web"])?;
+            Ok((list.contains("draining") || list.contains("removed")).then_some(()))
         })?;
     }
     Ok(())

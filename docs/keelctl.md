@@ -32,7 +32,7 @@ Remote control is off unless `control.remote` is configured. The local Unix
 socket (`keel.control_socket`) is always on and unchanged — `keel status` on
 the node works exactly as before.
 
-`address` takes a literal `ip:port`; a hostname is rejected during config validation. The listener is served by the root master process — see [Security](security.md#the-remote-control-listener-runs-as-root).
+`address` takes a literal `ip:port`; a hostname is rejected during config validation. The master binds the port and the control worker serves it — see [Security](security.md#processes-and-what-each-can-read).
 
 On first start with `control.remote` set (or on the first
 `keel credentials create`), Keel generates the control CA in `control/`
@@ -81,9 +81,9 @@ The keelconfig is resolved in order:
 ## Cluster mode
 
 Every node with `control.remote` configured listens. `cluster stepdown`,
-`config push`, `config reload` and `credentials revoke-all` sent to a
-follower reach the leader. `status`, `backend list` and `backend drain` act
-on the node that receives them only.
+`config push`, `config reload`, `backend drain` and `credentials revoke-all`
+sent to a follower reach the leader. `status` and `backend list` answer for
+the node that receives them.
 
 The control CA is cluster-wide. When a cluster forms, the leader commits
 its control CA (certificate and key) to the Raft log; every node, including
@@ -91,8 +91,8 @@ one that joins later, writes it into its own control CA directory and re-keys
 its remote listener. One keelconfig therefore authenticates to every node, and
 `keel credentials create` produces a valid keelconfig on any node.
 
-A node that starts with a different local CA (for example a node previously
-run standalone) adopts the cluster's and logs that it did; credentials
+A node that starts with a different local CA (for example a single node
+that later joined a cluster) adopts the cluster's and logs that it did; credentials
 issued by its old CA stop working. Create credentials once the cluster is
 up rather than on a node before it joins, for the same reason.
 

@@ -78,7 +78,7 @@ impl RoutingTable {
             }
         }
 
-        let acme_challenge_dir = cfg.acme_effective().map(|a| crate::acme::challenge_dir(&a.storage));
+        let acme_challenge_dir = cfg.acme_effective().map(|_| crate::acme::challenge_dir(&cfg.keel));
         RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions, acme_challenge_dir }
     }
 

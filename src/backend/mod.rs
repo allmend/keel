@@ -427,15 +427,6 @@ impl PoolRegistry {
         found
     }
 
-    /// Total active connections across all pools for a given backend address.
-    pub fn connections_for_address(&self, addr: &str) -> i64 {
-        let suffix = format!("/{addr}");
-        self.drain.iter()
-            .filter(|(key, _)| key.ends_with(&suffix))
-            .map(|(_, e)| e.connections.load(Ordering::Relaxed).max(0))
-            .sum()
-    }
-
     /// Sync drain state after a config reload.
     ///
     /// Backends present in the drain table but absent from `cfg` are moved to

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Default location of the node-local file. A node without one runs on the
@@ -20,7 +20,7 @@ pub const ROOT_FILE: &str = "keel.yaml";
 /// Sections of `node.yaml`: how this node is reached and run.
 const NODE_SECTIONS: [&str; 4] = ["keel", "cluster", "control", "metrics"];
 /// `keel:` settings that describe the node rather than the load balancer.
-const NODE_KEEL_KEYS: [&str; 6] = ["workers", "user", "group", "control_socket", "state_dir", "config_dir"];
+const NODE_KEEL_KEYS: [&str; 7] = ["workers", "user", "group", "control_user", "control_socket", "state_dir", "config_dir"];
 /// Sections only the root file of the config directory may hold; the other
 /// files add pools, vhosts, listeners and certificates.
 const ROOT_ONLY_SECTIONS: [&str; 4] = ["keel", "access_log", "acme", "cache"];
@@ -39,6 +39,28 @@ pub fn load(node_path: &str) -> Result<Config> {
     cfg.path = node_path.to_owned();
     cfg.node_yaml = node_yaml;
     Ok(cfg)
+}
+
+/// `node_yaml` without its `cluster:` section: what the workers get. The
+/// join secret stays with the control worker.
+pub fn without_cluster_section(node_yaml: &str) -> String {
+    let Ok(mut node) = parse_mapping("node.yaml", node_yaml) else { return String::new() };
+    node.remove("cluster");
+    if node.is_empty() {
+        return String::new();
+    }
+    serde_yml::to_string(&serde_yml::Value::Mapping(node)).unwrap_or_default()
+}
+
+impl Config {
+    /// This config as the workers get it: without the `cluster:` section
+    /// and its join secret.
+    pub fn for_workers(&self) -> Config {
+        let mut cfg = self.clone();
+        cfg.cluster = None;
+        cfg.node_yaml = without_cluster_section(&self.node_yaml);
+        cfg
+    }
 }
 
 /// `keel.config_dir` from a node file, or its default.
@@ -268,6 +290,22 @@ pub struct RemoteControlConfig {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        if self.keel.control_user == self.keel.user {
+            anyhow::bail!(
+                "keel.control_user and keel.user are both '{}': the control worker holds the CA keys \
+                 and must not share a user with the workers",
+                self.keel.user
+            );
+        }
+        if let Some(cluster) = &self.cluster {
+            // Without it the join listener would hand a CA-signed identity to
+            // any peer that reaches the cluster port.
+            if cluster.secret.as_deref().unwrap_or("").is_empty() {
+                anyhow::bail!("cluster.secret is required when node.yaml has a cluster section");
+            }
+        }
+        self.check_port_collisions()?;
+
         // Must be a literal address, not a name: the master binds it inline
         // so that resolving it cannot add a thread to the process that forks
         // workers (see control::remote and process::run_master).
@@ -523,6 +561,29 @@ impl Config {
     /// committed. Directories Keel writes to are node-local and absolute, and
     /// issued certificates never go into the config directory, which a push
     /// replaces.
+    /// The control and peer ports are node listeners of their own; one that
+    /// is also in `listeners:` would race for the port at bind time.
+    fn check_port_collisions(&self) -> Result<()> {
+        use std::net::SocketAddr;
+        let overlaps = |a: SocketAddr, b: SocketAddr| {
+            a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+        };
+        let own = [
+            ("control.remote.address", self.control.as_ref().and_then(|c| c.remote.as_ref()).map(|r| r.address.as_str())),
+            ("cluster.addr", self.cluster.as_ref().map(|c| c.addr.as_str())),
+        ];
+        for (field, address) in own {
+            let Some(address) = address else { continue };
+            let Ok(ours) = address.parse::<SocketAddr>() else { continue };
+            for l in self.listeners.iter().filter(|l| l.udp_pool.is_none()) {
+                if l.address.parse::<SocketAddr>().is_ok_and(|theirs| overlaps(ours, theirs)) {
+                    anyhow::bail!("{field} {address} collides with listener {}", l.address);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_paths(&self) -> Result<()> {
         let carried = |owner: String, field: &str, path: &Option<String>| -> Result<()> {
             match path.as_deref().and_then(relative_key) {
@@ -697,6 +758,12 @@ pub struct KeelConfig {
     #[serde(default = "default_group")]
     pub group: String,
 
+    /// User the control worker runs as: Raft, the control listeners, ACME.
+    /// Its primary group owns what only it may read (the state directory);
+    /// it joins `group` to reach the workers and share the config directory.
+    #[serde(default = "default_control_user")]
+    pub control_user: String,
+
     #[serde(default = "default_control_socket")]
     pub control_socket: String,
 
@@ -736,6 +803,7 @@ impl Default for KeelConfig {
             workers: default_workers(),
             user: default_user(),
             group: default_group(),
+            control_user: default_control_user(),
             control_socket: default_control_socket(),
             grace_period_seconds: default_grace_period(),
             udp_flow_timeout_seconds: default_udp_flow_timeout(),
@@ -753,6 +821,12 @@ impl KeelConfig {
     pub fn control_ca_dir(&self) -> String {
         format!("{}/control", self.state_dir.trim_end_matches('/'))
     }
+
+    /// The directory holding the instance control socket; also the workers'
+    /// sockets and the HTTP-01 challenge tokens, below it.
+    pub fn runtime_dir(&self) -> PathBuf {
+        Path::new(&self.control_socket).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/var/run/keel"))
+    }
 }
 fn default_config_dir() -> String { "/etc/keel/config".into() }
 
@@ -767,6 +841,7 @@ fn default_workers() -> usize {
 }
 fn default_user() -> String { "keel".into() }
 fn default_group() -> String { "keel".into() }
+fn default_control_user() -> String { "keel-control".into() }
 fn default_control_socket() -> String { "/var/run/keel/keel.sock".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1404,6 +1479,11 @@ pub struct ClusterConfig {
     pub advertise: Option<String>,
 
     pub secret: Option<String>,
+
+    /// Members to join through on first start. Without it, a node with no
+    /// stored state starts a cluster of its own.
+    #[serde(default)]
+    pub join: Vec<String>,
 }
 
 fn default_cluster_addr() -> String { "0.0.0.0:7654".into() }
@@ -1506,6 +1586,48 @@ mod tests {
         std::fs::write(&abs, "DISK").unwrap();
         assert_eq!(cfg.read_file(abs.to_str().unwrap()).unwrap(), b"DISK", "absolute paths read from disk");
         let _ = std::fs::remove_file(&abs);
+    }
+
+    const WEB: &str = "pools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\n";
+
+    #[test]
+    fn the_control_worker_needs_a_user_of_its_own() {
+        let err = assemble_err("keel:\n  user: keel\n  control_user: keel\n", &files(&[("keel.yaml", WEB)]));
+        assert!(err.contains("keel.control_user and keel.user are both 'keel'"), "{err}");
+    }
+
+    #[test]
+    fn a_cluster_section_needs_a_secret() {
+        let err = assemble_err("cluster:\n  advertise: 10.0.0.1:7654\n", &files(&[("keel.yaml", WEB)]));
+        assert!(err.contains("cluster.secret is required"), "{err}");
+    }
+
+    #[test]
+    fn control_and_peer_ports_must_not_be_listeners() {
+        let listening = |address: &str| format!("{WEB}listeners:\n  - address: {address}\n");
+        let remote = "control:\n  remote:\n    address: 0.0.0.0:10789\n";
+        let err = assemble_err(remote, &files(&[("keel.yaml", &listening("10.0.0.1:10789"))]));
+        assert!(err.contains("control.remote.address 0.0.0.0:10789 collides with listener 10.0.0.1:10789"), "{err}");
+        let peer = "cluster:\n  addr: 10.0.0.1:7654\n  secret: s\n";
+        let err = assemble_err(peer, &files(&[("keel.yaml", &listening("0.0.0.0:7654"))]));
+        assert!(err.contains("cluster.addr 10.0.0.1:7654 collides"), "{err}");
+        // Another address on the same port, or a UDP listener, is no collision.
+        assemble(peer, &files(&[("keel.yaml", &listening("10.0.0.2:7654"))])).unwrap();
+        let udp = format!("{WEB}listeners:\n  - address: 0.0.0.0:7654\n    udp_pool: web\n");
+        assemble(peer, &files(&[("keel.yaml", &udp)])).unwrap();
+    }
+
+    #[test]
+    fn workers_get_the_node_file_without_its_cluster_section() {
+        let node = "keel:\n  workers: 2\ncluster:\n  secret: s3cret\n";
+        let stripped = without_cluster_section(node);
+        assert!(!stripped.contains("s3cret") && stripped.contains("workers: 2"), "{stripped}");
+        assert_eq!(without_cluster_section("cluster:\n  secret: s\n"), "");
+        let cfg = assemble(node, &files(&[("keel.yaml", WEB)])).unwrap();
+        let mut loaded = cfg.clone();
+        loaded.node_yaml = node.into();
+        assert!(loaded.for_workers().cluster.is_none());
+        assert!(!loaded.for_workers().node_yaml.contains("s3cret"));
     }
 
     #[test]

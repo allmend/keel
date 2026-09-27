@@ -5,16 +5,18 @@
 //! source IPs are unreliable behind NAT / kube-proxy, so the restriction
 //! narrows exposure but never replaces mTLS.
 //!
-//! In cluster mode the control CA is replicated through the Raft log: the
-//! leader publishes its CA once, every node writes it into its own control CA
-//! directory and re-keys its listener, so one keelconfig authenticates to all
-//! nodes and `keel credentials create` works on any of them.
+//! The control CA is replicated through the Raft log: the leader publishes
+//! its CA once, every node writes it into its own control CA directory and
+//! re-keys its listener, so one keelconfig authenticates to all nodes and
+//! `keel credentials create` works on any of them.
+//!
+//! The master binds the port as root and hands it to the control worker,
+//! which serves it: no network input reaches the root process.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use ipnet::IpNet;
 use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
@@ -27,41 +29,22 @@ use crate::control::Dispatch;
 /// How long a client has to complete the TLS handshake after connecting.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Connections allowed to be handshaking or served at once. What reaches the
+/// listener before authentication cannot spawn tasks without limit.
+const MAX_CONNECTIONS: usize = 64;
+
 pub struct RemoteControlServer {
     pub cfg: RemoteControlConfig,
+    /// Bound by the master.
+    pub listener: std::net::TcpListener,
     /// `control/` under `keel.state_dir`.
     pub ca_dir: String,
     pub dispatch: Arc<Dispatch>,
 }
 
-/// The running listener's CA directory and TLS config, so a revocation can
-/// re-key it in place.
-static LISTENER: std::sync::OnceLock<(String, Arc<ArcSwap<rustls::ServerConfig>>)> = std::sync::OnceLock::new();
-
-/// Revoke every operator credential on a node that is not in a cluster:
-/// replace the control CA and re-key the running listener. Credentials
-/// signed by the old CA no longer authenticate.
-pub fn revoke_local() -> Result<()> {
-    let (ca_dir, tls) = LISTENER.get().context("no remote control listener is running")?;
-    let (cert_pem, key_pem) = ControlCa::generate()?;
-    let ca = ControlCa::install(ca_dir, &cert_pem, &key_pem)?;
-    tls.store(server_tls_for(&ca)?);
-    info!(ca_dir, "control: control CA replaced; every earlier keelconfig is revoked");
-    Ok(())
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for RemoteControlServer {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        self.serve(&mut shutdown).await
-    }
-}
-
 impl RemoteControlServer {
-    /// Serve until `shutdown` flips, logging a failed start. Split out of the
-    /// `BackgroundService` impl so the master can run the listener on its own
-    /// runtime, without a Pingora server.
-    pub async fn serve(&self, shutdown: &mut pingora::server::ShutdownWatch) {
+    /// Serve until `shutdown` flips, logging a failed start.
+    pub async fn serve(self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
         if let Err(e) = self.run(shutdown).await {
             // Refuse to run half-open: an operator who configured remote
             // control must notice it is not serving.
@@ -69,7 +52,7 @@ impl RemoteControlServer {
         }
     }
 
-    async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) -> Result<()> {
+    async fn run(self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> Result<()> {
         let allow: Vec<IpNet> = self
             .cfg
             .allow
@@ -81,30 +64,17 @@ impl RemoteControlServer {
         // Swapped when the cluster's CA replaces the local one or a revocation
         // replaces it; each accept reads the current config.
         let tls = Arc::new(ArcSwap::from(server_tls_for(&ca)?));
-        let _ = LISTENER.set((self.ca_dir.clone(), Arc::clone(&tls)));
-        if let Some(cluster) = self.dispatch.cluster() {
-            tokio::spawn(sync_control_ca(
-                cluster,
-                self.ca_dir.clone(),
-                Arc::clone(&tls),
-                (ca.ca_cert_pem.clone(), ca.ca_key_pem.clone()),
-                shutdown.clone(),
-            ));
-        }
+        tokio::spawn(sync_control_ca(
+            self.dispatch.cluster.clone(),
+            self.ca_dir.clone(),
+            Arc::clone(&tls),
+            (ca.ca_cert_pem.clone(), ca.ca_key_pem.clone()),
+            shutdown.clone(),
+        ));
 
-        // Parsed, not resolved: tokio only binds a literal address inline, and
-        // routes anything needing name resolution through spawn_blocking. That
-        // would leave a blocking-pool thread alive in the master, and the
-        // master's fork() for a replacement worker must happen from a
-        // single-threaded process (see run_master).
-        let address: std::net::SocketAddr = self
-            .cfg
-            .address
-            .parse()
-            .with_context(|| format!("control.remote.address must be ip:port, got '{}'", self.cfg.address))?;
-        let listener =
-            TcpListener::bind(address).await.with_context(|| format!("bind {address}"))?;
-        crate::control::register_master_listener(std::os::fd::AsRawFd::as_raw_fd(&listener));
+        self.listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(self.listener).context("serve control.remote")?;
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         info!(address = self.cfg.address, allow = ?self.cfg.allow, "control: remote listener ready (mTLS)");
 
         loop {
@@ -118,11 +88,16 @@ impl RemoteControlServer {
                         warn!(peer = %peer, "control: connection rejected by allow list");
                         continue;
                     }
+                    let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+                        warn!(peer = %peer, "control: too many remote connections; closed");
+                        continue;
+                    };
                     let acceptor = tokio_rustls::TlsAcceptor::from(tls.load_full());
                     let dispatch = Arc::clone(&self.dispatch);
                     tokio::spawn(async move {
-                        // An operator that connects and stalls must not hold a
-                        // slot on the master's runtime indefinitely.
+                        let _slot = slot;
+                        // A client that connects and stalls must not hold a
+                        // slot indefinitely.
                         let handshake =
                             tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream));
                         let tls_stream = match handshake.await {
@@ -169,7 +144,7 @@ async fn sync_control_ca(
     ca_dir: String,
     tls: Arc<ArcSwap<rustls::ServerConfig>>,
     mut local: (String, String),
-    mut shutdown: pingora::server::ShutdownWatch,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut rx = cluster.control_ca_rx.clone();
     // Until a CA is committed, followers serve their own: check often, so

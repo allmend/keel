@@ -7,7 +7,7 @@ Keel reads two things: the **node file**, `/etc/keel/node.yaml` (`--config` sets
 | Section | File | Purpose | Reference |
 |---|---|---|---|
 | `keel` | both | Process settings; which keys go where is [below](#keel) | [below](#keel) |
-| `cluster` | node file | Cluster mode: Raft, mTLS, peer address | [Cluster](cluster.md) |
+| `cluster` | node file | Peers: address, secret, members to join | [Cluster](cluster.md) |
 | `control` | node file | Remote control listener (keelctl, mTLS) | [Remote control](keelctl.md) |
 | `metrics` | node file | Prometheus metrics endpoint | [below](#metrics) |
 | `listeners` | config directory | Network ports to bind | [below](#listeners) |
@@ -30,8 +30,9 @@ Process-level settings. The ones that describe the node go in the node file; the
 # /etc/keel/node.yaml
 keel:
   workers: 4              # number of worker processes; default: CPU count (max 16)
-  user: keel              # drop to this user after binding privileged ports
-  group: keel             # drop to this group
+  user: keel              # workers drop to this user after binding privileged ports
+  group: keel             # workers drop to this group
+  control_user: keel-control   # the control worker: Raft, control listeners, ACME
   control_socket: /var/run/keel/keel.sock   # Unix socket for CLI commands
   state_dir: /var/lib/keel       # state kept across restarts: node ID, certificates, Raft store, control CA
   config_dir: /etc/keel/config   # the config directory
@@ -49,6 +50,7 @@ keel:
 | `workers` | node file | integer | CPU count, max 16 |
 | `user` | node file | string | `keel` |
 | `group` | node file | string | `keel` |
+| `control_user` | node file | string | `keel-control`; must differ from `user` |
 | `control_socket` | node file | string | `/var/run/keel/keel.sock` |
 | `state_dir` | node file | string | `/var/lib/keel` |
 | `config_dir` | node file | string | `/etc/keel/config` |
@@ -99,7 +101,7 @@ A `tcp_pool` or `udp_pool` listener references an ordinary entry in `pools` — 
 
 For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and hands each worker its own; a replacement worker takes over the socket of the one it replaces.
 
-The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in a `workers/` subdirectory of the `keel.control_socket` directory (the worker's own control socket, `worker-<index>.sock`, lives there too). The master creates that subdirectory and assigns it to `keel.user` before forking, keeping the parent directory — which holds its own control socket — root-owned. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
+The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in a `workers/` subdirectory of the `keel.control_socket` directory (the worker's own control socket, `worker-<index>.sock`, lives there too). The master creates that subdirectory and assigns it to `keel.user` before forking, keeping the parent directory — which holds the instance control socket — root-owned. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
 
 Changing listener ports requires a process restart. Adding new listeners via hot reload is not supported.
 
@@ -305,24 +307,26 @@ certificates:
 
 ## cluster
 
-Required in cluster mode. Omit for standalone.
+Needed for peers: without it the node is a cluster of one and opens no peer port.
 
 ```yaml
 cluster:
   addr: 0.0.0.0:7654         # bind address for peer connections
   advertise: 10.0.0.1:7654   # address the other nodes connect to
   secret: change-me
+  join: [10.0.0.2:7654]      # omit on the node that starts the cluster
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `addr` | string | `0.0.0.0:7654` | Peer listen address |
+| `addr` | string | `0.0.0.0:7654` | Peer listen address; must not be a `listeners:` address |
 | `advertise` | string | `addr` | Address announced to the other nodes. Required when `addr` is unspecified (`0.0.0.0`, `::`) |
-| `secret` | string | none | Shared secret for join authentication |
+| `secret` | string | none | Shared secret for join authentication; required |
+| `join` | list | none | Members to join through on first start |
 
 Unknown keys under `cluster:` are refused. The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity). The Raft store and the node's certificates live there too; see [Restarts](cluster.md#restarts).
 
-See [Cluster](cluster.md) for bootstrap, join, and restarts.
+See [Cluster](cluster.md) for starting, joining and restarts.
 
 ---
 
@@ -339,9 +343,9 @@ control:
       - 10.1.2.0/24
 ```
 
-`remote.address` takes a literal address and port. A hostname fails config validation at startup.
+`remote.address` takes a literal address and port, not in `listeners:`. A hostname fails config validation at startup.
 
-The listener is served by the root master process. See [Security](security.md#the-remote-control-listener-runs-as-root).
+The master binds the port and the control worker serves it. See [Security](security.md#processes-and-what-each-can-read).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|

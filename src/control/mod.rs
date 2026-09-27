@@ -1,126 +1,55 @@
 pub mod ca;
+pub mod control_worker;
 pub mod fanout;
 pub mod remote;
+pub mod worker_socket;
 
 use crate::backend::{BackendStatus, PoolRegistry, DRAIN_ACTIVE, DRAIN_DRAINING, DRAIN_REMOVED};
-use async_trait::async_trait;
 use fanout::{DrainOutcome, WorkerFanout};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info};
 
 // Wire types live in the keel-control crate, shared with keelctl.
 pub use keel_control::{ControlRequest, ControlResponse};
 
-// Master listener fds
-//
-// The first workers are forked before the master binds its control listeners,
-// but a worker the master restarts later inherits them across `fork`, and
-// nothing here ever execs to clear them. An inherited listening fd lets an
-// unprivileged worker accept operator commands the master should have
-// answered, and keeps the remote-control port bound if the master is killed,
-// so a fresh master cannot rebind it. The child closes them right after the
-// fork; closing a descriptor in the child does not disturb the parent's.
-static MASTER_LISTENER_FDS: std::sync::Mutex<Vec<std::os::fd::RawFd>> =
-    std::sync::Mutex::new(Vec::new());
+/// Largest request line an operator connection may send: a config push
+/// carries the whole config directory.
+const MAX_REQUEST_LINE: u64 = 64 * 1024 * 1024;
 
-/// Record a listener the master owns, so a forked child can disown it.
-pub fn register_master_listener(fd: std::os::fd::RawFd) {
-    if let Ok(mut fds) = MASTER_LISTENER_FDS.lock() {
-        fds.push(fd);
+/// Read one `\n`-terminated line of at most `max` bytes. A peer that sends
+/// more without a newline is refused instead of growing the buffer.
+pub async fn read_line_capped<R: AsyncBufRead + Unpin>(reader: &mut R, max: u64) -> anyhow::Result<String> {
+    let mut line = String::new();
+    let n = reader.take(max + 1).read_line(&mut line).await?;
+    if n as u64 > max {
+        anyhow::bail!("line longer than {max} bytes");
     }
-}
-
-/// Close every listener the master owns. Called in the child after `fork`,
-/// before it becomes a worker.
-pub fn close_master_listeners() {
-    let Ok(fds) = MASTER_LISTENER_FDS.lock() else { return };
-    for fd in fds.iter() {
-        // SAFETY: these fds belong to the master's listeners; in the child
-        // they are inherited copies this process must not keep.
-        unsafe { libc::close(*fd) };
-    }
+    Ok(line)
 }
 
 // Server
 
+/// The instance control socket. The master binds it as root and hands it
+/// to the control worker, which serves it.
 pub struct ControlServer {
-    pub socket_path: String,
+    pub listener: std::os::unix::net::UnixListener,
     pub dispatch: Arc<Dispatch>,
-    /// uid/gid to give the socket. The master binds as root but the socket
-    /// belongs to the worker user, so operators who could reach it through
-    /// group membership before still can.
-    pub owner: Option<(u32, u32)>,
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for ControlServer {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        self.run(&mut shutdown).await
-    }
 }
 
 impl ControlServer {
-    /// Serve the socket until `shutdown` flips. Split out of the
-    /// `BackgroundService` impl so the master — which has no Pingora server —
-    /// can run the same listener on its own runtime.
-    pub async fn run(&self, shutdown: &mut pingora::server::ShutdownWatch) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _ = std::fs::remove_file(&self.socket_path);
-        if let Some(parent) = std::path::Path::new(&self.socket_path).parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                error!(path = self.socket_path, error = %e, "control: failed to create socket directory");
-                return;
-            }
-            // Restrict the directory first so the socket is never traversable by
-            // other users, even during the brief window before its own mode is set.
-            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)) {
-                error!(path = %parent.display(), error = %e, "control: failed to set socket directory permissions");
-                return;
-            }
-        }
-
-        let listener = match UnixListener::bind(&self.socket_path) {
+    pub async fn run(self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+        let listener = match self.listener.set_nonblocking(true).and_then(|()| UnixListener::from_std(self.listener)) {
             Ok(l) => l,
             Err(e) => {
-                error!(path = self.socket_path, error = %e, "control: failed to bind socket");
+                error!(error = %e, "control: cannot serve the instance socket");
                 return;
             }
         };
-
-        if let Some((uid, gid)) = self.owner {
-            let path = std::path::Path::new(&self.socket_path);
-            if let Err(e) = nix::unistd::chown(
-                path,
-                Some(nix::unistd::Uid::from_raw(uid)),
-                Some(nix::unistd::Gid::from_raw(gid)),
-            ) {
-                error!(path = self.socket_path, error = %e, "control: failed to set socket ownership");
-                let _ = std::fs::remove_file(&self.socket_path);
-                return;
-            }
-        }
-
-        // The control protocol can drain backends, reload config, and push config
-        // to the whole cluster — anyone who can open the socket owns the proxy.
-        // Restrict to owner+group (0660); refuse to serve if we cannot lock it down.
-        if let Err(e) =
-            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))
-        {
-            error!(path = self.socket_path, error = %e, "control: failed to restrict socket permissions");
-            let _ = std::fs::remove_file(&self.socket_path);
-            return;
-        }
-
-        // Only the master's socket needs disowning in forked children, but a
-        // worker never forks, so registering unconditionally is harmless.
-        register_master_listener(std::os::fd::AsRawFd::as_raw_fd(&listener));
-        info!(path = self.socket_path, "control: socket ready");
-
+        info!("control: socket ready");
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -136,110 +65,40 @@ impl ControlServer {
                                 }
                             });
                         }
-                        Err(e) => {
-                            error!(error = %e, "control: accept error");
-                        }
+                        Err(e) => error!(error = %e, "control: accept error"),
                     }
                 }
             }
         }
-
-        let _ = std::fs::remove_file(&self.socket_path);
-        info!("control: socket closed");
     }
 }
 
 // Dispatch
 
-/// Where a control command is answered.
-///
-/// `Local` answers from this process's own `PoolRegistry` — that is the
-/// cluster-mode node (one process, no workers) and each worker on its own
-/// per-worker socket. `Workers` is the master: it owns the instance socket
-/// and fans every command out to the workers, because the drain state,
-/// connection counters and health of a forked worker live only in that
-/// worker.
-pub enum Dispatch {
-    Local {
-        pools: Arc<PoolRegistry>,
-        started_at: Instant,
-        cluster: Option<crate::cluster::ClusterHandle>,
-    },
-    Workers(WorkerFanout),
+/// Where a control command is answered: the control worker, which asks the
+/// workers for their view (connections, health, drain progress live in each
+/// worker) and commits changes through the cluster.
+pub struct Dispatch {
+    pub fanout: WorkerFanout,
+    pub cluster: crate::cluster::ClusterHandle,
 }
 
 impl Dispatch {
-    pub fn local(
-        pools: Arc<PoolRegistry>,
-        cluster: Option<crate::cluster::ClusterHandle>,
-    ) -> Arc<Self> {
-        Arc::new(Dispatch::Local { pools, started_at: Instant::now(), cluster })
+    pub fn new(fanout: WorkerFanout, cluster: crate::cluster::ClusterHandle) -> Arc<Self> {
+        Arc::new(Dispatch { fanout, cluster })
     }
 
-    /// The master's dispatch: one socket per worker, merged on the way out.
-    pub fn workers(control_socket: &str, workers: usize) -> Arc<Self> {
-        Arc::new(Dispatch::Workers(WorkerFanout::new(control_socket, workers)))
-    }
-
-    pub fn fanout(&self) -> Option<&WorkerFanout> {
-        match self {
-            Dispatch::Workers(w) => Some(w),
-            Dispatch::Local { .. } => None,
-        }
-    }
-
-    async fn status(&self) -> String {
-        match self {
-            Dispatch::Local { pools, started_at, .. } => cmd_status(pools, *started_at),
-            Dispatch::Workers(w) => w.status().await,
-        }
-    }
-
-    async fn backend_list(&self, pool: &str) -> String {
-        match self {
-            Dispatch::Local { pools, .. } => cmd_backend_list(pools, pool),
-            Dispatch::Workers(w) => w.backend_list(pool).await,
-        }
-    }
-
-    /// Mark a backend draining. `Ok` carries the pools it was found in and
-    /// how widely the drain was applied.
+    /// Drain `address` on this node's workers at once, then commit it so every
+    /// node, and every worker started later, keeps it drained. The workers'
+    /// answer also checks the address: one in no pool is refused before
+    /// anything is committed.
     async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
-        match self {
-            Dispatch::Local { pools, .. } => {
-                let found = pools.drain_by_address(address);
-                if found.is_empty() {
-                    Err(format!("backend '{address}' not found in any pool"))
-                } else {
-                    Ok(DrainOutcome { pools: found, acknowledged: 1, workers: 1 })
-                }
-            }
-            Dispatch::Workers(w) => w.drain(address).await,
-        }
-    }
-
-    /// Connections still open to a backend. `None` means no worker answered,
-    /// which is not the same as zero — see `WorkerFanout::connections_for`.
-    async fn connections_for(&self, address: &str) -> Option<i64> {
-        match self {
-            Dispatch::Local { pools, .. } => Some(pools.connections_for_address(address)),
-            Dispatch::Workers(w) => w.connections_for(address).await,
-        }
-    }
-
-    /// Trigger a config reload. A worker reloads itself; the master signals
-    /// itself and its supervision loop forwards SIGHUP to every worker.
-    fn reload(&self) -> String {
-        let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGHUP);
-        ControlResponse::ok(serde_json::json!({"message": "config reload triggered"}))
-    }
-
-    /// Cluster mode never forks, so only `Local` can hold a cluster handle.
-    fn cluster(&self) -> Option<crate::cluster::ClusterHandle> {
-        match self {
-            Dispatch::Local { cluster, .. } => cluster.clone(),
-            Dispatch::Workers(_) => None,
-        }
+        let outcome = self.fanout.drain(address).await?;
+        self.cluster
+            .drain(address.to_owned())
+            .await
+            .map_err(|e| format!("drained on this node, but not committed to the cluster: {e:#}"))?;
+        Ok(outcome)
     }
 }
 
@@ -255,8 +114,13 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 ) -> anyhow::Result<()> {
     let (reader_half, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader_half);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = match read_line_capped(&mut reader, MAX_REQUEST_LINE).await {
+        Ok(line) => line,
+        Err(e) => {
+            write_line(&mut writer, &ControlResponse::err(format!("invalid request: {e}"))).await?;
+            return Ok(());
+        }
+    };
 
     if line.trim().is_empty() {
         return Ok(());
@@ -274,15 +138,15 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         info!(client = who, command = request.name(), "control: remote command");
     }
 
-    let cluster = dispatch.cluster();
+    let cluster = &dispatch.cluster;
 
     match request {
         ControlRequest::Status => {
-            write_line(&mut writer, &dispatch.status().await).await?;
+            write_line(&mut writer, &dispatch.fanout.status().await).await?;
         }
 
         ControlRequest::BackendList { pool } => {
-            write_line(&mut writer, &dispatch.backend_list(&pool).await).await?;
+            write_line(&mut writer, &dispatch.fanout.backend_list(&pool).await).await?;
         }
 
         ControlRequest::BackendDrain { address, wait } => {
@@ -312,7 +176,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
                     // the backend may still be carrying connections, and
                     // reporting completion would invite the operator to take
                     // it away.
-                    let conns = dispatch.connections_for(&address).await;
+                    let conns = dispatch.fanout.connections_for(&address).await;
                     let done = conns == Some(0);
                     write_line(
                         &mut writer,
@@ -330,44 +194,37 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         }
 
         ControlRequest::ConfigReload => {
-            // In a cluster, reloading means reconciling this node's config
-            // directory into the cluster: it becomes the next version.
-            let resp = match &cluster {
-                Some(ch) => match crate::config::read_config_dir(&ch.config_dir) {
-                    Ok(files) => cmd_config_push(&cluster, files).await,
-                    Err(e) => ControlResponse::err(format!("{e:#}")),
-                },
-                None => dispatch.reload(),
+            // Reloading reconciles this node's config directory into the
+            // cluster: it becomes the next version, which every node applies.
+            let resp = match crate::config::read_config_dir(&cluster.config_dir) {
+                Ok(files) => cmd_config_push(cluster, files).await,
+                Err(e) => ControlResponse::err(format!("{e:#}")),
             };
             write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::ClusterStatus => {
-            let resp = cmd_cluster_status(&cluster).await;
+            let resp = cmd_cluster_status(cluster).await;
             write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::ClusterDemote => {
-            let resp = cmd_cluster_demote(&cluster).await;
+            let resp = cmd_cluster_demote(cluster).await;
             write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::ClusterStepdown { force } => {
-            let resp = cmd_cluster_stepdown(&cluster, force).await;
+            let resp = cmd_cluster_stepdown(cluster, force).await;
             write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::ConfigPush { files } => {
-            let resp = cmd_config_push(&cluster, files).await;
+            let resp = cmd_config_push(cluster, files).await;
             write_line(&mut writer, &resp).await?;
         }
 
         ControlRequest::CredentialsRevokeAll => {
-            let revoked = match &cluster {
-                Some(ch) => ch.revoke_operator_credentials().await,
-                None => crate::control::remote::revoke_local(),
-            };
-            let resp = match revoked {
+            let resp = match cluster.revoke_operator_credentials().await {
                 Ok(()) => ControlResponse::ok(serde_json::json!({
                     "message": "control CA replaced; every earlier keelconfig is revoked — issue new ones with `keel credentials create`",
                 })),
@@ -389,7 +246,7 @@ async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> anyhow
 
 // Command implementations
 
-fn cmd_status(pools: &PoolRegistry, started_at: Instant) -> String {
+pub(crate) fn cmd_status(pools: &PoolRegistry, started_at: Instant) -> String {
     let uptime_secs = started_at.elapsed().as_secs();
     let all = pools.all_backends();
 
@@ -414,7 +271,7 @@ fn cmd_status(pools: &PoolRegistry, started_at: Instant) -> String {
     }))
 }
 
-fn cmd_backend_list(pools: &PoolRegistry, pool_name: &str) -> String {
+pub(crate) fn cmd_backend_list(pools: &PoolRegistry, pool_name: &str) -> String {
     if !pools.has_pool(pool_name) {
         return ControlResponse::err(format!("pool '{pool_name}' not found"));
     }
@@ -448,10 +305,7 @@ fn backend_json(b: &BackendStatus) -> serde_json::Value {
     })
 }
 
-async fn cmd_cluster_status(cluster: &Option<crate::cluster::ClusterHandle>) -> String {
-    let Some(ch) = cluster else {
-        return ControlResponse::err("not in cluster mode");
-    };
+async fn cmd_cluster_status(ch: &crate::cluster::ClusterHandle) -> String {
     let Some(raft) = ch.raft().await else {
         return ControlResponse::err("cluster not yet initialized");
     };
@@ -481,10 +335,7 @@ async fn cmd_cluster_status(cluster: &Option<crate::cluster::ClusterHandle>) -> 
     }))
 }
 
-async fn cmd_cluster_demote(cluster: &Option<crate::cluster::ClusterHandle>) -> String {
-    let Some(ch) = cluster else {
-        return ControlResponse::err("not in cluster mode");
-    };
+async fn cmd_cluster_demote(ch: &crate::cluster::ClusterHandle) -> String {
     let Some(raft) = ch.raft().await else {
         return ControlResponse::err("cluster not yet initialized");
     };
@@ -500,13 +351,7 @@ async fn cmd_cluster_demote(cluster: &Option<crate::cluster::ClusterHandle>) -> 
     }
 }
 
-async fn cmd_cluster_stepdown(
-    cluster: &Option<crate::cluster::ClusterHandle>,
-    force: bool,
-) -> String {
-    let Some(ch) = cluster else {
-        return ControlResponse::err("not in cluster mode");
-    };
+async fn cmd_cluster_stepdown(ch: &crate::cluster::ClusterHandle, force: bool) -> String {
     let Some(raft) = ch.raft().await else {
         return ControlResponse::err("cluster not yet initialized");
     };
@@ -519,15 +364,25 @@ async fn cmd_cluster_stepdown(
     }
 }
 
-async fn cmd_config_push(cluster: &Option<crate::cluster::ClusterHandle>, files: crate::config::FileSet) -> String {
-    let Some(ch) = cluster else {
-        return ControlResponse::err("not in cluster mode");
-    };
+async fn cmd_config_push(ch: &crate::cluster::ClusterHandle, files: crate::config::FileSet) -> String {
     match ch.push_config(files).await {
         Ok(version) => ControlResponse::ok(serde_json::json!({
             "message": format!("config version {version} committed; every node applies it"),
             "version": version,
         })),
         Err(e) => ControlResponse::err(format!("{e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_line_capped;
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_cap_is_refused() {
+        let mut short = tokio::io::BufReader::new(&b"{\"a\":1}\nrest"[..]);
+        assert_eq!(read_line_capped(&mut short, 16).await.unwrap(), "{\"a\":1}\n");
+        let mut long = tokio::io::BufReader::new(&[b'x'; 64][..]);
+        assert!(read_line_capped(&mut long, 16).await.is_err());
     }
 }

@@ -1,44 +1,68 @@
-//! Master-side control plane: fan one operator command out to every worker
-//! and merge the answers.
+//! The control worker's side of the workers: every operator command that
+//! needs the workers' view, and every applied config, goes out to each
+//! worker's own socket, and the answers are merged.
 //!
-//! Workers are forked processes, so a backend's drain state, its connection
-//! counter and its health live in whichever worker observed them — there is
-//! no shared registry. Each worker therefore binds its own control socket
-//! (`worker-<index>.sock`, next to the instance socket) and only the master
-//! binds `keel.control_socket`. Before this split every worker bound the same
-//! path and the last one to start owned it: `keel status` reported a single
-//! worker's connection counts, and `keel backend drain` left the other
-//! workers sending new traffic to the backend.
+//! Workers are forked processes, so a backend's connection counter and its
+//! health live in whichever worker observed them — there is no shared
+//! registry. Each worker binds `worker-<index>.sock` below the runtime
+//! directory; the instance socket belongs to the control worker.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use keel_control::{ControlRequest, ControlResponse};
+use keel_control::ControlResponse;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-/// How long one worker gets to answer before the master leaves it out of the
-/// merged result. Generous: a worker under load still answers in microseconds,
-/// so hitting this means the worker is wedged, not busy.
+/// How long one worker gets to answer before it is left out of the merged
+/// result. Generous: a worker under load still answers in microseconds, so
+/// hitting this means the worker is wedged, not busy.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A replacement worker rebuilds its pools from config, so it must be told
-/// again what is draining. It binds its socket a moment after the fork.
-const REPLAY_ATTEMPTS: u32 = 40;
-const REPLAY_INTERVAL: Duration = Duration::from_millis(250);
+/// A replacement worker binds its socket a moment after the fork.
+const START_ATTEMPTS: u32 = 40;
+const START_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Largest line either end reads: an `Apply` carries the config files and
+/// the ACME certificates.
+pub const MAX_WORKER_LINE: u64 = 64 * 1024 * 1024;
+
+/// What the control worker asks a worker. Internal: not part of the
+/// operator protocol.
+#[derive(Serialize, Deserialize)]
+pub enum WorkerRequest {
+    Status,
+    BackendList { pool: String },
+    Drain { address: String },
+    Apply(Box<Applied>),
+}
+
+/// Everything a worker serves from, as the control worker applied it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Applied {
+    /// The config version; 0 for the files the node started with.
+    pub version: u64,
+    /// This node's `node.yaml` without its `cluster:` section (the join
+    /// secret stays with the control worker).
+    pub node_yaml: String,
+    pub files: crate::config::FileSet,
+    /// ACME certificates by host, which workers cannot read from storage.
+    pub certs: crate::tls::Issued,
+    /// Backend addresses drained through the cluster.
+    pub drained: BTreeSet<String>,
+}
 
 /// The directory holding the sockets the workers create.
 ///
-/// A subdirectory of the instance socket's directory, not the directory
-/// itself: the workers need to create files here, so it belongs to the
-/// unprivileged worker user, and anyone who can write a directory can unlink
-/// what is in it. Keeping the master's control socket out of a
-/// worker-writable directory stops a compromised worker from replacing it
-/// and answering operator commands in the master's place.
+/// A subdirectory of the runtime directory, not the directory itself: the
+/// workers create files here, so it belongs to their user, and anyone who
+/// can write a directory can unlink what is in it. Keeping the instance
+/// socket out of a worker-writable directory stops a compromised worker from
+/// replacing it and answering operator commands in its place.
 pub fn worker_socket_dir(control_socket: &str) -> std::path::PathBuf {
     Path::new(control_socket)
         .parent()
@@ -59,18 +83,13 @@ pub struct DrainOutcome {
     pub pools: Vec<String>,
     /// Workers that applied it.
     pub acknowledged: usize,
-    /// Workers the master expected to reach.
+    /// Workers expected to answer.
     pub workers: usize,
 }
 
 pub struct WorkerFanout {
     sockets: Vec<String>,
     started_at: Instant,
-    /// Backends drained through this master, replayed into any worker the
-    /// master restarts. Drains outlive a worker crash — an operator draining
-    /// a backend for a rolling upgrade would otherwise see traffic return to
-    /// it the moment a worker was replaced.
-    drained: Mutex<Vec<String>>,
 }
 
 impl WorkerFanout {
@@ -78,7 +97,6 @@ impl WorkerFanout {
         WorkerFanout {
             sockets: (0..workers).map(|i| worker_socket_path(control_socket, i)).collect(),
             started_at: Instant::now(),
-            drained: Mutex::new(Vec::new()),
         }
     }
 
@@ -86,7 +104,7 @@ impl WorkerFanout {
     /// (mid-restart) or wedged are skipped with a warning rather than failing
     /// the whole command — a partial answer beats no answer for an operator
     /// who is trying to see what is going on.
-    async fn ask_all(&self, request: &ControlRequest) -> Vec<ControlResponse> {
+    async fn ask_all(&self, request: &WorkerRequest) -> Vec<ControlResponse> {
         let line = match serde_json::to_string(request) {
             Ok(l) => l,
             Err(e) => {
@@ -117,12 +135,12 @@ impl WorkerFanout {
     }
 
     pub async fn status(&self) -> String {
-        let responses = self.ask_all(&ControlRequest::Status).await;
+        let responses = self.ask_all(&WorkerRequest::Status).await;
         if responses.is_empty() {
             return ControlResponse::err("no worker answered");
         }
-        // Uptime is the master's: workers come and go under it, and an
-        // operator asking how long the instance has been up means the
+        // Uptime is the control worker's: workers come and go under it, and
+        // an operator asking how long the instance has been up means the
         // instance, not the youngest worker.
         ControlResponse::ok(json!({
             "uptime_secs": self.started_at.elapsed().as_secs(),
@@ -131,7 +149,7 @@ impl WorkerFanout {
     }
 
     pub async fn backend_list(&self, pool: &str) -> String {
-        let request = ControlRequest::BackendList { pool: pool.to_owned() };
+        let request = WorkerRequest::BackendList { pool: pool.to_owned() };
         let responses = self.ask_all(&request).await;
         if responses.is_empty() {
             return ControlResponse::err("no worker answered");
@@ -157,7 +175,7 @@ impl WorkerFanout {
     }
 
     pub async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
-        let request = ControlRequest::BackendDrain { address: address.to_owned(), wait: false };
+        let request = WorkerRequest::Drain { address: address.to_owned() };
         let responses = self.ask_all(&request).await;
         if responses.is_empty() {
             return Err("no worker answered".into());
@@ -177,16 +195,9 @@ impl WorkerFanout {
             }
         }
 
-        {
-            let mut drained = self.drained.lock().unwrap();
-            if !drained.iter().any(|a| a == address) {
-                drained.push(address.to_owned());
-            }
-        }
         // A worker that did not answer is still sending traffic to the
-        // backend. The master will replay the drain if it restarts that
-        // worker, but until then the drain is only partly applied and the
-        // operator has to know.
+        // backend. It gets the drain with the next applied state, but until
+        // then the drain is only partly applied and the operator has to know.
         Ok(DrainOutcome {
             pools,
             acknowledged: responses.iter().filter(|r| r.ok).count(),
@@ -200,53 +211,47 @@ impl WorkerFanout {
     /// Reporting zero would tell `drain --wait` the backend is finished while
     /// connections are still open on it.
     pub async fn connections_for(&self, address: &str) -> Option<i64> {
-        let responses = self.ask_all(&ControlRequest::Status).await;
+        let responses = self.ask_all(&WorkerRequest::Status).await;
         if responses.is_empty() {
             return None;
         }
         Some(responses.iter().map(|r| connections_in(r, address)).sum())
     }
 
-    /// Re-apply the current drains to a worker the master just replaced.
-    ///
-    /// Waits for the replacement's socket to come up — Pingora takes about a
-    /// second to bootstrap — and replays whatever is draining at that moment.
-    /// A drain issued after the worker is reachable needs no replay: it goes
-    /// out through the normal fan-out.
-    pub async fn replay_drains(&self, index: usize) {
-        let Some(path) = self.sockets.get(index) else { return };
-        let probe = match serde_json::to_string(&ControlRequest::Status) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        for _ in 0..REPLAY_ATTEMPTS {
-            tokio::time::sleep(REPLAY_INTERVAL).await;
-            if let Err(e) = ask_one(path, &probe).await {
-                debug!(worker = %path, error = %e, "control: waiting for replacement worker");
-                continue;
-            }
-
-            let drained = self.drained.lock().unwrap().clone();
-            if drained.is_empty() {
-                return;
-            }
-            for address in &drained {
-                let request =
-                    ControlRequest::BackendDrain { address: address.clone(), wait: false };
-                let Ok(line) = serde_json::to_string(&request) else { continue };
-                match ask_one(path, &line).await {
-                    Ok(_) => info!(worker = %path, backend = %address, "control: re-applied drain to restarted worker"),
-                    Err(e) => warn!(worker = %path, backend = %address, error = %e, "control: could not re-apply drain to restarted worker"),
-                }
-            }
-            return;
+    /// Hand `applied` to every worker, in parallel, each waiting for its
+    /// socket like [`Self::apply_to`]. Returns how many applied it.
+    pub async fn apply_all(&self, applied: &Applied) -> usize {
+        let Ok(line) = serde_json::to_string(&WorkerRequest::Apply(Box::new(applied.clone()))) else { return 0 };
+        let mut calls = tokio::task::JoinSet::new();
+        for path in &self.sockets {
+            calls.spawn(apply_once_up(path.clone(), line.clone()));
         }
-        warn!(
-            worker = %path,
-            "control: replacement worker never answered — drain state not re-applied"
-        );
+        calls.join_all().await.into_iter().filter(|ok| *ok).count()
     }
+
+    /// Hand `applied` to worker `index`, waiting for its socket to come up —
+    /// a worker the master just started takes about a second to bootstrap.
+    pub async fn apply_to(&self, index: usize, applied: &Applied) -> bool {
+        let Some(path) = self.sockets.get(index) else { return false };
+        let Ok(line) = serde_json::to_string(&WorkerRequest::Apply(Box::new(applied.clone()))) else { return false };
+        apply_once_up(path.clone(), line).await
+    }
+}
+
+async fn apply_once_up(path: String, line: String) -> bool {
+    for _ in 0..START_ATTEMPTS {
+        match ask_one(&path, &line).await {
+            Ok(r) if r.ok => return true,
+            Ok(r) => {
+                warn!(worker = %path, error = r.error.as_deref().unwrap_or(""), "control: worker refused the applied config");
+                return false;
+            }
+            Err(e) => debug!(worker = %path, error = %e, "control: waiting for worker"),
+        }
+        tokio::time::sleep(START_INTERVAL).await;
+    }
+    warn!(worker = %path, "control: worker never answered; it serves the config it started with");
+    false
 }
 
 /// One request, one response line, over one worker socket.
@@ -258,8 +263,7 @@ async fn ask_one(path: &str, line: &str) -> anyhow::Result<ControlResponse> {
         writer.write_all(b"\n").await?;
         writer.flush().await?;
 
-        let mut response = String::new();
-        BufReader::new(reader).read_line(&mut response).await?;
+        let response = crate::control::read_line_capped(&mut BufReader::new(reader), MAX_WORKER_LINE).await?;
         let parsed: ControlResponse = serde_json::from_str(response.trim())?;
         Ok::<_, anyhow::Error>(parsed)
     };
@@ -395,6 +399,7 @@ fn health_rank(health: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     fn resp(pools: Value) -> ControlResponse {
         ControlResponse {
@@ -510,7 +515,6 @@ mod tests {
                 .map(|i| dir.join(format!("w{i}.sock")).to_string_lossy().into_owned())
                 .collect(),
             started_at: Instant::now(),
-            drained: Mutex::new(Vec::new()),
         }
     }
 

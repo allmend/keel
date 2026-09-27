@@ -151,19 +151,18 @@ Such an entry is not ACME-managed; `issuer` is ignored on it, and the files are 
 │   └── account.json              # one ACME account per issuer (0600)
 ├── internal/
 │   └── account.json
-├── challenges/                   # live HTTP-01 tokens (transient, auto-cleaned)
 ├── www.example.com.crt           # certificate chain
 ├── www.example.com.key           # private key (0600)
 └── db.example.com.crt / .key
 ```
 
-Certificate files are flat (`{host}.crt` / `{host}.key`) regardless of issuer, because a hostname has exactly one certificate. Changing an issuer's `directory` registers a fresh account; existing certificates keep serving until their normal renewal.
+Certificate files are flat (`{host}.crt` / `{host}.key`) regardless of issuer, because a hostname has exactly one certificate. Live HTTP-01 tokens are not here but in `challenges/` in the runtime directory (`/var/run/keel/challenges`), which the workers can read. Changing an issuer's `directory` registers a fresh account; existing certificates keep serving until their normal renewal.
 
 ---
 
 ## Reloads, restarts and persistence
 
-A reload, or a pushed version in a cluster, applies ACME changes at once. A new `tls.acme` vhost or `certificates:` entry is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
+A reload or a pushed version applies ACME changes at once. A new `tls.acme` vhost or `certificates:` entry is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
 
 Certificates persist on disk and are not re-issued on restart, reload, or reboot. On startup Keel loads whatever is in `storage`; the CA is contacted only when a certificate is missing, expired, unparsable, or inside its renewal window. A node that restarts while the CA is unreachable keeps serving its existing certificates.
 
@@ -171,7 +170,7 @@ Certificates persist on disk and are not re-issued on restart, reload, or reboot
 
 ## Cluster mode
 
-In cluster mode certificates are replicated through the Raft log:
+A node is always a cluster, of one or more. Certificates are replicated through the Raft log:
 
 - Only the leader contacts the CAs. One issuance, no duplicate certificates across nodes.
 - Each issuer's account is committed to the Raft log when first registered. Every node writes it to `storage/<issuer>/account.json`, and a new leader uses it instead of registering another. A node's own account file is committed only when the log holds none for that issuer's directory.
@@ -196,7 +195,7 @@ During step 6 the leader serves the new certificate while the other nodes still 
 
 ## How it works
 
-Every worker process runs the ACME service, and an exclusive lock in the storage directory ensures only one worker talks to the CAs at a time. Challenge tokens are written as files, so any worker can answer the CA's validation request regardless of which worker started the order. Issued and renewed certificates are hot-swapped into the listeners within a minute — no restart, no dropped connections.
+The control worker runs the ACME service; it is the only process that can read `acme.storage`. It writes challenge tokens into the runtime directory, where every worker answers the CA's validation request, and sends issued and renewed certificates to the workers, which swap them into their listeners — no restart, no dropped connections.
 
 A request for `/.well-known/acme-challenge/<token>` where the token is unknown is proxied normally. A backend that manages its own ACME certificates behind Keel keeps working.
 

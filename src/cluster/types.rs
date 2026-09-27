@@ -23,10 +23,8 @@ pub enum ClientRequest {
     SetConfig { yaml: String },
     /// A new config version: the whole file set of the config directory.
     SetConfigFiles { files: crate::config::FileSet },
-    /// Mark a backend as draining on all nodes.
-    DrainBackend { pool: String, address: String },
-    /// Re-activate a drained backend.
-    ActivateBackend { pool: String, address: String },
+    /// Drain a backend address in every pool, on every node.
+    DrainBackend { address: String },
     /// Replicate an ACME-issued certificate so every node (including late
     /// joiners, via snapshot) serves it without re-issuing.
     SetCert { host: String, cert_pem: String, key_pem: String },
@@ -63,6 +61,9 @@ pub type ClusterCaPair = Option<(String, String)>;
 /// for the whole cluster.
 pub type AcmeAccountMap = BTreeMap<String, String>;
 
+/// Backend addresses drained through the cluster, as written in the config.
+pub type DrainedSet = std::collections::BTreeSet<String>;
+
 /// A committed config: the file set and its version, the index of the log
 /// entry that committed it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,8 +91,9 @@ pub struct ClusterState {
     /// The committed config version. Applied on every node after commit.
     #[serde(default)]
     pub config: Option<ConfigVersion>,
-    /// Drain overrides: "pool/addr" → true means draining.
-    pub draining: BTreeMap<String, bool>,
+    /// Backend addresses drained in every pool, on every node.
+    #[serde(default)]
+    pub drained: DrainedSet,
     /// ACME certificates replicated cluster-wide.
     #[serde(default)]
     pub certs: CertMap,

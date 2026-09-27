@@ -6,8 +6,8 @@
 //! account; hostnames map to exactly one issuer.
 //!
 //! Managed hostnames come from two places:
-//!   - vhosts with `tls.acme` — issued certs are hot-swapped into the
-//!     `CertStore` so Keel terminates TLS with them;
+//!   - vhosts with `tls.acme` — issued certs go to the workers, which
+//!     terminate TLS with them;
 //!   - `certificates:` entries — hostnames Keel does not terminate TLS for
 //!     (plain TCP / TLS-passthrough backends). Keel answers the HTTP-01
 //!     challenge and writes the cert/key files for the operator or backend to
@@ -20,12 +20,12 @@
 //! remains — a percentage ("30%", scales from 90-day to 6-day certs) or an
 //! absolute window ("20d").
 //!
-//! Multi-process coordination (standalone mode runs one worker per process):
-//! challenge tokens are files under `{storage}/challenges/`, so ANY worker can
-//! answer the CA's validation request; issuance itself is serialized with an
-//! exclusive flock on `{storage}/.issuer.lock` so exactly one worker talks to
-//! the CAs. Every worker watches the cert files and hot-swaps renewed certs
-//! into its own CertStore.
+//! The service runs in the control worker, the only process that can read
+//! `acme.storage`. A node is always a cluster, of one or more: the leader
+//! talks to the CAs, certificates and challenge tokens replicate through
+//! Raft, and every node writes tokens to its runtime directory, where its
+//! workers answer the CA's validation requests. Changed certificates are sent
+//! to the workers by the apply driver.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::config::{AcmeConfig, AcmeIssuer, Config, RenewBefore};
-use crate::tls::{acme_cert_paths, CertStore};
+use crate::tls::acme_cert_paths;
 
 /// How often each worker wakes to check certs (renewal window, file changes).
 const CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -68,9 +68,10 @@ pub fn valid_token(token: &str) -> bool {
         && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Directory the proxy serves HTTP-01 responses from.
-pub fn challenge_dir(storage: &str) -> PathBuf {
-    Path::new(storage).join("challenges")
+/// Directory the workers serve HTTP-01 responses from: in the runtime
+/// directory, which they can read, not in `acme.storage`, which they cannot.
+pub fn challenge_dir(keel: &crate::config::KeelConfig) -> PathBuf {
+    keel.runtime_dir().join("challenges")
 }
 
 /// Account credentials wrapper persisted to `{storage}/{issuer}/account.json`.
@@ -119,21 +120,23 @@ impl Plan {
 /// takes effect at once, without a restart.
 pub struct AcmeService {
     config: tokio::sync::watch::Receiver<Arc<Config>>,
-    cert_store: Arc<CertStore>,
-    /// Present in cluster mode: certs replicate via Raft, only the leader
-    /// talks to the CAs.
-    cluster: Option<crate::cluster::ClusterHandle>,
+    /// Certificates replicate via Raft; only the leader talks to the CAs.
+    cluster: crate::cluster::ClusterHandle,
+    /// Woken when a certificate file changed, so the workers get it.
+    certs_changed: Arc<tokio::sync::Notify>,
+    challenges: PathBuf,
 }
 
 impl AcmeService {
-    /// `config` carries the applied config; the reload paths publish every
-    /// version they apply.
+    /// `config` carries the applied config; the apply driver publishes every
+    /// version it applies.
     pub fn new(
         config: tokio::sync::watch::Receiver<Arc<Config>>,
-        cert_store: Arc<CertStore>,
-        cluster: Option<crate::cluster::ClusterHandle>,
+        cluster: crate::cluster::ClusterHandle,
+        certs_changed: Arc<tokio::sync::Notify>,
     ) -> Self {
-        Self { config, cert_store, cluster }
+        let challenges = challenge_dir(&config.borrow().keel);
+        Self { config, cluster, certs_changed, challenges }
     }
 }
 
@@ -144,28 +147,19 @@ impl pingora::services::background::BackgroundService for AcmeService {
         // standalone mode nothing else installs one (idempotent).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Cluster: mirror the replicated challenge map into the local
-        // challenge directory, so THIS node answers HTTP-01 requests for
-        // orders started by the leader. Every node runs this; the map is the
-        // single source of truth for the directory in cluster mode.
-        if let Some(cluster) = &self.cluster {
-            let mut rx = cluster.challenges_rx.clone();
-            let mut config = self.config.clone();
+        // Mirror the replicated challenge map into the challenge directory,
+        // so THIS node answers HTTP-01 requests for orders the leader started.
+        // Every node runs this; the map is the directory's only source.
+        {
+            let mut rx = self.cluster.challenges_rx.clone();
+            let dir = self.challenges.clone();
             let mut shutdown_c = shutdown.clone();
             tokio::spawn(async move {
                 loop {
                     let map = rx.borrow_and_update().clone();
-                    let storage = config.borrow_and_update().acme_effective().map(|a| a.storage);
-                    if let Some(storage) = storage {
-                        if prepare_storage(&storage).is_ok() {
-                            sync_challenge_dir(&challenge_dir(&storage), &map);
-                        }
-                    }
+                    sync_challenge_dir(&dir, &map);
                     tokio::select! {
                         changed = rx.changed() => {
-                            if changed.is_err() { break; }
-                        }
-                        changed = config.changed() => {
                             if changed.is_err() { break; }
                         }
                         _ = shutdown_c.changed() => {
@@ -200,10 +194,10 @@ impl pingora::services::background::BackgroundService for AcmeService {
                         }
                         managed = now;
                         if issuers.as_ref().is_none_or(|p| p.acme != plan.acme) {
-                            issuers = Some(IssuerPool::new(&plan.acme));
+                            issuers = Some(IssuerPool::new(&plan.acme, &self.challenges));
                         }
                         let pool = issuers.as_mut().expect("set above");
-                        self.check(&cfg, &plan, pool, &mut cert_mtimes, &shutdown).await;
+                        self.check(&plan, pool, &mut cert_mtimes, &shutdown).await;
                     }
                 },
             }
@@ -222,56 +216,42 @@ impl pingora::services::background::BackgroundService for AcmeService {
 }
 
 impl AcmeService {
-    /// One round: adopt, issue what is due, replicate, hot-swap.
+    /// One round: adopt, issue what is due, replicate, hand to the workers.
     async fn check(
         &self,
-        cfg: &Config,
         plan: &Plan,
         issuers: &mut IssuerPool,
         cert_mtimes: &mut HashMap<String, SystemTime>,
         shutdown: &pingora::server::ShutdownWatch,
     ) {
-        let storage = &plan.acme.storage;
-        // Cluster: adopt any replicated cert that is better (longer valid)
-        // than what this node has on disk — BEFORE the issuance check, so
-        // a node never re-issues something the cluster already holds.
+        // Adopt any replicated cert that is better (longer valid) than what
+        // this node has on disk — BEFORE the issuance check, so a node never
+        // re-issues something the cluster already holds.
         self.pull_cluster_certs(plan).await;
-        if let Some(cluster) = &self.cluster {
-            sync_account_files(storage, &cluster.acme_accounts_rx.borrow().clone());
-        }
+        sync_account_files(&plan.acme.storage, &self.cluster.acme_accounts_rx.borrow().clone());
 
-        // Only the leader talks to the CAs in cluster mode; standalone
-        // always may. The flock additionally serializes across workers.
-        if self.may_issue().await {
-            match try_issuer_lock(storage) {
-                Ok(Some(_lock)) => {
-                    for m in &plan.managed {
-                        if *shutdown.borrow() {
-                            break;
-                        }
-                        issuers.maybe_issue(&m.host, &m.issuer, self.cluster.as_ref()).await;
-                    }
-                    // _lock drops here, releasing the flock.
+        // Only the leader talks to the CAs.
+        if self.is_leader().await {
+            for m in &plan.managed {
+                if *shutdown.borrow() {
+                    break;
                 }
-                Ok(None) => {} // another worker is the issuer this cycle
-                Err(e) => warn!(error = %format!("{e:#}"), "acme: issuer lock failed"),
+                issuers.maybe_issue(&m.host, &m.issuer, &self.cluster).await;
             }
         }
 
-        // Cluster leader: replicate any disk cert that is better than (or
-        // missing from) the Raft state — covers fresh issuance and certs
-        // that survived a full-cluster restart on disk only.
+        // Leader: replicate any disk cert that is better than (or missing
+        // from) the Raft state — covers fresh issuance and certs that
+        // survived a full-cluster restart on disk only.
         self.push_cluster_certs(plan).await;
 
-        // Every worker: hot-swap certs that changed on disk (issued here,
-        // by another worker, or adopted from the cluster).
-        self.reload_changed_certs(cfg, plan, cert_mtimes);
+        // Hand certs that changed on disk (issued here or adopted from the
+        // cluster) to the workers.
+        self.notify_changed_certs(plan, cert_mtimes);
     }
 
-    /// In cluster mode: true only on the current Raft leader.
-    async fn may_issue(&self) -> bool {
-        let Some(cluster) = &self.cluster else { return true };
-        let Some(raft) = cluster.raft().await else { return false };
+    async fn is_leader(&self) -> bool {
+        let Some(raft) = self.cluster.raft().await else { return false };
         let m = raft.metrics().borrow().clone();
         m.current_leader == Some(m.id)
     }
@@ -280,8 +260,7 @@ impl AcmeService {
     /// copy. "Better" = valid with more remaining lifetime; the loser is
     /// overwritten so disk and Raft converge on one source of truth.
     async fn pull_cluster_certs(&self, plan: &Plan) {
-        let Some(cluster) = &self.cluster else { return };
-        let replicated = cluster.certs_rx.borrow().clone();
+        let replicated = self.cluster.certs_rx.borrow().clone();
         for m in &plan.managed {
             let Some((cert_pem, key_pem)) = replicated.get(&m.host) else { continue };
             let raft_remaining = match pem_remaining_secs(cert_pem) {
@@ -305,15 +284,14 @@ impl AcmeService {
     /// Leader only: replicate disk certs that beat (or are missing from) the
     /// Raft state, so followers and future joiners receive them.
     async fn push_cluster_certs(&self, plan: &Plan) {
-        let Some(cluster) = &self.cluster else { return };
-        let Some(raft) = cluster.raft().await else { return };
+        let Some(raft) = self.cluster.raft().await else { return };
         {
             let m = raft.metrics().borrow().clone();
             if m.current_leader != Some(m.id) {
                 return;
             }
         }
-        let replicated = cluster.certs_rx.borrow().clone();
+        let replicated = self.cluster.certs_rx.borrow().clone();
         for m in &plan.managed {
             let (cert_path, key_path) = acme_cert_paths(&plan.acme.storage, &m.host);
             let Ok(cert_pem) = std::fs::read_to_string(&cert_path) else { continue };
@@ -335,9 +313,9 @@ impl AcmeService {
         }
     }
 
-    /// Reload the CertStore from the applied config when any vhost-managed
-    /// cert file changed on disk.
-    fn reload_changed_certs(&self, cfg: &Config, plan: &Plan, seen: &mut HashMap<String, SystemTime>) {
+    /// Wake the apply driver when any vhost-managed cert file changed on
+    /// disk: it sends the workers the certificates they serve.
+    fn notify_changed_certs(&self, plan: &Plan, seen: &mut HashMap<String, SystemTime>) {
         let mut changed = false;
         for m in plan.managed.iter().filter(|m| m.vhost_managed) {
             let (cert_path, _) = acme_cert_paths(&plan.acme.storage, &m.host);
@@ -348,10 +326,8 @@ impl AcmeService {
             }
         }
         if changed {
-            match self.cert_store.reload(cfg) {
-                Ok(()) => info!("acme: certificates hot-swapped into TLS store"),
-                Err(e) => error!(error = %format!("{e:#}"), "acme: cert store reload failed"),
-            }
+            info!("acme: certificates changed; handing them to the workers");
+            self.certs_changed.notify_one();
         }
     }
 }
@@ -387,34 +363,7 @@ fn sync_challenge_dir(dir: &Path, map: &crate::cluster::types::ChallengeMap) {
 }
 
 fn prepare_storage(storage: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(storage).with_context(|| format!("create {storage}"))?;
-    // Private keys live here — owner only.
-    std::fs::set_permissions(storage, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {storage}"))?;
-    let challenges = challenge_dir(storage);
-    std::fs::create_dir_all(&challenges)
-        .with_context(|| format!("create {}", challenges.display()))?;
-    // Tokens are public by definition; workers may run as different users.
-    std::fs::set_permissions(&challenges, std::fs::Permissions::from_mode(0o755))?;
-    Ok(())
-}
-
-/// Take the cross-process issuer lock non-blockingly. Returns the held lock
-/// (released on drop) or None if another worker has it.
-fn try_issuer_lock(storage: &str) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> {
-    let path = Path::new(storage).join(".issuer.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(lock) => Ok(Some(lock)),
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-        Err((_, e)) => Err(anyhow::anyhow!("flock: {e}")),
-    }
+    private_dir(Path::new(storage))
 }
 
 // Issuer pool — the part that talks to the CAs
@@ -422,6 +371,8 @@ fn try_issuer_lock(storage: &str) -> Result<Option<nix::fcntl::Flock<std::fs::Fi
 struct IssuerPool {
     /// The `acme:` section this pool was built from.
     acme: AcmeConfig,
+    /// Where the challenge sync writes tokens; checked before the CA is told.
+    challenges: PathBuf,
     storage: String,
     global_renew: RenewBefore,
     issuers: HashMap<String, AcmeIssuer>,
@@ -433,12 +384,13 @@ struct IssuerPool {
 }
 
 impl IssuerPool {
-    fn new(acme: &AcmeConfig) -> Self {
+    fn new(acme: &AcmeConfig, challenges: &Path) -> Self {
         // Validated at config load; fall back to 30% defensively.
         let global_renew =
             RenewBefore::parse(&acme.renew_before).unwrap_or(RenewBefore::Percent(30));
         Self {
             acme: acme.clone(),
+            challenges: challenges.to_path_buf(),
             storage: acme.storage.clone(),
             global_renew,
             issuers: acme.issuers.clone(),
@@ -464,7 +416,7 @@ impl IssuerPool {
         &mut self,
         host: &str,
         issuer_name: &str,
-        cluster: Option<&crate::cluster::ClusterHandle>,
+        cluster: &crate::cluster::ClusterHandle,
     ) {
         let issuer = self.issuer(issuer_name);
         if !needs_issuance(&self.storage, host, self.renew_before(&issuer)) {
@@ -504,7 +456,7 @@ impl IssuerPool {
         host: &str,
         issuer_name: &str,
         issuer: &AcmeIssuer,
-        cluster: Option<&crate::cluster::ClusterHandle>,
+        cluster: &crate::cluster::ClusterHandle,
     ) -> Result<()> {
         let account = self.account(issuer_name, issuer, cluster).await?;
 
@@ -515,15 +467,11 @@ impl IssuerPool {
             .context("new order")?;
 
         // Publish HTTP-01 responses for all pending authorizations, then tell
-        // the CA to validate. Tokens are cleaned up when we're done, pass or fail.
-        //
-        // Standalone: the token is written straight to the challenge dir.
-        // Cluster: the token is committed to the Raft log and the challenge
-        // sync task writes the file on every node (including this one); the CA
-        // is signalled only after every node is confirmed to hold the token,
-        // because it may validate from multiple vantage points that can reach
-        // any node.
-        let mut published: Vec<PathBuf> = Vec::new();
+        // the CA to validate. Each token is committed to the Raft log and the
+        // challenge sync writes the file on every node (this one included);
+        // the CA is signalled only once every node holds it, because it may
+        // validate from vantage points that reach any node. Tokens are
+        // retracted when we're done, pass or fail.
         let mut cluster_tokens: Vec<String> = Vec::new();
         let result = async {
             let mut authorizations = order.authorizations();
@@ -543,15 +491,8 @@ impl IssuerPool {
                     anyhow::bail!("CA sent a token with unexpected characters");
                 }
                 let key_auth = challenge.key_authorization();
-                if let Some(cluster) = cluster {
-                    self.replicate_challenge(cluster, &token, key_auth.as_str()).await?;
-                    cluster_tokens.push(token);
-                } else {
-                    let token_path = challenge_dir(&self.storage).join(&token);
-                    std::fs::write(&token_path, key_auth.as_str())
-                        .with_context(|| format!("write {}", token_path.display()))?;
-                    published.push(token_path);
-                }
+                self.replicate_challenge(cluster, &token, key_auth.as_str()).await?;
+                cluster_tokens.push(token);
                 ready += 1;
                 challenge.set_ready().await.context("set challenge ready")?;
             }
@@ -576,18 +517,12 @@ impl IssuerPool {
         }
         .await;
 
-        for p in published {
-            let _ = std::fs::remove_file(p);
-        }
         // Retract replicated tokens; the sync task removes the files on every
         // node. Best effort — if leadership was lost mid-order this fails and
         // the tokens linger in the map until a later issuance cycle; a stale
         // token is served but validates nothing.
         if !cluster_tokens.is_empty() {
-            if let Some(raft) = match cluster {
-                Some(c) => c.raft().await,
-                None => None,
-            } {
+            if let Some(raft) = cluster.raft().await {
                 for token in cluster_tokens {
                     if let Err(e) = crate::cluster::remove_challenge(&raft, token).await {
                         warn!(host, error = %format!("{e:#}"), "acme: challenge retraction failed");
@@ -630,7 +565,7 @@ impl IssuerPool {
         // Belt and braces: the local file is written by the same sync task
         // pipeline as on followers. Seeing it appear confirms that pipeline
         // end-to-end before the CA is signalled.
-        let local = challenge_dir(&self.storage).join(token);
+        let local = self.challenges.join(token);
         for _ in 0..20 {
             if local.exists() {
                 return Ok(());
@@ -649,14 +584,17 @@ impl IssuerPool {
         &mut self,
         issuer_name: &str,
         issuer: &AcmeIssuer,
-        cluster: Option<&crate::cluster::ClusterHandle>,
+        cluster: &crate::cluster::ClusterHandle,
     ) -> Result<&Account> {
         let dir = Path::new(&self.storage).join(issuer_name);
         private_dir(&dir)?;
         let path = dir.join("account.json");
 
         let replicated = cluster
-            .and_then(|c| c.acme_accounts_rx.borrow().get(issuer_name).cloned())
+            .acme_accounts_rx
+            .borrow()
+            .get(issuer_name)
+            .cloned()
             .filter(|json| stored_for(json, &issuer.directory).is_some());
         if let Some(json) = replicated {
             if self.accounts.get(issuer_name).map(|(_, j)| j) != Some(&json) {
@@ -705,10 +643,7 @@ impl IssuerPool {
             self.accounts.insert(issuer_name.to_owned(), (account, json));
         }
 
-        if let Some(raft) = match cluster {
-            Some(c) => c.raft().await,
-            None => None,
-        } {
+        if let Some(raft) = cluster.raft().await {
             let json = self.accounts[issuer_name].1.clone();
             match crate::cluster::push_acme_account(&raft, issuer_name.to_owned(), json).await {
                 Ok(()) => info!(issuer = issuer_name, "acme: account committed to the cluster"),

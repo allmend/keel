@@ -230,6 +230,30 @@ impl Stack {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Cut a running service off the stack's network, or put it back at
+    /// `ip`: a network split without stopping anything.
+    pub fn disconnect(&self, service: &str) -> Result<()> {
+        self.network(&["disconnect"], service)
+    }
+
+    pub fn reconnect(&self, service: &str, ip: &str) -> Result<()> {
+        self.network(&["connect", "--ip", ip], service)
+    }
+
+    fn network(&self, action: &[&str], service: &str) -> Result<()> {
+        let out = self.compose(&["ps", "--quiet", service])?;
+        let container = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let network = format!("{}_net", self.project);
+        let mut args = vec!["network"];
+        args.extend_from_slice(action);
+        args.extend([network.as_str(), container.as_str()]);
+        let out = Command::new("docker").args(&args).output().context("cannot run docker")?;
+        if !out.status.success() {
+            bail!("docker {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
     /// Move a stopped service to another address on the stack's network.
     pub fn set_ip(&self, service: &str, ip: &str) -> Result<()> {
         let out = self.compose(&["ps", "--all", "--quiet", service])?;

@@ -3,7 +3,6 @@ use crate::{
     backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
     cache::CacheHandle,
     config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, VhostCacheConfig},
-    control::ControlServer,
     health,
     metrics::MetricsService,
     tls::CertStore,
@@ -32,7 +31,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 
 // Per-request context
@@ -742,58 +740,6 @@ fn is_trusted_proxy(ip: &IpAddr, cidrs: &[String]) -> bool {
     })
 }
 
-// Hot reload service
-
-struct ReloadService {
-    routing: Arc<ArcSwap<RoutingTable>>,
-    pools: Arc<PoolRegistry>,
-    cert_store: Arc<CertStore>,
-    /// The applied config, for services that follow it (ACME).
-    applied: tokio::sync::watch::Sender<Arc<Config>>,
-    config_path: String,
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for ReloadService {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        let mut sighup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = %e, "reload: failed to register SIGHUP handler");
-                return;
-            }
-        };
-
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                _ = sighup.recv() => {
-                    match crate::config::load(&self.config_path) {
-                        Ok(new_cfg) => {
-                            self.routing.store(Arc::new(RoutingTable::build(&new_cfg)));
-                            self.pools.sync_from_config(&new_cfg);
-                            if let Err(e) = self.cert_store.reload(&new_cfg) {
-                                error!(error = %e, "TLS cert reload failed, keeping previous certs");
-                            }
-                            self.applied.send_replace(Arc::new(new_cfg));
-                            info!(path = self.config_path, "config reloaded");
-                        }
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                path = self.config_path,
-                                "config reload failed, keeping previous config"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 // Server startup
 
 /// Sockets a worker inherited from the root master (see process::BoundListeners).
@@ -1047,11 +993,41 @@ fn send_inherited_fds(inherited: Option<&WorkerSockets>) {
     });
 }
 
+/// Applies what the control worker sends: a config version with its ACME
+/// certificates and the cluster's drains.
+struct WorkerApplier {
+    routing: Arc<ArcSwap<RoutingTable>>,
+    pools: Arc<PoolRegistry>,
+    cert_store: Arc<CertStore>,
+    /// The last applied state, to skip what did not change.
+    last: std::sync::Mutex<Option<crate::control::fanout::Applied>>,
+}
+
+impl crate::control::worker_socket::Apply for WorkerApplier {
+    fn apply(&self, next: &crate::control::fanout::Applied) -> Result<(), String> {
+        let cfg = crate::config::assemble(&next.node_yaml, &next.files).map_err(|e| format!("{e:#}"))?;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let config_changed = last
+            .as_ref()
+            .is_none_or(|l| l.version != next.version || l.files != next.files || l.node_yaml != next.node_yaml);
+        if config_changed {
+            self.routing.store(Arc::new(RoutingTable::build(&cfg)));
+            self.pools.sync_from_config(&cfg);
+        }
+        let certs = self.cert_store.reload(&cfg, &next.certs);
+        for address in next.drained.iter().filter(|a| last.as_ref().is_none_or(|l| !l.drained.contains(*a))) {
+            self.pools.drain_by_address(address);
+        }
+        *last = Some(next.clone());
+        certs.map_err(|e| format!("TLS certificates not reloaded, previous ones kept: {e:#}"))
+    }
+}
+
 // Start the Pingora proxy server. Never returns.
 //
 // `index` is the worker's position among `keel.workers`; it names the worker's
-// own control socket. The instance socket belongs to the master, which fans
-// commands out to every worker (see `control::fanout`).
+// own control socket, where the control worker asks for its view and hands it
+// every applied config.
 pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
     let mut inherited = inherited;
@@ -1072,7 +1048,9 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     };
     add_health_services(&mut server, cfg, &pools);
 
-    let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
+    // ACME certificates arrive from the control worker; until then an ACME
+    // host has none.
+    let cert_store = Arc::new(CertStore::build(cfg, &Default::default()).unwrap_or_else(|e| {
         error!(error = %e, "failed to load TLS certificates");
         std::process::exit(1);
     }));
@@ -1091,26 +1069,15 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         }
     };
 
-    // Register the hot-reload background service.
-    let (applied_tx, applied_rx) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
-    server.add_service(background_service(
-        "reload",
-        ReloadService {
-            routing: Arc::clone(&routing),
-            pools: Arc::clone(&pools),
-            cert_store: Arc::clone(&cert_store),
-            applied: applied_tx,
-            config_path: cfg.path.clone(),
-        },
-    ));
-    server.add_service(background_service(
-        "acme",
-        crate::acme::AcmeService::new(applied_rx, Arc::clone(&cert_store), None),
-    ));
-
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
     add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
 
+    let applier = WorkerApplier {
+        routing: Arc::clone(&routing),
+        pools: Arc::clone(&pools),
+        cert_store: Arc::clone(&cert_store),
+        last: std::sync::Mutex::new(None),
+    };
     let proxy = KProxy {
         routing,
         pools: Arc::clone(&pools),
@@ -1145,39 +1112,16 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
 
     server.add_service(svc);
     server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
-    // Workers answer only on their own socket. The master owns
-    // `keel.control_socket` and the remote listener, and merges what the
-    // workers report — a single worker's view is a fraction of the instance.
     server.add_service(background_service(
         "control",
-        ControlServer {
-            socket_path: crate::control::fanout::worker_socket_path(
-                &cfg.keel.control_socket,
-                index,
-            ),
-            dispatch: crate::control::Dispatch::local(Arc::clone(&pools), None),
-            owner: None,
+        crate::control::worker_socket::WorkerSocket {
+            path: crate::control::fanout::worker_socket_path(&cfg.keel.control_socket, index),
+            pools,
+            applier: Arc::new(applier),
         },
     ));
 
     server.run_forever()
-}
-
-/// Register the mTLS remote control listener when `control.remote` is set.
-fn add_remote_control(
-    server: &mut Server,
-    cfg: &Config,
-    dispatch: &Arc<crate::control::Dispatch>,
-) {
-    let Some(remote) = cfg.control.as_ref().and_then(|c| c.remote.clone()) else { return };
-    server.add_service(background_service(
-        "control-remote",
-        crate::control::remote::RemoteControlServer {
-            cfg: remote,
-            ca_dir: cfg.keel.control_ca_dir(),
-            dispatch: Arc::clone(dispatch),
-        },
-    ));
 }
 
 /// HTTP listener that expects a PROXY protocol header first. The header is
@@ -1381,354 +1325,5 @@ fn add_udp_services(
             proxy_protocol: l.proxy_protocol,
         };
         server.add_service(background_service(&format!("udp-{}", l.address), svc));
-    }
-}
-
-// Cluster reload watcher
-
-/// Applies every committed config version on this node. A version is built
-/// against this node's `node.yaml` and applied in place; only then are the
-/// config directory and the "last applied" record written, so the files are
-/// always the last version that worked here. A version that fails leaves the
-/// node serving the previous one, files untouched.
-struct ClusterReloadWatcher {
-    routing: Arc<ArcSwap<RoutingTable>>,
-    pools: Arc<PoolRegistry>,
-    cert_store: Arc<CertStore>,
-    /// The applied config, for services that follow it (ACME).
-    applied: tokio::sync::watch::Sender<Arc<Config>>,
-    config_rx: tokio::sync::watch::Receiver<Option<crate::cluster::types::ConfigVersion>>,
-    node_yaml: String,
-    config_dir: std::path::PathBuf,
-    state_dir: std::path::PathBuf,
-}
-
-impl ClusterReloadWatcher {
-    fn apply(&self, next: &crate::cluster::types::ConfigVersion) {
-        use crate::cluster::applied;
-        let serving = applied::read(&self.state_dir).ok().flatten();
-        if serving.as_ref().is_some_and(|a| a.version == next.version) {
-            return;
-        }
-        match crate::config::assemble(&self.node_yaml, &next.files) {
-            Ok(cfg) => {
-                self.routing.store(Arc::new(RoutingTable::build(&cfg)));
-                self.pools.sync_from_config(&cfg);
-                if let Err(e) = self.cert_store.reload(&cfg) {
-                    error!(error = %e, "cluster: TLS cert reload failed");
-                }
-                self.applied.send_replace(Arc::new(cfg));
-                let written = applied::write_config_dir(&self.config_dir, &next.files)
-                    .and_then(|()| applied::save(&self.state_dir, next.version, &next.files));
-                match written {
-                    Ok(()) => info!(version = next.version, "cluster: config version applied"),
-                    Err(e) => error!(
-                        version = next.version,
-                        error = %format!("{e:#}"),
-                        "cluster: config version applied, but its files could not be written"
-                    ),
-                }
-            }
-            Err(e) => error!(
-                version = next.version,
-                serving = serving.map(|a| a.version),
-                error = %format!("{e:#}"),
-                "cluster: config version cannot be applied; still serving the previous one, files unchanged"
-            ),
-        }
-    }
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for ClusterReloadWatcher {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        let mut rx = self.config_rx.clone();
-        loop {
-            let current = rx.borrow_and_update().clone();
-            if let Some(next) = current {
-                self.apply(&next);
-            }
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                result = rx.changed() => {
-                    if result.is_err() { return; }
-                }
-            }
-        }
-    }
-}
-
-/// SIGHUP on a cluster node: reconcile its config directory into the cluster
-/// as the next version. Every node, this one included, then applies it.
-struct ClusterReconcileOnSighup {
-    cluster: crate::cluster::ClusterHandle,
-}
-
-#[async_trait]
-impl pingora::services::background::BackgroundService for ClusterReconcileOnSighup {
-    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        let mut sighup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = %e, "reload: failed to register SIGHUP handler");
-                return;
-            }
-        };
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                _ = sighup.recv() => {
-                    let pushed = match crate::config::read_config_dir(&self.cluster.config_dir) {
-                        Ok(files) => self.cluster.push_config(files).await,
-                        Err(e) => Err(e),
-                    };
-                    match pushed {
-                        Ok(version) => info!(version, "reload: config directory committed as a new version"),
-                        Err(e) => error!(error = %format!("{e:#}"), "reload: config directory not pushed"),
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Start the proxy in cluster mode: registers ClusterService as a background service
-// and watches Raft-committed config changes. Never returns.
-pub fn run_cluster(
-    cfg: &Config,
-    cluster: crate::cluster::ClusterHandle,
-    cluster_svc: crate::cluster::ClusterService,
-    inherited: Option<WorkerSockets>,
-) -> ! {
-    let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
-    let mut inherited = inherited;
-
-    let mut server = new_server(cfg, inherited.as_ref());
-    send_inherited_fds(inherited.as_ref());
-    server.bootstrap();
-    if let Some(w) = inherited.as_mut() {
-        crate::health::icmp::init(crate::health::icmp::IcmpSockets { v4: w.icmp4.take(), v6: w.icmp6.take() });
-    }
-
-    let pools = match build_pools(cfg) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            error!(error = %e, "failed to build pool registry");
-            std::process::exit(1);
-        }
-    };
-    add_health_services(&mut server, cfg, &pools);
-
-    let cert_store = Arc::new(CertStore::build(cfg).unwrap_or_else(|e| {
-        error!(error = %e, "failed to load TLS certificates");
-        std::process::exit(1);
-    }));
-
-    let access_logger = Arc::new(AccessLogger::new(&cfg.access_log));
-
-    let cache = match crate::cache::init(&cfg.cache) {
-        Ok(Some(h)) => {
-            log_cache_mode(&cfg.cache);
-            Some(h)
-        }
-        Ok(None) => None,
-        Err(e) => {
-            error!(error = %e, "cache: init failed, caching disabled");
-            None
-        }
-    };
-
-    server.add_service(background_service("cluster", cluster_svc));
-    let (applied_tx, applied_rx) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
-    server.add_service(background_service(
-        "cluster-reload",
-        ClusterReloadWatcher {
-            routing: Arc::clone(&routing),
-            pools: Arc::clone(&pools),
-            cert_store: Arc::clone(&cert_store),
-            applied: applied_tx,
-            config_rx: cluster.config_rx.clone(),
-            node_yaml: cfg.node_yaml.clone(),
-            config_dir: std::path::PathBuf::from(&cfg.keel.config_dir),
-            state_dir: std::path::PathBuf::from(&cfg.keel.state_dir),
-        },
-    ));
-    server.add_service(background_service("reload", ClusterReconcileOnSighup { cluster: cluster.clone() }));
-
-    server.add_service(background_service(
-        "acme",
-        crate::acme::AcmeService::new(applied_rx, Arc::clone(&cert_store), Some(cluster.clone())),
-    ));
-
-    add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
-    add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
-
-    let proxy = KProxy {
-        routing,
-        pools: Arc::clone(&pools),
-        access_logger,
-        cache,
-    };
-    add_proxy_protocol_services(&mut server, cfg, proxy.clone());
-    add_proxy_protocol_tls_services(&mut server, cfg, proxy.clone(), &cert_store);
-    let mut svc = http_proxy_service(&server.configuration, proxy);
-
-    let plain: Vec<_> = cfg
-        .listeners
-        .iter()
-        .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
-        .collect();
-    let tls_listeners: Vec<_> = cfg.listeners.iter().filter(|l| l.tls && !l.proxy_protocol).collect();
-
-    if cfg.listeners.is_empty() {
-        info!("no listeners configured, defaulting to 0.0.0.0:8080");
-        svc.add_tcp("0.0.0.0:8080");
-    } else {
-        for l in plain {
-            info!(address = l.address, "adding listener");
-            svc.add_tcp(&l.address);
-        }
-        for l in tls_listeners {
-            let settings = build_tls_settings(&cert_store, &l.address);
-            info!(address = l.address, "adding TLS listener");
-            svc.add_tls_with_settings(&l.address, None, settings);
-        }
-    }
-
-    server.add_service(svc);
-    server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
-    // Cluster mode never forks, so this process owns the instance socket and
-    // answers from its own registry.
-    let dispatch = crate::control::Dispatch::local(Arc::clone(&pools), Some(cluster));
-    add_remote_control(&mut server, cfg, &dispatch);
-    server.add_service(background_service(
-        "control",
-        ControlServer {
-            socket_path: cfg.keel.control_socket.clone(),
-            dispatch,
-            owner: None,
-        },
-    ));
-
-    server.run_forever()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stripping_forwarded_headers_keeps_the_request_serializable() {
-        // Built like a parsed downstream HTTP/1 request: header case kept.
-        let mut req = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
-        req.insert_header("X-Forwarded-For", "6.6.6.6").unwrap();
-        req.insert_header("Host", "example.com").unwrap();
-        req.insert_header("Forwarded", "for=6.6.6.6").unwrap();
-        req.insert_header("Accept", "*/*").unwrap();
-        strip_forwarded_headers(&mut req);
-        let mut wire = Vec::new();
-        req.header_to_h1_wire(&mut wire);
-        let wire = String::from_utf8(wire).unwrap();
-        assert!(wire.contains("Host: example.com\r\n") && wire.contains("Accept: */*\r\n"));
-        assert!(!wire.to_ascii_lowercase().contains("forwarded"));
-    }
-
-    fn rule(ttl: Option<u32>) -> VhostCacheConfig {
-        VhostCacheConfig { enabled: true, ttl, statuses: vec![], content_types: vec![] }
-    }
-
-    fn req(headers: &[(&str, &str)]) -> pingora::http::RequestHeader {
-        let mut r = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
-        for (k, v) in headers {
-            r.insert_header(k.to_string(), *v).unwrap();
-        }
-        r
-    }
-
-    fn resp(headers: &[(&str, &str)]) -> pingora::http::ResponseHeader {
-        let mut r = pingora::http::ResponseHeader::build(200, None).unwrap();
-        for (k, v) in headers {
-            r.append_header(k.to_string(), *v).unwrap();
-        }
-        r
-    }
-
-    fn stored(rule: &VhostCacheConfig, req: &pingora::http::RequestHeader, resp: &pingora::http::ResponseHeader) -> bool {
-        matches!(response_cacheability(rule, req, resp, std::time::SystemTime::now()), RespCacheable::Cacheable(_))
-    }
-
-    #[test]
-    fn ttl_fallback_never_overrides_the_origin() {
-        let r = rule(Some(60));
-        let anon = req(&[]);
-        assert!(stored(&r, &anon, &resp(&[])), "no freshness information: the fallback applies");
-        assert!(!stored(&rule(None), &anon, &resp(&[])), "no ttl and no freshness: not stored");
-        assert!(!stored(&r, &anon, &resp(&[("cache-control", "private")])));
-        assert!(!stored(&r, &anon, &resp(&[("cache-control", "no-store")])));
-        assert!(!stored(&r, &anon, &resp(&[("set-cookie", "session=a")])));
-        assert!(!stored(&r, &anon, &resp(&[("cache-control", "public, max-age=60"), ("set-cookie", "session=a")])));
-        assert!(!stored(&r, &anon, &resp(&[("vary", "Accept, *")])));
-        assert!(stored(&r, &anon, &resp(&[("cache-control", "public, max-age=60")])));
-        assert!(stored(&rule(None), &anon, &resp(&[("cache-control", "max-age=60")])), "origin freshness needs no ttl");
-    }
-
-    #[test]
-    fn personalised_requests_need_the_origins_permission() {
-        let r = rule(Some(60));
-        let cookie = req(&[("cookie", "user=alice")]);
-        let auth = req(&[("authorization", "Bearer x")]);
-        assert!(!stored(&r, &cookie, &resp(&[])), "fallback skips requests with Cookie");
-        assert!(!stored(&r, &auth, &resp(&[])), "fallback skips requests with Authorization");
-        assert!(!stored(&r, &auth, &resp(&[("cache-control", "max-age=60")])), "RFC 9111 3.5");
-        assert!(stored(&r, &auth, &resp(&[("cache-control", "public, max-age=60")])));
-        assert!(stored(&r, &cookie, &resp(&[("cache-control", "max-age=60")])));
-    }
-
-    #[test]
-    fn status_and_content_type_filters_apply_first() {
-        let mut r = rule(Some(60));
-        r.content_types = vec!["text/*".into()];
-        let anon = req(&[]);
-        assert!(stored(&r, &anon, &resp(&[("content-type", "text/html; charset=utf-8")])));
-        assert!(!stored(&r, &anon, &resp(&[("content-type", "image/png")])));
-        let mut not_found = pingora::http::ResponseHeader::build(404, None).unwrap();
-        not_found.insert_header("cache-control", "public, max-age=60").unwrap();
-        assert!(!stored(&rule(Some(60)), &anon, &not_found), "only 200 by default");
-    }
-
-    #[test]
-    fn vary_names_are_split_and_lowercased() {
-        let r = resp(&[("vary", "Accept-Encoding, Accept-Language"), ("vary", "X-Tenant")]);
-        assert_eq!(vary_names(&r), ["accept-encoding", "accept-language", "x-tenant"]);
-    }
-
-    // `build` normalizes an absolute-form target to its path, so the h2 shape
-    // (authority, no Host header) has to be set on the URI directly.
-    fn req_with(headers: &[(&str, &str)], uri: &str) -> pingora::http::RequestHeader {
-        let mut r = pingora::http::RequestHeader::build("GET", b"/", None).unwrap();
-        r.set_uri(uri.parse::<http::Uri>().unwrap());
-        for (k, v) in headers {
-            r.insert_header(k.to_string(), *v).unwrap();
-        }
-        r
-    }
-
-    #[test]
-    fn the_requested_host_comes_from_the_header_or_the_authority() {
-        // HTTP/1.1: the Host header.
-        assert_eq!(requested_host(&req_with(&[("host", "a.example")], "/x")), "a.example");
-        // HTTP/2: no Host header, the name is in :authority (the request URI).
-        assert_eq!(requested_host(&req_with(&[], "https://b.example/x")), "b.example");
-        // Both: the header wins, as it does for HTTP/1.1 proxies.
-        assert_eq!(
-            requested_host(&req_with(&[("host", "a.example")], "https://b.example/x")),
-            "a.example"
-        );
-        // Neither: callers substitute their own fallback.
-        assert_eq!(requested_host(&req_with(&[], "/x")), "");
     }
 }

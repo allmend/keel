@@ -35,26 +35,20 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_SOCKET)]
     socket: String,
 
-    /// Enable cluster mode
-    #[arg(long)]
-    cluster: bool,
-
-    /// Bootstrap a new cluster (first node)
-    #[arg(long, requires = "cluster")]
-    bootstrap: bool,
-
-    /// Join an existing cluster at this address
-    #[arg(long, requires = "cluster")]
-    join: Option<String>,
-
-    /// Shared secret for cluster join / bootstrap
-    #[arg(long)]
-    secret: Option<String>,
-
     /// Forced recovery after a permanently lost majority: keep this node's
     /// stored state and make it the only member of the cluster
-    #[arg(long, requires = "cluster")]
+    #[arg(long)]
     force_new_cluster: bool,
+
+    // Removed: node.yaml decides. Accepted only to say what replaces them.
+    #[arg(long, hide = true)]
+    cluster: bool,
+    #[arg(long, hide = true)]
+    bootstrap: bool,
+    #[arg(long, hide = true)]
+    join: Option<String>,
+    #[arg(long, hide = true)]
+    secret: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -164,87 +158,33 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-
-    match detect_mode(&cli) {
-        Mode::Cli(cmd) => run_cli(cmd, &cli),
-        Mode::ClusterBootstrap => run_server(cli),
-        Mode::ClusterJoin => run_server(cli),
-        Mode::Standalone => run_server(cli),
+    match &cli.command {
+        Some(cmd) => run_cli(cmd, &cli),
+        None => run_server(&cli),
     }
 }
 
-enum Mode<'a> {
-    Cli(&'a Command),
-    ClusterBootstrap,
-    ClusterJoin,
-    Standalone,
+/// Flags that used to choose how a node starts, and what replaced them.
+fn removed_flag(cli: &Cli) -> Option<&'static str> {
+    if cli.cluster || cli.bootstrap {
+        Some("--cluster and --bootstrap are gone: a node with no stored state starts a cluster of its own")
+    } else if cli.join.is_some() {
+        Some("--join is gone: list the members to join in node.yaml, cluster.join")
+    } else if cli.secret.is_some() {
+        Some("--secret is gone: set it in node.yaml, cluster.secret")
+    } else {
+        None
+    }
 }
 
-fn detect_mode(cli: &Cli) -> Mode<'_> {
-    if let Some(cmd) = &cli.command {
-        return Mode::Cli(cmd);
+fn run_server(cli: &Cli) -> Result<()> {
+    if let Some(message) = removed_flag(cli) {
+        anyhow::bail!("{message}");
     }
-    if cli.cluster && cli.bootstrap {
-        return Mode::ClusterBootstrap;
-    }
-    if cli.cluster && cli.join.is_some() {
-        return Mode::ClusterJoin;
-    }
-    Mode::Standalone
-}
-
-fn run_server(cli: Cli) -> Result<()> {
     let cfg = config::load(&cli.config)
         .with_context(|| format!("failed to load config: {}", cli.config))?;
-
-    if cli.cluster {
-        run_cluster_server(cli, cfg)
-    } else {
-        info!(workers = cfg.keel.workers, user = cfg.keel.user, config = cli.config, "starting keel");
-        process::run_master(cfg)
-    }
-}
-
-fn run_cluster_server(cli: Cli, cfg: config::Config) -> Result<()> {
-    // Cluster mode is one process: bind as root, then drop, before anything
-    // else (cluster port, CA files, Raft) is set up.
-    let sockets = process::take_privileges_single_process(&cfg)?;
-
-    let cluster_cfg = cfg.cluster.as_ref();
-    let cluster_addr = cluster_cfg
-        .map(|c| c.addr.clone())
-        .unwrap_or_else(|| "0.0.0.0:7654".to_owned());
-    let advertise = cluster::identity::announce_addr(&cluster_addr, cluster_cfg.and_then(|c| c.advertise.as_deref()))?;
-
-    // Read or created after the drop: the state directory belongs to keel.user.
-    let state_dir = std::path::Path::new(&cfg.keel.state_dir);
-    let node_id = cluster::identity::load_or_create_node_id(state_dir)?;
-
-    // Read before any committed version can be written over it: a restart
-    // compares these files with the version this node last applied.
-    let config_dir = std::path::Path::new(&cfg.keel.config_dir);
-    let startup_files = config::read_config_dir(config_dir)?;
-
-    let secret = cli.secret.or_else(|| cluster_cfg.and_then(|c| c.secret.clone()));
-
-    info!(node_id, cluster_addr, advertise, "starting keel in cluster mode");
-
-    let opts = cluster::ClusterOpts {
-        node_id,
-        cluster_addr,
-        advertise,
-        state_dir: state_dir.to_path_buf(),
-        force_new_cluster: cli.force_new_cluster,
-        node_yaml: cfg.node_yaml.clone(),
-        config_dir: config_dir.to_path_buf(),
-        startup_files,
-        secret,
-        bootstrap: cli.bootstrap,
-        join: cli.join,
-    };
-
-    let (handle, svc) = cluster::new_cluster(opts);
-    proxy::run_cluster(&cfg, handle, svc, sockets)
+    info!(workers = cfg.keel.workers, user = cfg.keel.user, control_user = cfg.keel.control_user, config = cli.config, "starting keel");
+    process::run(cfg, cli.force_new_cluster)
 }
 
 // Cli commands
@@ -345,9 +285,22 @@ mod tests {
     use super::Cli;
 
     #[test]
+    fn start_flags_are_refused_with_what_replaced_them() {
+        for (args, field) in [
+            (vec!["--cluster", "--bootstrap"], "starts a cluster of its own"),
+            (vec!["--join", "10.0.0.1:7654"], "cluster.join"),
+            (vec!["--secret", "s"], "cluster.secret"),
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("keel").chain(args)).unwrap();
+            assert!(super::removed_flag(&cli).is_some_and(|m| m.contains(field)), "{field}");
+        }
+        assert!(super::removed_flag(&Cli::try_parse_from(["keel", "--force-new-cluster"]).unwrap()).is_none());
+    }
+
+    #[test]
     fn own_ca_flags_are_refused() {
         for flag in ["--ca-cert", "--ca-key"] {
-            let err = Cli::try_parse_from(["keel", "--cluster", "--bootstrap", flag, "ca.pem"])
+            let err = Cli::try_parse_from(["keel", flag, "ca.pem"])
                 .err()
                 .expect("flag must be refused")
                 .to_string();
