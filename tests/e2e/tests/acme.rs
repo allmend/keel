@@ -95,7 +95,12 @@ fn acme_follows_a_reload_and_renewals_keep_it() -> Result<()> {
         ],
     )?;
     let addr = stack.addr("keel", 443)?;
-    wait_until("gone.test served", Duration::from_secs(60), || Ok(served_certificate(addr, "gone.test").ok()))?;
+    // As early as the master takes signals, before the node is ready: the
+    // reload must wait for it, and the node must not write its first
+    // version over the edits.
+    wait_until("the master is up", Duration::from_secs(30), || {
+        Ok(stack.logs("keel")?.contains("master: control worker started").then_some(()))
+    })?;
 
     // No ACME host at startup; the reload adds one, adds a BYO vhost and
     // removes gone.test.

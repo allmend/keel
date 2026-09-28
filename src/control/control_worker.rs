@@ -140,6 +140,7 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
         state_dir,
         applied: applied_tx,
         certs_changed,
+        startup_files: Some(cfg.files.clone()),
     };
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
@@ -203,6 +204,14 @@ async fn master_link(
             Ok(MasterMessage::Reload) => {
                 let cluster = cluster.clone();
                 tokio::spawn(async move {
+                    // A SIGHUP during startup waits for the cluster instead
+                    // of being lost.
+                    for _ in 0..600 {
+                        if cluster.raft().await.is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                     let pushed = match crate::config::read_config_dir(&cluster.config_dir) {
                         Ok(files) => cluster.push_config(files).await,
                         Err(e) => Err(e),
@@ -237,10 +246,14 @@ struct ApplyDriver {
     /// The applied config, for the ACME service.
     applied: watch::Sender<Arc<Config>>,
     certs_changed: Arc<Notify>,
+    /// The config directory as read at start, until the first version is
+    /// applied. A version with exactly these files came from this directory:
+    /// it is not written back, so edits made since are not overwritten.
+    startup_files: Option<crate::config::FileSet>,
 }
 
 impl ApplyDriver {
-    async fn run(self, mut restarted: mpsc::UnboundedReceiver<usize>, mut shutdown: watch::Receiver<bool>) {
+    async fn run(mut self, mut restarted: mpsc::UnboundedReceiver<usize>, mut shutdown: watch::Receiver<bool>) {
         let mut versions = self.cluster.config_rx.clone();
         let mut drained = self.cluster.drained_rx.clone();
         let mut version = crate::cluster::applied::read(&self.state_dir).ok().flatten().map_or(0, |a| a.version);
@@ -281,7 +294,7 @@ impl ApplyDriver {
     }
 
     /// Apply a committed version; false when it cannot be applied here.
-    async fn apply(&self, next: &ConfigVersion) -> bool {
+    async fn apply(&mut self, next: &ConfigVersion) -> bool {
         let cfg = match crate::config::assemble(&self.node_yaml, &next.files) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -298,7 +311,8 @@ impl ApplyDriver {
         cfg.path = self.applied.borrow().path.clone();
         self.applied.send_replace(Arc::new(cfg));
         let acked = self.send_all(next.version).await;
-        let written = crate::cluster::applied::write_config_dir(&self.config_dir, &next.files)
+        let from_here = self.startup_files.take().is_some_and(|files| files == next.files);
+        let written = if from_here { Ok(()) } else { crate::cluster::applied::write_config_dir(&self.config_dir, &next.files) }
             .and_then(|()| crate::cluster::applied::save(&self.state_dir, next.version, &next.files));
         match written {
             Ok(()) => info!(version = next.version, workers = acked, "cluster: config version applied"),

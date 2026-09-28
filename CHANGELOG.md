@@ -15,6 +15,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   certificate by every peer, and any join under it. See
   [Removing a member](docs/cluster.md#removing-a-member).
 
+### Fixed
+
+- A `SIGHUP` that arrived while the control worker was still starting was
+  logged and dropped; the reload now waits for the node to be ready.
+- A node's first version, committed from its own config directory at start,
+  was written back to that directory once applied, overwriting edits made
+  in the meantime. It is no longer written back: the directory holds it.
+
 ---
 
 ## [0.24.0] — 2026-09-27
