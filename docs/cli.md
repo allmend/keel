@@ -254,6 +254,23 @@ The node keeps serving traffic until you stop the process. See [Cluster — Step
 
 ---
 
+## keel cluster remove
+
+Remove another member — dead, or one you no longer trust — from any node. A follower forwards the command to the leader.
+
+```bash
+keel cluster remove <node_id>
+```
+
+```
+removed 11223344 (10.0.0.3:7654); 2 voters remain, quorum 2
+certificate keel-node-11223344 refused from now on
+```
+
+The node ID comes from `keel cluster status`. It is refused for good: every peer refuses its certificate, and a join under it fails. Removing the leader works; it steps down once its removal is committed. Without a reachable majority the command fails like any write. See [Cluster — Removing a member](cluster.md#removing-a-member).
+
+---
+
 ## keel credentials create
 
 Issue an operator client certificate from the control CA and print a keelconfig for [keelctl](keelctl.md) to stdout. Runs locally on the node (it reads the CA key from `control/` under `keel.state_dir`); it does not need a running keel.

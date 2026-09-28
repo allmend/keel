@@ -1,6 +1,6 @@
 //! Three-node cluster: formation and voter promotion, config push through the
 //! leader, remote control over mTLS on every node, stepdown and the quorum
-//! probe, and node identity — an ID generated once and kept, a node that moves
+//! probe, removing a member for good, and node identity — an ID generated once and kept, a node that moves
 //! to a new address, and a copied state directory. node2 joins through the
 //! bootstrap node and node3 through node2, so every stack admits one node
 //! through a follower, which holds the replicated cluster CA.
@@ -444,6 +444,61 @@ fn node_id_survives_a_restart() -> Result<()> {
     })?;
     assert_eq!(cluster.read_node_id_file("node3")?, before, "node ID file unchanged");
     assert_eq!(cluster.members("node1")?, cluster.all_ids(), "no member added or lost");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_removed_member_stays_out() -> Result<()> {
+    let cluster = Cluster::up("cluster-remove")?;
+    let leader = cluster.leader()?;
+    let others: Vec<&str> = NODES.iter().copied().filter(|n| *n != leader).collect();
+    let (gone, asker) = (others[0], others[1]);
+    let gone_id = cluster.id(gone);
+
+    // The member dies; the removal is sent to a follower and forwarded.
+    cluster.stack.stop(gone)?;
+    let reply = cluster.request(asker, &ControlRequest::ClusterRemove { node_id: gone_id })?;
+    let message = reply["message"].as_str().unwrap_or_default().to_owned();
+    assert!(message.contains("2 voters remain, quorum 2"), "{message}");
+    assert!(message.contains(&format!("keel-node-{gone_id} refused")), "{message}");
+    let rest = [cluster.id(&leader), cluster.id(asker)];
+    for node in [leader.as_str(), asker] {
+        cluster.wait_for_voters(node, &rest)?;
+    }
+    let listed = cluster.stack.exec(asker, &["cat", "/var/lib/keel/members.yaml"])?;
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(&gone_id.to_string()), "members.yaml updated");
+
+    // It comes back with its state: the others refuse it, and writes still
+    // commit with two voters.
+    cluster.stack.start(gone)?;
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(cluster.voters(&leader)?, { let mut v = rest.to_vec(); v.sort(); v }, "it is not let back in");
+    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
+
+    // It lost its state and tries to join under its old ID: refused, naming the fix.
+    cluster.stack.stop(gone)?;
+    cluster.stack.on_volume(&format!("{gone}-state"), "rm -rf /state/raft")?;
+    cluster.stack.start(gone)?;
+    wait_until("the join is refused", Duration::from_secs(60), || {
+        Ok(cluster.logged(gone, &format!("node {gone_id} was removed from this cluster"))?.then_some(()))
+    })?;
+    assert!(cluster.logged(gone, "delete node_id and raft/")?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn removing_the_leader_hands_over_leadership() -> Result<()> {
+    let cluster = Cluster::up("cluster-remove-leader")?;
+    let leader = cluster.leader()?;
+    let follower = NODES.iter().copied().find(|n| *n != leader).expect("a follower");
+    cluster.request(follower, &ControlRequest::ClusterRemove { node_id: cluster.id(&leader) })?;
+    wait_until("a new leader among the other two", Duration::from_secs(30), || {
+        let status = cluster.status(follower)?;
+        let new = status["leader_id"].as_u64().filter(|id| *id != cluster.id(&leader));
+        Ok(new.filter(|_| cluster.voters(follower).is_ok_and(|v| v.len() == 2)))
+    })?;
     Ok(())
 }
 

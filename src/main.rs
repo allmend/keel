@@ -113,6 +113,11 @@ enum ClusterCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Remove another member, dead or alive; its node ID is refused from then on
+    Remove {
+        /// Node ID, as `cluster status` shows it
+        node_id: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -139,9 +144,9 @@ enum BackendCommand {
 
 #[derive(Subcommand)]
 enum ConfigCommand {
-    /// Apply the node's config directory (same as SIGHUP); in a cluster, push it as the new version
+    /// Push the node's config directory as the next version (same as SIGHUP)
     Reload,
-    /// Push a config directory (or a single file, as its keel.yaml) as the cluster's new config version
+    /// Push a config directory (or a single file, as its keel.yaml) as the next version
     Push {
         file: String,
     },
@@ -227,6 +232,9 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
         }
         Command::Cluster { command: ClusterCommand::Stepdown { force } } => {
             client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force })
+        }
+        Command::Cluster { command: ClusterCommand::Remove { node_id } } => {
+            client::message(&mut stream, &ControlRequest::ClusterRemove { node_id: *node_id })
         }
         Command::Credentials { command: CredentialsCommand::RevokeAll } => {
             client::message(&mut stream, &ControlRequest::CredentialsRevokeAll)

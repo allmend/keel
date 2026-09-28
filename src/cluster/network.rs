@@ -40,6 +40,8 @@ pub enum RpcRequest {
     RevokeOperatorCredentials,
     /// Ask the receiving node (must be the leader) to commit a drain.
     Drain { address: String },
+    /// Ask the receiving node (must be the leader) to remove a member for good.
+    Remove { node_id: NodeId },
 }
 
 /// The leader's answer to a forwarded config push: the committed version.
@@ -200,6 +202,16 @@ pub(crate) async fn send_drain(leader_addr: &str, tls: Arc<rustls::ClientConfig>
         .await
         .map_err(|e| anyhow::anyhow!("drain request to the leader at {leader_addr} failed: {e}"))?;
     Ok(())
+}
+
+/// Forward `keel cluster remove` to the leader; returns its report.
+pub(crate) async fn send_remove(leader_addr: &str, tls: Arc<rustls::ClientConfig>, node_id: NodeId) -> anyhow::Result<String> {
+    let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let reply: StepDownReply = net
+        .call(&RpcRequest::Remove { node_id })
+        .await
+        .map_err(|e| anyhow::anyhow!("remove request to the leader at {leader_addr} failed: {e}"))?;
+    Ok(reply.message)
 }
 
 /// Forward a config push to the leader; returns the version it committed.

@@ -218,6 +218,14 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             write_line(&mut writer, &resp).await?;
         }
 
+        ControlRequest::ClusterRemove { node_id } => {
+            let resp = match cluster.remove(node_id).await {
+                Ok(message) => ControlResponse::ok(serde_json::json!({ "message": message })),
+                Err(e) => ControlResponse::err(format!("{e:#}")),
+            };
+            write_line(&mut writer, &resp).await?;
+        }
+
         ControlRequest::ConfigPush { files } => {
             let resp = cmd_config_push(cluster, files).await;
             write_line(&mut writer, &resp).await?;

@@ -12,7 +12,7 @@ use openraft::{
 
 use crate::cluster::persist::{Disk, Loaded, StoredSnapshot};
 use crate::cluster::types::{
-    AcmeAccountMap, CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, DrainedSet,
+    AcmeAccountMap, CertMap, ChallengeMap, ClientRequest, ClientResponse, ClusterCaPair, ClusterState, ConfigVersion, DrainedSet, RetiredSet,
     NodeId, TypeConfig, ControlCaPair};
 
 fn disk_err(e: anyhow::Error) -> openraft::StorageError<NodeId> {
@@ -181,6 +181,7 @@ struct StateMachineData {
     cluster_ca_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<ClusterCaPair>>>,
     acme_accounts_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<AcmeAccountMap>>>,
     drained_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<DrainedSet>>>,
+    retired_tx: Option<std::sync::Arc<tokio::sync::watch::Sender<RetiredSet>>>,
     disk: Option<Arc<Disk>>,
 }
 
@@ -215,6 +216,9 @@ impl StateMachineData {
         }
         if let Some(tx) = &self.drained_tx {
             tx.send_replace(self.state.drained.clone());
+        }
+        if let Some(tx) = &self.retired_tx {
+            tx.send_replace(self.state.retired.clone());
         }
         if let (Some(tx), Some(config)) = (&self.config_tx, &self.state.config) {
             tx.send_replace(Some(config.clone()));
@@ -262,6 +266,10 @@ impl StateMachine {
 
     pub fn set_drained_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<DrainedSet>>) {
         self.0.write().unwrap().drained_tx = Some(tx);
+    }
+
+    pub fn set_retired_tx(&self, tx: std::sync::Arc<tokio::sync::watch::Sender<RetiredSet>>) {
+        self.0.write().unwrap().retired_tx = Some(tx);
     }
 
     /// Persist snapshots to `disk` from here on, and start from the stored
@@ -350,6 +358,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             d.state.drained.insert(address);
                             if let Some(tx) = &d.drained_tx {
                                 tx.send_replace(d.state.drained.clone());
+                            }
+                            ClientResponse::ok()
+                        }
+                        ClientRequest::RetireNode { node_id } => {
+                            d.state.retired.insert(node_id);
+                            if let Some(tx) = &d.retired_tx {
+                                tx.send_replace(d.state.retired.clone());
                             }
                             ClientResponse::ok()
                         }

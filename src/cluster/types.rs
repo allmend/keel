@@ -25,6 +25,9 @@ pub enum ClientRequest {
     SetConfigFiles { files: crate::config::FileSet },
     /// Drain a backend address in every pool, on every node.
     DrainBackend { address: String },
+    /// Refuse a removed member's node ID for good: its certificate and any
+    /// join under its ID.
+    RetireNode { node_id: NodeId },
     /// Replicate an ACME-issued certificate so every node (including late
     /// joiners, via snapshot) serves it without re-issuing.
     SetCert { host: String, cert_pem: String, key_pem: String },
@@ -64,6 +67,9 @@ pub type AcmeAccountMap = BTreeMap<String, String>;
 /// Backend addresses drained through the cluster, as written in the config.
 pub type DrainedSet = std::collections::BTreeSet<String>;
 
+/// Node IDs removed from the cluster, refused from then on.
+pub type RetiredSet = std::collections::BTreeSet<NodeId>;
+
 /// A committed config: the file set and its version, the index of the log
 /// entry that committed it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +100,9 @@ pub struct ClusterState {
     /// Backend addresses drained in every pool, on every node.
     #[serde(default)]
     pub drained: DrainedSet,
+    /// Members removed for good.
+    #[serde(default)]
+    pub retired: RetiredSet,
     /// ACME certificates replicated cluster-wide.
     #[serde(default)]
     pub certs: CertMap,

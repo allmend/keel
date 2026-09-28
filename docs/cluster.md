@@ -249,6 +249,29 @@ Note that the proposed change stays in the Raft log: if enough nodes come back l
 
 ---
 
+## Removing a member
+
+`stepdown` runs on the node that leaves. For a member that cannot run it — a dead machine, or one you no longer trust — run on any other node:
+
+```bash
+keel cluster remove 11223344
+```
+
+```
+removed 11223344 (10.0.0.3:7654); 2 voters remain, quorum 2
+certificate keel-node-11223344 refused from now on
+```
+
+- The node ID is retired through Raft, then the membership change is committed. From then on every peer refuses requests signed with that node's certificate.
+- A dead member otherwise stays a voter and lowers the failure tolerance: five voters with one dead tolerate one more failure, four voters after its removal tolerate one as well, with a smaller quorum.
+- A removed node that comes back cannot rejoin under its ID: the join is refused, naming the fix. Delete `node_id` and `raft/` in its state directory and it joins as a new node.
+- Removing the leader works; it steps down once its removal is committed. Removing the last voter is refused.
+- No quorum probe: without a reachable majority the command fails like any write.
+
+For a compromised node, removal stops it taking part in the cluster, but it still holds the cluster CA key, as every member does, and could issue certificates under other node IDs. The cluster CA cannot be rotated in place; see [Cluster CA](#cluster-ca).
+
+---
+
 ## ACME certificates in cluster mode
 
 Certificates obtained via [ACME](acme.md) are cluster state: the leader

@@ -8,6 +8,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`keel cluster remove <node_id>`** (and `keelctl`): remove another member,
+  dead or alive, from any node. The node ID is refused for good: its
+  certificate by every peer, and any join under it. See
+  [Removing a member](docs/cluster.md#removing-a-member).
+
 ---
 
 ## [0.24.0] — 2026-09-27

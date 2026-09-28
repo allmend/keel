@@ -69,6 +69,8 @@ pub enum ControlRequest {
     ClusterStatus,
     ClusterDemote,
     ClusterStepdown { #[serde(default)] force: bool },
+    /// Remove another member for good: its node ID is refused from then on.
+    ClusterRemove { node_id: u64 },
     /// A new config version: the whole file set, which replaces the current one.
     ConfigPush { files: FileSet },
     /// Replace the control CA, revoking every operator credential.
@@ -86,6 +88,7 @@ impl ControlRequest {
             ControlRequest::ClusterStatus => "cluster_status",
             ControlRequest::ClusterDemote => "cluster_demote",
             ControlRequest::ClusterStepdown { .. } => "cluster_stepdown",
+            ControlRequest::ClusterRemove { .. } => "cluster_remove",
             ControlRequest::ConfigPush { .. } => "config_push",
             ControlRequest::CredentialsRevokeAll => "credentials_revoke_all",
         }

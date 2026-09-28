@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster::network::{ClusterNetworkFactory, RpcRequest, RpcResponse};
 use crate::cluster::store::{LogStore, StateMachine};
@@ -191,6 +191,17 @@ impl ClusterHandle {
         match leader_addr(&raft)? {
             None => replace_control_ca(&raft).await,
             Some(leader) => crate::cluster::network::send_revoke(&leader, tls).await,
+        }
+    }
+
+    /// Remove member `node_id` for good, through the leader; see [`apply_remove`].
+    pub async fn remove(&self, node_id: NodeId) -> Result<String> {
+        let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
+            anyhow::bail!("cluster not yet initialized");
+        };
+        match leader_addr(&raft)? {
+            None => apply_remove(&raft, node_id).await,
+            Some(leader) => crate::cluster::network::send_remove(&leader, tls, node_id).await,
         }
     }
 
@@ -473,7 +484,8 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
         RpcRequest::Join { .. }
         | RpcRequest::PushConfig { .. }
         | RpcRequest::RevokeOperatorCredentials
-        | RpcRequest::Drain { .. } => None,
+        | RpcRequest::Drain { .. }
+        | RpcRequest::Remove { .. } => None,
     }
 }
 
@@ -483,6 +495,8 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
 struct PeerCtx {
     tls: Arc<rustls::ClientConfig>,
     node_yaml: Arc<String>,
+    /// Removed members, whose certificates are refused.
+    retired: watch::Receiver<crate::cluster::types::RetiredSet>,
 }
 
 /// Dispatches one mTLS peer connection to the Raft node.
@@ -500,12 +514,23 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
 
     let request = serde_json::from_slice::<RpcRequest>(&buf);
     let impersonates = request.as_ref().ok().and_then(claimed_sender).filter(|claimed| Some(*claimed) != peer_id);
-    let request = match impersonates {
-        Some(claimed) => {
+    // Refused once out of the membership too: a leader removing itself
+    // retires its ID first and must still replicate its own removal.
+    let retired = peer_id.filter(|id| {
+        ctx.retired.borrow().contains(id)
+            && !raft.metrics().borrow().membership_config.membership().nodes().any(|(member, _)| member == id)
+    });
+    let request = match (impersonates, retired) {
+        (Some(claimed), _) => {
             warn!(claimed, certificate = ?peer_id, "cluster: peer request refused: sender does not match its certificate");
             Err(format!("request from node {claimed} with the certificate of node {peer_id:?}"))
         }
-        None => request.map_err(|e| e.to_string()),
+        // Logged at debug: a removed node that still runs keeps asking.
+        (None, Some(id)) => {
+            debug!(node_id = id, "cluster: peer request refused: node was removed from the cluster");
+            Err(format!("node {id} was removed from this cluster"))
+        }
+        (None, None) => request.map_err(|e| e.to_string()),
     };
 
     let resp_bytes = match request {
@@ -545,6 +570,14 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             .unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
         },
+        Ok(RpcRequest::Remove { node_id }) => match apply_remove(&raft, node_id).await {
+            Ok(message) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::StepDownReply { message }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
         Ok(RpcRequest::Drain { address }) => match commit_drain(&raft, address).await {
             Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
                 ok: Some(crate::cluster::network::StepDownReply { message: "drained".into() }),
@@ -578,6 +611,7 @@ async fn handle_join(
     ca: &Ca,
     raft: Arc<ClusterRaft>,
     peer_tls: Arc<rustls::ClientConfig>,
+    retired: watch::Receiver<crate::cluster::types::RetiredSet>,
 ) {
     let result = async {
         let key = join_key(expected_secret);
@@ -611,7 +645,12 @@ async fn handle_join(
         // cannot be asked is not a refusal: close without an answer, and the
         // joiner retries.
         let m = raft.metrics().borrow().clone();
-        let admitted = if m.current_leader == Some(m.id) {
+        let admitted = if retired.borrow().contains(&req.node_id) {
+            Err(format!(
+                "node {} was removed from this cluster; to join as a new node, delete node_id and raft/ in its state directory",
+                req.node_id
+            ))
+        } else if m.current_leader == Some(m.id) {
             admit_joiner(Arc::clone(&raft), req.node_id, req.addr.clone()).await
         } else {
             let leader_addr = m.current_leader.and_then(|l| {
@@ -941,6 +980,7 @@ pub struct ClusterService {
     cluster_ca_tx: Arc<watch::Sender<crate::cluster::types::ClusterCaPair>>,
     acme_accounts_tx: Arc<watch::Sender<crate::cluster::types::AcmeAccountMap>>,
     drained_tx: Arc<watch::Sender<crate::cluster::types::DrainedSet>>,
+    retired_tx: Arc<watch::Sender<crate::cluster::types::RetiredSet>>,
 }
 
 #[async_trait]
@@ -1013,6 +1053,7 @@ impl ClusterService {
         sm.set_cluster_ca_tx(Arc::clone(&self.cluster_ca_tx));
         sm.set_acme_accounts_tx(Arc::clone(&self.acme_accounts_tx));
         sm.set_drained_tx(Arc::clone(&self.drained_tx));
+        sm.set_retired_tx(Arc::clone(&self.retired_tx));
         sm.persisted(Arc::clone(&disk), loaded.snapshot.as_ref())?;
 
         let log_store = LogStore::persisted(disk, &loaded);
@@ -1082,7 +1123,12 @@ impl ClusterService {
                             let secret2 = secret.clone();
                             let ca_pems = cluster_ca_rx.borrow().clone();
                             let peer_tls = Arc::clone(&client_tls);
-                            let peer_ctx = PeerCtx { tls: Arc::clone(&client_tls), node_yaml: Arc::clone(&node_yaml) };
+                            let peer_ctx = PeerCtx {
+                                tls: Arc::clone(&client_tls),
+                                node_yaml: Arc::clone(&node_yaml),
+                                retired: self.retired_tx.subscribe(),
+                            };
+                            let retired = self.retired_tx.subscribe();
 
                             tokio::spawn(async move {
                                 // Everything before a peer is authenticated gets a
@@ -1107,7 +1153,7 @@ impl ClusterService {
                                         // Not deadlined as a whole: a join may wait for the
                                         // leader. handle_join applies `deadline` to its own
                                         // unauthenticated read.
-                                        Some(Ok(ca)) => handle_join(stream, deadline, &secret2, &ca, raft2, peer_tls).await,
+                                        Some(Ok(ca)) => handle_join(stream, deadline, &secret2, &ca, raft2, peer_tls, retired).await,
                                         Some(Err(e)) => error!(error = %e, "cluster: replicated cluster CA unusable"),
                                         // Closing makes the joiner retry.
                                         None => warn!(peer = %peer_addr, "cluster: join before the cluster CA is committed"),
@@ -1148,6 +1194,9 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
     let acme_accounts_tx = Arc::new(acme_accounts_tx);
     let (drained_tx, drained_rx) = watch::channel(crate::cluster::types::DrainedSet::new());
     let drained_tx = Arc::new(drained_tx);
+    // A sender without receivers still keeps the value (`send_replace`);
+    // the peer listener subscribes once it runs.
+    let retired_tx = Arc::new(watch::channel(crate::cluster::types::RetiredSet::new()).0);
 
     let handle = ClusterHandle {
         raft: Arc::clone(&raft_slot),
@@ -1172,6 +1221,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         cluster_ca_tx,
         acme_accounts_tx,
         drained_tx,
+        retired_tx,
     };
 
     (handle, service)
@@ -1544,6 +1594,37 @@ pub async fn apply_stepdown(raft: &ClusterRaft, node_id: NodeId) -> Result<Strin
             Ok(format!("node {node_id} removed from cluster membership (committed by quorum)"))
         }
     }
+}
+
+/// Remove member `node_id` for good. Runs on the leader. The node ID is
+/// retired first — every peer refuses its certificate, and a join under it,
+/// from that commit on — then the membership change is committed; a leader
+/// removing itself steps down after that. No quorum probe: without a
+/// majority, the commit fails like any write.
+pub async fn apply_remove(raft: &ClusterRaft, node_id: NodeId) -> Result<String> {
+    let m = raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership().clone();
+    let Some(addr) = membership.nodes().find(|(id, _)| **id == node_id).map(|(_, n)| n.addr.clone()) else {
+        anyhow::bail!("node {node_id} is not a cluster member");
+    };
+    let remaining = membership.voter_ids().filter(|id| *id != node_id).count();
+    if remaining == 0 {
+        anyhow::bail!("node {node_id} is the only voter; the cluster cannot remove it");
+    }
+
+    // A leader cannot commit anything once it has removed itself.
+    let retire = raft.client_write(ClientRequest::RetireNode { node_id });
+    match tokio::time::timeout(STEPDOWN_COMMIT_TIMEOUT, retire).await {
+        Err(_) => anyhow::bail!("removal did not commit within {}s; is a majority reachable?", STEPDOWN_COMMIT_TIMEOUT.as_secs()),
+        Ok(Err(e)) => anyhow::bail!("removal failed: {e}"),
+        Ok(Ok(_)) => {}
+    }
+    apply_stepdown(raft, node_id).await?;
+    info!(node_id, addr, "cluster: node removed; its node ID is refused from now on");
+    Ok(format!(
+        "removed {node_id} ({addr}); {remaining} voters remain, quorum {}\ncertificate keel-node-{node_id} refused from now on",
+        remaining / 2 + 1
+    ))
 }
 
 /// Count how many peers accept a TCP connection on their cluster address within
