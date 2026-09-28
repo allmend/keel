@@ -54,3 +54,14 @@ jobs:
       # one at a time.
       - name: End-to-end tests
         run: cargo test -p keel-e2e --no-fail-fast -- --ignored
+
+      # Every stack's node logs, one collapsed group per node, so a failure
+      # on the runner can be read without reproducing it.
+      - name: Stack logs
+        if: failure()
+        run: |
+          for f in target/e2e-logs/*/*.log; do
+            echo "::group::$f"
+            grep -v -e "No incoming socket" -e "metrics: failed to bind" "$f" | tail -n 300
+            echo "::endgroup::"
+          done
