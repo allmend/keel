@@ -395,8 +395,8 @@ async fn reply_loop(
         // Wait for readiness before allocating: an idle flow holds no buffer,
         // so memory scales with datagrams in flight, not with open flows.
         // `reserve` + `try_recv_buf` reads into uninitialised memory — no
-        // 64 KiB memset per datagram. A pooled buffer is a later optimisation
-        // (ROADMAP).
+        // 64 KiB memset per datagram.
+        // TODO: reuse reply buffers from a per-worker pool.
         let mut buf = bytes::BytesMut::new();
         let received = match upstream.readable().await {
             Ok(()) => {
