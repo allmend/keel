@@ -936,6 +936,28 @@ fn decide_start(opts: &ClusterOpts, loaded: &persist::Loaded) -> Result<Start> {
     Ok(Start::Bootstrap)
 }
 
+/// Exit the control worker when the Raft core stops with a fatal error: the
+/// node would otherwise keep serving with a control plane that applies
+/// nothing. The master restarts the control worker, which restarts Raft
+/// from the stored state.
+async fn exit_when_raft_stops(raft: Arc<ClusterRaft>, shutdown: pingora::server::ShutdownWatch) {
+    let mut metrics = raft.metrics();
+    loop {
+        if let Err(fatal) = &metrics.borrow().running_state {
+            error!(error = %fatal, "cluster: Raft stopped; restarting the control worker");
+            std::process::exit(1);
+        }
+        // A core task that panicked drops the channel instead.
+        if metrics.changed().await.is_err() {
+            if !*shutdown.borrow() {
+                error!("cluster: Raft stopped; restarting the control worker");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+}
+
 /// Rewrite `members.yaml` whenever the membership changes.
 async fn keep_members_file(raft: Arc<ClusterRaft>, state_dir: std::path::PathBuf) {
     let mut metrics = raft.metrics();
@@ -1088,6 +1110,7 @@ impl ClusterService {
             tokio::spawn(commit_cluster_ca(Arc::clone(&raft), ca.cert_pem.clone(), ca.key_pem.clone()));
         }
         tokio::spawn(keep_members_file(Arc::clone(&raft), opts.state_dir.clone()));
+        tokio::spawn(exit_when_raft_stops(Arc::clone(&raft), shutdown.clone()));
         let node_yaml = Arc::new(opts.node_yaml.clone());
         tokio::spawn(reconcile_config(
             Arc::clone(&raft),

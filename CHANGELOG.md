@@ -24,6 +24,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A Raft core that stopped with a fatal error left the node serving with a
+  control plane that applied nothing; the control worker now exits and the
+  master restarts it.
 - A `SIGHUP` that arrived while the control worker was still starting was
   logged and dropped; the reload now waits for the node to be ready.
 - A node's first version, committed from its own config directory at start,

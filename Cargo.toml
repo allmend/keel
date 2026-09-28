@@ -87,6 +87,12 @@ default = []
 # of linking the system library. Local dev builds keep using system OpenSSL.
 vendored-openssl = ["openssl/vendored"]
 
+# openraft 0.9 debug-asserts that a lease timestamp never moves backwards;
+# across threads it can, by a millisecond, and the assertion then kills the
+# Raft task of a debug build. Release builds have no such check: match them.
+[profile.dev.package.openraft]
+debug-assertions = false
+
 [profile.release]
 strip = true
 lto = "thin"
