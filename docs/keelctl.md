@@ -105,8 +105,8 @@ credential, run on a node:
 keel credentials revoke-all
 ```
 
-It replaces the control CA — in a cluster through Raft, so every node
-re-keys its listener — and every keelconfig issued so far stops working.
+It replaces the control CA through Raft, so every node re-keys its
+listener, and every keelconfig issued so far stops working.
 Issue new ones with `keel credentials create`.
 
 ## Audit log

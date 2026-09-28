@@ -180,7 +180,7 @@ side), renewal tuning, and certificates for TCP/passthrough backends.
 keel status                              # node status + pool overview
 keel backend list --pool web             # list backends and connection counts
 keel backend drain 10.0.0.1:8080 --wait  # drain a backend, stream live status
-keel config reload                       # apply the config directory (same as SIGHUP); in a cluster, push it
+keel config reload                       # push the config directory as the next version (same as SIGHUP)
 keel config push /etc/keel/config        # commit a config directory as the cluster's next version
 keel cluster status                      # cluster membership and Raft roles
 keel cluster stepdown                    # gracefully leave the cluster (--force to override quorum guard)

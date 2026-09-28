@@ -407,7 +407,7 @@ A new version comes from:
 - `keel config push <dir>` or `keelctl config push <dir>`. A single file is pushed as `keel.yaml`. A follower forwards the push to the leader.
 - `SIGHUP` or `keel config reload` on a node: its config directory becomes the next version.
 - Starting a node whose files differ from the version it last applied. The later push wins.
-- The first start of a new cluster: the bootstrap node's files become version 1.
+- The first start of a new cluster, one node included: the first node's files become version 1.
 
 A push is validated before it is committed. Without a reachable majority it fails at once: `no quorum: 1 of 3 members reachable; config not pushed`. Traffic is unaffected either way.
 
@@ -415,11 +415,11 @@ A push is validated before it is committed. Without a reachable majority it fail
 
 ## Hot reload
 
-On a single node, send `SIGHUP` or run `keel config reload` to reload the node file and the config directory without dropping connections. The master forwards the signal to every worker and re-reads the config itself, so a worker it restarts later starts from the current config. If the new config fails to load, the master logs the error and retains the previous one for that purpose. In a cluster, the same commands push the node's config directory as the next version; see [In a cluster](#in-a-cluster).
+`SIGHUP` to the master or `keel config reload` pushes the node's config directory as the next version, one node or many; see [In a cluster](#in-a-cluster). A directory that does not load is refused and nothing changes. Every node's control worker applies the version and hands it to its workers without dropping connections. A worker started later gets the applied version from the control worker. The node file is read at start only.
 
 What reloads without restart:
 - Virtual host rules: hosts, routes and the pools they reference, `forwarded_headers`, cache rules, `redirect_http`, `default_action`
-- TLS certificates: certificate files of vhosts and `certificates:` entries are re-read
+- TLS certificates: certificate files of vhosts and `certificates:` entries are re-read with every applied version
 - Backends removed from a pool — they are moved to `draining`
 - ACME: hosts, issuers and `certificates:` entries. A new host is issued at once; a vhost switched from its own certificate to `tls.acme` serves the old one until the issued one arrives
 
@@ -435,4 +435,4 @@ What requires a process restart:
 
 Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
 
-In a cluster, a version applies the same way on every node: what reloads live above takes effect on push, the rest needs a restart of each node.
+A version applies the same way on every node: what reloads live above takes effect on push, the rest needs a restart of each node.

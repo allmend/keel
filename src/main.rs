@@ -273,7 +273,7 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
 
 fn cli_backend_add(address: &str, pool: &str) -> Result<()> {
     Err(anyhow::anyhow!(
-        "Live backend addition is not supported in standalone mode.\n\
+        "Live backend addition is not supported.\n\
          Add '{address}' to pool '{pool}' in keel.yaml and run 'keel config reload'."
     ))
 }

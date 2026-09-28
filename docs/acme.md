@@ -139,7 +139,7 @@ certificates:
     key: /etc/keel/certs/ldap.example.com.key
 ```
 
-Such an entry is not ACME-managed; `issuer` is ignored on it, and the files are re-read on SIGHUP.
+Such an entry is not ACME-managed; `issuer` is ignored on it, and the files are re-read whenever a version is applied (a push, or `SIGHUP`).
 
 ---
 
