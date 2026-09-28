@@ -15,6 +15,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   certificate by every peer, and any join under it. See
   [Removing a member](docs/cluster.md#removing-a-member).
 
+### Changed
+
+- Raft timings: heartbeat every 250ms, election after 1–2s without one
+  (were 50ms and 150–300ms). A replication call gets the heartbeat interval
+  as its deadline, and 50ms did not always fit a peer connection's TLS
+  handshake: on a busy node a joining member could fail to catch up.
+
 ### Fixed
 
 - A `SIGHUP` that arrived while the control worker was still starting was

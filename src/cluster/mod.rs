@@ -1057,7 +1057,19 @@ impl ClusterService {
         sm.persisted(Arc::clone(&disk), loaded.snapshot.as_ref())?;
 
         let log_store = LogStore::persisted(disk, &loaded);
-        let raft_config = Arc::new(RaftConfig::default().validate().unwrap());
+        // Openraft gives each replication call the heartbeat interval as its
+        // deadline, and every peer RPC here is a fresh TCP + TLS connection:
+        // its 50ms default dropped calls mid-handshake on a busy node, and a
+        // joining learner never caught up. The log carries config, not
+        // traffic, so etcd-like timings cost nothing that matters.
+        let raft_config = RaftConfig {
+            heartbeat_interval: 250,
+            election_timeout_min: 1000,
+            election_timeout_max: 2000,
+            install_snapshot_timeout: 10_000,
+            ..Default::default()
+        };
+        let raft_config = Arc::new(raft_config.validate().context("Raft config")?);
 
         let client_tls = build_client_tls(&node_cert_pem, &node_key_pem, &ca_cert_pem)?;
         *self.tls_slot.lock().await = Some(Arc::clone(&client_tls));

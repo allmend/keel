@@ -23,7 +23,7 @@ Add nodes when you need:
 
 Every write — a push, a drain, a membership change, an ACME issuance — needs a majority of the voters. With two nodes that is both: either one down stops writes, and both keep serving traffic with the config they have.
 
-A leader is elected by majority vote only; a node never promotes itself. Split across two sites with equal node counts, neither side has a majority: both keep serving, both refuse writes, and there is no split brain. For redundancy across sites, run one node per site on three or five sites.
+A leader is elected by majority vote only; a node never promotes itself. When the leader fails, the others elect a new one after 1–2 seconds without its heartbeat; writes wait for it, traffic does not. Split across two sites with equal node counts, neither side has a majority: both keep serving, both refuse writes, and there is no split brain. For redundancy across sites, run one node per site on three or five sites.
 
 ---
 
