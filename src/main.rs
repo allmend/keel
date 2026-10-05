@@ -1,3 +1,8 @@
+// musl's allocator, which the static release binaries would otherwise use,
+// cost about a third of the requests per core; glibc's a few percent.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod access_log;
 mod acme;
 mod backend;

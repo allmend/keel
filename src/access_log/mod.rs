@@ -87,6 +87,11 @@ impl AccessLogger {
         }
     }
 
+    /// Whether entries are written at all; callers skip building them when not.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn log(&self, entry: &AccessLogEntry) {
         if !self.enabled {
             return;

@@ -21,6 +21,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   (were 50ms and 150–300ms). A replication call gets the heartbeat interval
   as its deadline, and 50ms did not always fit a peer connection's TLS
   handshake: on a busy node a joining member could fail to catch up.
+- Less CPU per proxied request: about 50 % more requests per core without a
+  cache, 15–25 % more from the caches (one worker; release builds). Keel
+  allocates with mimalloc: the static musl binaries used musl's allocator,
+  which alone cost a third of the throughput. A worker's proxy runtime no
+  longer uses work stealing (one thread, nothing to steal); backend state
+  is looked up by address instead of by a string formatted per request; the
+  access-log fields are captured only when the access log is on; the
+  consistent-hash key is built only for `consistent_hash` pools.
 
 ### Fixed
 

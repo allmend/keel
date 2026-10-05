@@ -331,8 +331,10 @@ pub fn set_backend_healthy(pool: &str, backend: &str, healthy: bool) {
         .set(if healthy { 1.0 } else { 0.0 });
 }
 
-pub fn set_active_connections(pool: &str, backend: &str, count: f64) {
-    ACTIVE_CONNECTIONS.with_label_values(&[pool, backend]).set(count);
+/// One backend's `keel_active_connections`, bound to its labels once so the
+/// per-request updates skip the label lookup.
+pub fn active_connections_gauge(pool: &str, backend: &str) -> prometheus::Gauge {
+    ACTIVE_CONNECTIONS.with_label_values(&[pool, backend])
 }
 
 pub fn record_ejection(pool: &str, backend: &str, ejected: bool) {

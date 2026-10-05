@@ -394,29 +394,26 @@ impl ProxyHttp for KProxy {
     ) -> pingora::Result<Box<HttpPeer>> {
         let ds = session.as_downstream();
 
-        // Capture all request metadata before any early return so logging() always has it.
-        let method = ds.req_header().method.to_string();
-        let uri = ds
-            .req_header()
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str().to_owned())
-            .unwrap_or_else(|| ds.req_header().uri.path().to_owned());
-        let protocol = format!("{:?}", ds.req_header().version);
-        let user_agent = ds
-            .get_header("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned());
+        // Capture the access-log fields before any early return so logging()
+        // always has them — and only when there is an access log to write.
+        if self.access_logger.enabled() {
+            let req = ds.req_header();
+            ctx.method = req.method.to_string();
+            ctx.uri = req
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_owned())
+                .unwrap_or_else(|| req.uri.path().to_owned());
+            ctx.protocol = format!("{:?}", req.version);
+            ctx.user_agent = ds.get_header("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
+            ctx.client_addr_str = ds.client_addr().and_then(|a| a.as_inet()).map(|a| a.to_string());
+        }
         let host = requested_host_or(ds.req_header(), "*").to_owned();
         let path = ds.req_header().uri.path().to_owned();
         let client_ip: Option<IpAddr> = ds
             .client_addr()
             .and_then(|a| a.as_inet())
             .map(|a| a.ip());
-        let client_addr_str: Option<String> = ds
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.to_string());
         let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
 
         // Resolve the raw Host header to a bounded, operator-configured label before
@@ -428,20 +425,10 @@ impl ProxyHttp for KProxy {
             .unwrap_or("unmatched")
             .to_owned();
 
-        ctx.method = method;
-        ctx.uri = uri;
-        ctx.protocol = protocol;
-        ctx.user_agent = user_agent;
         ctx.vhost = vhost_label;
         ctx.host_header = host.clone();
         ctx.client_ip = client_ip;
-        ctx.client_addr_str = client_addr_str;
         ctx.is_tls = is_tls;
-
-        // Client IP as consistent-hash key; fall back to empty bytes.
-        let key: Vec<u8> = client_ip
-            .map(|ip| ip.to_string().into_bytes())
-            .unwrap_or_default();
 
         let pool_name = routing
             .resolve(&host, &path)
@@ -456,6 +443,12 @@ impl ProxyHttp for KProxy {
 
         // Set pool before select() so logging() can distinguish no_route from no_backend.
         ctx.pool = pool_name.clone();
+
+        // Client IP as consistent-hash key; fall back to empty bytes.
+        let key: Vec<u8> = match client_ip {
+            Some(ip) if self.pools.uses_key(&pool_name) => ip.to_string().into_bytes(),
+            _ => Vec::new(),
+        };
 
         let addr = self
             .pools
@@ -657,11 +650,12 @@ impl ProxyHttp for KProxy {
         if let Some(addr) = backend {
             self.pools.release(&ctx.pool, addr);
         }
+        let backend_label = backend.map(|a| a.to_string());
 
         // Backend was selected but proxying failed — count as a connection error.
         if e.is_some() {
-            if let Some(addr) = backend {
-                crate::metrics::record_backend_connection_error(&ctx.pool, &addr.to_string());
+            if let Some(label) = &backend_label {
+                crate::metrics::record_backend_connection_error(&ctx.pool, label);
             }
         }
 
@@ -676,21 +670,20 @@ impl ProxyHttp for KProxy {
         if !ctx.pool.is_empty() {
             crate::metrics::record_request(&ctx.pool, &ctx.vhost, status, elapsed);
 
-            if let Some(addr) = backend {
+            if let Some(label) = &backend_label {
                 let backend_elapsed = ctx
                     .backend_started_at
                     .map(|t| t.elapsed().as_secs_f64())
                     .unwrap_or(elapsed);
-                crate::metrics::record_backend_request(
-                    &ctx.pool,
-                    &addr.to_string(),
-                    status,
-                    backend_elapsed,
-                );
+                crate::metrics::record_backend_request(&ctx.pool, label, status, backend_elapsed);
             }
 
             crate::metrics::add_request_bytes_in(&ctx.pool, &ctx.vhost, ctx.request_bytes);
             crate::metrics::add_request_bytes_out(&ctx.pool, &ctx.vhost, ctx.response_bytes);
+        }
+
+        if !self.access_logger.enabled() {
+            return;
         }
 
         let error_str: Option<String> = if ctx.pool.is_empty() {
@@ -716,7 +709,7 @@ impl ProxyHttp for KProxy {
             client_addr: ctx.client_addr_str.take(),
             vhost: std::mem::take(&mut ctx.vhost),
             pool: std::mem::take(&mut ctx.pool),
-            backend_addr: backend.map(|a| a.to_string()),
+            backend_addr: backend_label,
             bytes_in: ctx.request_bytes,
             bytes_out: ctx.response_bytes,
             duration_ms: elapsed * 1000.0,
@@ -772,7 +765,7 @@ fn resolve_addr(addr: &str) -> anyhow::Result<String> {
 // (`add_health_services`) once the registry exists.
 fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
     let mut pools: HashMap<String, Pool> = HashMap::new();
-    let mut drain: HashMap<String, crate::backend::BackendEntry> = HashMap::new();
+    let mut drain = crate::backend::DrainTable::new();
     let mut passive: HashMap<String, crate::backend::PassiveRule> = HashMap::new();
 
     for (name, pool_cfg) in &cfg.pools {
@@ -801,7 +794,7 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
             .map(|b| b.address.as_str())
             .zip(addrs.iter().copied())
             .collect();
-        build_drain_entries(name, &configured, &mut drain);
+        build_drain_entries(name, &configured, &mut drain)?;
 
         // Initialise drain state metric for each backend
         for addr in &addrs {
@@ -953,6 +946,9 @@ fn new_server(cfg: &Config, inherited: Option<&WorkerSockets>) -> Server {
     let mut conf = pingora::server::configuration::ServerConf {
         grace_period_seconds: Some(cfg.keel.grace_period_seconds),
         graceful_shutdown_timeout_seconds: Some(5),
+        // One proxy thread per worker: a work-stealing runtime only adds
+        // cross-thread bookkeeping to every task wake (≈15 % CPU per request).
+        work_stealing: false,
         ..Default::default()
     };
 
