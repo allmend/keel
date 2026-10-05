@@ -10,6 +10,7 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
+COPY tests ./tests
 
 RUN cargo build --release
 
