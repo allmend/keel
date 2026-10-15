@@ -16,7 +16,7 @@
 
 > ⚠️ **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not production-ready yet — feedback welcome.
 
-Keel is a fast, modern, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, automatic TLS, certificate hot-swap, routing changes without restart — from a single binary.
+Keel is a feature-rich, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, automatic TLS, certificate hot-swap, routing changes without restart — from a single binary.
 
 Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 

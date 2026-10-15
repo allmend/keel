@@ -7,14 +7,13 @@ version = "0.24.0"
 edition = "2021"
 authors = ["Allmend Contributors"]
 license = "Apache-2.0"
-description = "Fast, modern, self-hosted load balancer, reverse proxy, and API gateway"
+description = "Feature-rich, self-hosted load balancer, reverse proxy, and API gateway"
 
 [[bin]]
 name = "keel"
 path = "src/main.rs"
 
 [dependencies]
-mimalloc = { version = "0.1", default-features = false }
 # Control protocol shared with keelctl
 keel-control = { path = "crates/keel-control" }
 # Proxy framework
