@@ -813,7 +813,7 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
             }
             LbAlgorithm::LeastConnections => {
                 Pool::LeastConn(Arc::new(
-                    LeastConnPool::build(&addrs)
+                    LeastConnPool::build(&addrs, &weights)
                         .map_err(|e| anyhow::anyhow!("{e}"))?,
                 ))
             }

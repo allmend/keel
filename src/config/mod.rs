@@ -322,6 +322,9 @@ impl Config {
             if pool.backends.is_empty() {
                 anyhow::bail!("pool '{name}' has no backends");
             }
+            if let Some(b) = pool.backends.iter().find(|b| !(1..=MAX_WEIGHT).contains(&b.weight)) {
+                anyhow::bail!("pool '{name}': backend {} weight must be 1-{MAX_WEIGHT}, got {}", b.address, b.weight);
+            }
             if pool.passive.failures == 0 {
                 anyhow::bail!("pool '{name}': passive.failures must be at least 1");
             }
@@ -1167,6 +1170,10 @@ pub struct Backend {
 
 fn default_weight() -> u32 { 1 }
 
+/// Upper bound for `backends[].weight`: consistent hashing places about 160
+/// points per unit of weight on its ring.
+const MAX_WEIGHT: u32 = 1000;
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForwardedMode {
@@ -1912,6 +1919,19 @@ mod tests {
         parse("  - address: 0.0.0.0:5353\n    tcp_pool: dns\n    tls_mode: terminate\n    tls_host: x\n    proxy_protocol: true\n")
             .validate()
             .expect_err("tls_host x unknown, but proxy_protocol itself is fine on tcp listeners");
+    }
+
+    #[test]
+    fn backend_weight_must_be_1_to_1000() {
+        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+        for weight in [1, 1000] {
+            cfg.pools.get_mut("dns").unwrap().backends[0].weight = weight;
+            cfg.validate().expect("weight in range");
+        }
+        for weight in [0, 1001] {
+            cfg.pools.get_mut("dns").unwrap().backends[0].weight = weight;
+            assert!(err(&cfg).contains("weight must be 1-1000"), "weight {weight}");
+        }
     }
 
     #[test]

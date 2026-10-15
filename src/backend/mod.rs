@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use pingora::lb::{
+    discovery::Static,
     selection::{Consistent, RoundRobin, Random},
-    Backend, LoadBalancer,
+    Backend, Backends, LoadBalancer,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -513,6 +514,7 @@ fn status_of(pool: &str, entry: &BackendEntry, now_ms: u64) -> BackendStatus {
 
 pub struct LeastConnEntry {
     pub addr: SocketAddr,
+    pub weight: i64,
 }
 
 pub struct LeastConnPool {
@@ -520,23 +522,28 @@ pub struct LeastConnPool {
 }
 
 impl LeastConnPool {
-    pub fn build(addrs: &[&str]) -> Result<Self> {
+    pub fn build(addrs: &[&str], weights: &[usize]) -> Result<Self> {
         let backends = addrs
             .iter()
-            .map(|a| {
+            .zip(weights)
+            .map(|(a, &weight)| {
                 let addr: SocketAddr = a.parse().with_context(|| format!("invalid address: {a}"))?;
-                Ok(LeastConnEntry { addr })
+                Ok(LeastConnEntry { addr, weight: weight as i64 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(LeastConnPool { backends })
     }
 
+    /// The available backend with the fewest connections per unit of
+    /// weight, as nginx's weighted least_conn; ties go to the first listed.
     fn select(&self, entries: &HashMap<SocketAddr, BackendEntry>, now_ms: u64) -> Option<SocketAddr> {
+        let conns = |e: &LeastConnEntry| entries.get(&e.addr).map(|d| d.connections.load(Ordering::Relaxed)).unwrap_or(0);
         let addr = self
             .backends
             .iter()
             .filter(|e| is_available(entries, &e.addr, now_ms))
-            .min_by_key(|e| entries.get(&e.addr).map(|d| d.connections.load(Ordering::Relaxed)).unwrap_or(0))?
+            // a/wa < b/wb without division: a*wb < b*wa.
+            .min_by(|a, b| (conns(a) * b.weight).cmp(&(conns(b) * a.weight)))?
             .addr;
         if let Some(entry) = entries.get(&addr) {
             entry.acquire();
@@ -547,14 +554,16 @@ impl LeastConnPool {
 
 // Load balancer builder
 
-/// Build a Pingora LoadBalancer from backend addresses (unweighted; weights are
-/// handled by Pingora internally when using `Backend::new_with_weight`).
+/// Build a Pingora LoadBalancer over the weighted backends.
 pub fn build_lb<S>(addrs: &[&str], weights: &[usize]) -> Result<LoadBalancer<S>>
 where
     S: pingora::lb::selection::BackendSelection + Send + Sync + 'static,
     S::Iter: pingora::lb::selection::BackendIter,
 {
-    let backends: Vec<Backend> = addrs
+    use std::future::Future;
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    let backends: BTreeSet<Backend> = addrs
         .iter()
         .zip(weights.iter())
         .map(|(addr, &weight)| {
@@ -562,8 +571,15 @@ where
         })
         .collect::<Result<_>>()?;
 
-    LoadBalancer::try_from_iter(backends.iter().map(|b| b.addr.to_string()))
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    let lb = LoadBalancer::from_backends(Backends::new(Static::new(backends)));
+    // Static discovery answers at once, so one poll completes the update
+    // (Pingora's own `try_from_iter` does the same).
+    let polled = std::pin::pin!(lb.update()).poll(&mut TaskContext::from_waker(Waker::noop()));
+    match polled {
+        Poll::Ready(result) => result.map_err(|e| anyhow::anyhow!("{e}"))?,
+        Poll::Pending => anyhow::bail!("static backend discovery did not complete"),
+    }
+    Ok(lb)
 }
 
 /// Build the drain table from a pool's backends.
@@ -589,7 +605,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> = addrs.iter().map(|a| (*a, *a)).collect();
         build_drain_entries("p", &pairs, &mut drain).unwrap();
         let mut pools = HashMap::new();
-        pools.insert("p".to_owned(), Pool::LeastConn(Arc::new(LeastConnPool::build(&addrs).unwrap())));
+        pools.insert("p".to_owned(), Pool::LeastConn(Arc::new(LeastConnPool::build(&addrs, &[1, 1]).unwrap())));
         let mut passive = HashMap::new();
         passive.insert("p".to_owned(), PassiveRule { failures: 3, eject_for });
         PoolRegistry::new(pools, drain, passive)
@@ -734,5 +750,60 @@ mod tests {
         assert_eq!(reg.sweep_ejections(), 1);
         assert_eq!(reg.sweep_ejections(), 0);
         assert_eq!(selections(&reg, 6).len(), 2);
+    }
+
+    /// A pool of :1 (weight 1) and :2 (weight 3).
+    fn weighted(pool: Pool) -> PoolRegistry {
+        let mut drain = HashMap::new();
+        build_drain_entries("p", &[("127.0.0.1:1", "127.0.0.1:1"), ("127.0.0.1:2", "127.0.0.1:2")], &mut drain).unwrap();
+        let mut pools = HashMap::new();
+        pools.insert("p".to_owned(), pool);
+        PoolRegistry::new(pools, drain, HashMap::new())
+    }
+
+    const ADDRS: [&str; 2] = ["127.0.0.1:1", "127.0.0.1:2"];
+    const WEIGHTS: [usize; 2] = [1, 3];
+
+    /// Selections that went to the weight-1 backend out of `n`, each with its
+    /// own key and released at once.
+    fn light_share(reg: &PoolRegistry, n: usize) -> usize {
+        let light: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        (0..n)
+            .filter(|i| {
+                let a = reg.select("p", format!("10.0.{}.{}", i / 256, i % 256).as_bytes()).expect("a backend");
+                reg.release("p", a);
+                a == light
+            })
+            .count()
+    }
+
+    #[test]
+    fn round_robin_honours_weights() {
+        let reg = weighted(Pool::RoundRobin(Arc::new(build_lb(&ADDRS, &WEIGHTS).unwrap())));
+        assert_eq!(light_share(&reg, 400), 100);
+    }
+
+    #[test]
+    fn random_honours_weights() {
+        let reg = weighted(Pool::Random(Arc::new(build_lb(&ADDRS, &WEIGHTS).unwrap())));
+        let light = light_share(&reg, 4000);
+        assert!((850..=1150).contains(&light), "{light} of 4000, expected about 1000");
+    }
+
+    #[test]
+    fn consistent_hash_honours_weights() {
+        let reg = weighted(Pool::ConsistentHash(Arc::new(build_lb(&ADDRS, &WEIGHTS).unwrap())));
+        let light = light_share(&reg, 4000);
+        assert!((700..=1300).contains(&light), "{light} of 4000 keys, expected about 1000");
+    }
+
+    /// Connections held open spread 1:3: the weight-3 backend takes a new
+    /// one until it holds three times as many.
+    #[test]
+    fn least_connections_honours_weights() {
+        let reg = weighted(Pool::LeastConn(Arc::new(LeastConnPool::build(&ADDRS, &WEIGHTS).unwrap())));
+        let light: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let held: Vec<SocketAddr> = (0..40).map(|_| reg.select("p", b"").expect("a backend")).collect();
+        assert_eq!(held.iter().filter(|a| **a == light).count(), 10);
     }
 }

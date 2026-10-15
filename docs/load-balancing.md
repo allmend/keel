@@ -28,13 +28,13 @@ Use as an alternative to round-robin when strict ordering doesn't matter and you
 
 ### least_connections
 
-Routes each request to the backend with the fewest active connections at the time the request arrives. Weights are ignored. Each worker process counts only the connections it opened itself.
+Routes each request to the backend with the fewest active connections per unit of weight at the time the request arrives: with weights 1 and 3, the second backend takes new connections until it holds three times as many. Ties go to the backend listed first. Each worker process counts only the connections it opened itself.
 
 Use for workloads where requests have variable processing time — long-lived connections or slow backends will receive fewer new requests automatically.
 
 ### consistent_hash
 
-Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights.
+Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights: a backend with `weight: 2` gets about twice the share of keys.
 
 At L4 every new TCP connection uses a new source port, so affinity holds per connection (TCP) or per flow (UDP), not per client.
 
@@ -44,7 +44,7 @@ Use when backend-side caching or session affinity matters and you cannot use coo
 
 ## Weighted backends
 
-`round_robin`, `random` and `consistent_hash` support per-backend weights. A backend with `weight: 2` receives twice as many requests as one with `weight: 1`. `least_connections` ignores weights.
+Every algorithm honours per-backend weights. A backend with `weight: 2` receives twice as many requests as one with `weight: 1` (`round_robin` exactly, `random` and `consistent_hash` on average); `least_connections` balances connections per unit of weight.
 
 ```yaml
 pools:
@@ -59,7 +59,7 @@ pools:
         weight: 2   # receives 50% of traffic
 ```
 
-Weight defaults to `1` if omitted.
+Weight defaults to `1` if omitted and must be 1–1000. Up to v0.24.0 weights were ignored: every backend got an equal share.
 
 ---
 

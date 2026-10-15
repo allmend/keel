@@ -208,7 +208,7 @@ pools:
 | `passive.failures` | integer | `5` | Consecutive upstream connect (or UDP reply) failures that eject |
 | `passive.eject_for` | string | `30s` | Time out of rotation before re-admission |
 | `backends[].address` | string | required | `host:port` |
-| `backends[].weight` | integer | `1` | Relative weight for weighted algorithms |
+| `backends[].weight` | integer | `1` | Relative weight, 1–1000; honoured by every algorithm |
 
 See [Load balancing](load-balancing.md) for details on algorithms and drain behavior.
 

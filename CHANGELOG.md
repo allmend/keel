@@ -29,6 +29,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Backend weights were ignored: every algorithm gave each backend an equal
+  share. `round_robin`, `random` and `consistent_hash` now honour `weight`,
+  and `least_connections` balances connections per unit of weight. A weight
+  must be 1–1000; 0 or a larger value is a load error.
 - A Raft core that stopped with a fatal error left the node serving with a
   control plane that applied nothing; the control worker now exits and the
   master restarts it.
