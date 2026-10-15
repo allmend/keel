@@ -36,9 +36,9 @@ const TICK: Duration = Duration::from_millis(100);
 const CONTROL_STABLE: Duration = Duration::from_secs(10);
 const CONTROL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Listening sockets bound by the root master before any worker is forked.
-/// Workers inherit them across `fork` and never bind privileged ports
-/// themselves.
+/// Listening sockets bound by the master before any worker is forked (on
+/// Linux, root or not). Workers inherit them across `fork`: they never bind
+/// privileged ports themselves, and every worker accepts on the same socket.
 pub struct BoundListeners {
     /// One listening socket per TCP listener, shared by every worker; the
     /// kernel spreads `accept` across the processes.
@@ -47,7 +47,8 @@ pub struct BoundListeners {
     /// so the kernel's client→socket hash keeps every flow on one worker.
     pub udp: Vec<(String, Vec<std::net::UdpSocket>)>,
     /// One ICMP datagram socket per worker and family, when any pool uses an
-    /// `icmp` health check. Needs CAP_NET_RAW to open — the master has it.
+    /// `icmp` health check. Needs CAP_NET_RAW or `ping_group_range`: a root
+    /// master has it, a non-root one may not (checks then pass).
     pub icmp4: Vec<std::net::UdpSocket>,
     pub icmp6: Vec<std::net::UdpSocket>,
 }
@@ -215,10 +216,11 @@ fn take_tree(path: &std::path::Path, uid: Uid, gid: Gid) -> Result<()> {
     Ok(())
 }
 
-/// Bind every configured listener while still root. `per_listener` UDP and
-/// ICMP sockets are opened per listener — one per worker (an unread
-/// SO_REUSEPORT socket would swallow its share of datagrams).
-fn bind_listeners(cfg: &Config, per_listener: usize) -> Result<BoundListeners> {
+/// Bind every configured listener before forking (as root, before the
+/// privilege drop). `per_listener` UDP and ICMP sockets are opened per
+/// listener — one per worker (an unread SO_REUSEPORT socket would swallow
+/// its share of datagrams).
+fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<BoundListeners> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::ToSocketAddrs;
 
@@ -227,7 +229,15 @@ fn bind_listeners(cfg: &Config, per_listener: usize) -> Result<BoundListeners> {
     let (mut icmp4, mut icmp6) = (Vec::new(), Vec::new());
     if crate::health::icmp::needed(cfg) {
         for _ in 0..per_listener {
-            icmp4.push(crate::health::icmp::open_socket(false).context("master: cannot open ICMPv4 socket")?);
+            match crate::health::icmp::open_socket(false) {
+                Ok(s) => icmp4.push(s),
+                Err(e) if root => return Err(e).context("master: cannot open ICMPv4 socket"),
+                // Without root it takes `net.ipv4.ping_group_range`.
+                Err(e) => {
+                    warn!(error = %e, "master: cannot open ICMPv4 socket — icmp checks of IPv4 backends pass unconditionally");
+                    break;
+                }
+            }
             match crate::health::icmp::open_socket(true) {
                 Ok(s) => icmp6.push(s),
                 // IPv6 may be disabled on the host; v6 backends then pass unchecked.
@@ -356,10 +366,12 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     }
 
     // The TCP hand-off to Pingora rides on its upgrade channel, which is
-    // Linux-only; unprivileged dev runs on any platform let each worker bind
-    // its own listeners.
-    let bound = if cfg!(target_os = "linux") && accounts.is_some() {
-        Some(bind_listeners(&cfg, cfg.keel.workers)?)
+    // Linux-only; elsewhere each worker binds its own listeners with
+    // SO_REUSEPORT (proxy::listen). Not root does not matter: without the
+    // shared socket all workers but one would wait for a port that never
+    // frees.
+    let bound = if cfg!(target_os = "linux") {
+        Some(bind_listeners(&cfg, cfg.keel.workers, accounts.is_some())?)
     } else {
         None
     };

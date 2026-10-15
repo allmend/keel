@@ -185,11 +185,11 @@ throughput is visible while a long flow is open.
 
 ## Behavior notes
 
-- **Privileged ports.** When Keel starts as root on Linux, the master binds
-  the UDP sockets before forking and the workers inherit them after dropping
-  to `keel.user`; ports below 1024 (53, 514) need nothing further. Started
-  unprivileged, each worker binds its own socket, so a port below 1024 then
-  needs `CAP_NET_BIND_SERVICE` on the binary. A failed bind is logged at
+- **Privileged ports.** On Linux the master binds the UDP sockets before
+  forking and the workers inherit them (after dropping to `keel.user` when
+  started as root); ports below 1024 (53, 514) need nothing further as root.
+  Started unprivileged, a port below 1024 needs `CAP_NET_BIND_SERVICE` on
+  the binary. A failed bind is logged at
   error level; the rest of the process keeps running.
 - **No healthy backend.** The datagram is dropped; one log entry with
   `"error": "no_backend"` is written per dropped datagram and
@@ -208,8 +208,8 @@ throughput is visible while a long flow is open.
   28,000 by default) and by the process's file descriptor limit. Exhaustion
   shows as `upstream_bind` errors.
 - **Multiple workers.** Each worker owns one socket of an `SO_REUSEPORT`
-  group on the listener address (bound by the master when started as root,
-  otherwise by the worker itself). On Linux the kernel assigns each client
+  group on the listener address (bound by the master on Linux, by the worker
+  itself elsewhere). On Linux the kernel assigns each client
   `ip:port` to one socket by hash, so a flow's datagrams always reach the
   same worker and the per-worker flow tables never disagree. A replacement
   worker takes over the socket of the one it replaces; datagrams hashed to

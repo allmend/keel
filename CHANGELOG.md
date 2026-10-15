@@ -29,6 +29,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Started without root on Linux (including the container image run with
+  `--user`), only one worker accepted connections: each worker bound the
+  listener itself and the others waited for the port forever. The master
+  now binds every listener on Linux whether or not it is root, and the
+  workers share it. On other platforms workers bind with `SO_REUSEPORT`.
+  Pingora's listener warnings (a port in use) are now in the default log.
 - Backend weights were ignored: every algorithm gave each backend an equal
   share. `round_robin`, `random` and `consistent_hash` now honour `weight`,
   and `least_connections` balances connections per unit of weight. A weight

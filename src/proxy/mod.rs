@@ -1093,16 +1093,16 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
 
     if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
-        svc.add_tcp("0.0.0.0:8080");
+        listen(&mut svc, "0.0.0.0:8080");
     } else {
         for l in plain {
             info!(address = l.address, "adding listener");
-            svc.add_tcp(&l.address);
+            listen(&mut svc, &l.address);
         }
         for l in tls {
             let settings = build_tls_settings(&cert_store, &l.address);
             info!(address = l.address, "adding TLS listener");
-            svc.add_tls_with_settings(&l.address, None, settings);
+            svc.add_tls_with_settings(&l.address, socket_options(), settings);
         }
     }
 
@@ -1201,8 +1201,28 @@ fn add_proxy_protocol_tls_services(
         svc.endpoints()
             .set_pre_tls_callback(Arc::new(ProxyProtocolPreTls { listener: l.address.clone() }));
         let settings = build_tls_settings(cert_store, &l.address);
-        svc.add_tls_with_settings(&l.address, None, settings);
+        svc.add_tls_with_settings(&l.address, socket_options(), settings);
         server.add_service(svc);
+    }
+}
+
+/// Socket options for a listener a worker binds itself. On Linux the master
+/// binds every listener and workers inherit them (process::bind_listeners);
+/// elsewhere each worker binds its own, and without SO_REUSEPORT every
+/// worker but the first would wait for the port forever.
+fn socket_options() -> Option<pingora::listeners::TcpSocketOptions> {
+    (!cfg!(target_os = "linux")).then(|| {
+        let mut opt = pingora::listeners::TcpSocketOptions::default();
+        opt.so_reuseport = Some(true);
+        opt
+    })
+}
+
+/// Add a plain TCP listener to a service, with [`socket_options`].
+fn listen<A>(svc: &mut pingora::services::listening::Service<A>, address: &str) {
+    match socket_options() {
+        Some(opt) => svc.add_tcp_with_settings(address, opt),
+        None => svc.add_tcp(address),
     }
 }
 
@@ -1219,7 +1239,7 @@ fn add_proxy_protocol_services(server: &mut Server, cfg: &Config, proxy: KProxy)
             listener: l.address.clone(),
         };
         let mut svc = pingora::services::listening::Service::new(format!("proxy-pp-{}", l.address), app);
-        svc.add_tcp(&l.address);
+        listen(&mut svc, &l.address);
         server.add_service(svc);
     }
 }
@@ -1290,7 +1310,7 @@ fn add_l4_services(
             format!("tcp-{}", l.address),
             app,
         );
-        svc.add_tcp(&l.address);
+        listen(&mut svc, &l.address);
         server.add_service(svc);
     }
 }

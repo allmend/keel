@@ -155,11 +155,12 @@ health_check:
   timeout: 1s
 ```
 
-Keel uses ICMP datagram sockets, not raw sockets. When started as root on
-Linux, the master opens one IPv4 and one IPv6 socket per worker before
-dropping privileges and the workers inherit them, like the listeners. When
-started unprivileged, each worker opens its own; that works on macOS, and on
-Linux when the worker's group is inside `net.ipv4.ping_group_range`. If no
+Keel uses ICMP datagram sockets, not raw sockets. On Linux the master opens
+one IPv4 and one IPv6 socket per worker before forking (and before dropping
+privileges when started as root), and the workers inherit them, like the
+listeners. Started unprivileged, that works when the user's group is inside
+`net.ipv4.ping_group_range`. On other platforms each worker opens its own,
+which works on macOS without privileges. If no
 socket can be opened, Keel logs an error once and `icmp` probes for that
 address family pass unconditionally rather than take every backend out of
 service. Reasons: `no echo reply within 1000ms`, `unreachable`.

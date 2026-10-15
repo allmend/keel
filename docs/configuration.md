@@ -68,7 +68,7 @@ Every setting in the `keel` section requires a process restart. See [Hot reload]
 
 ## listeners
 
-One entry per port. When Keel starts as root on Linux, the master binds every listener — TCP and UDP — before forking the workers, and the workers inherit the sockets after dropping to `keel.user`. Workers never need the capability to bind ports below 1024. When started unprivileged (dev), each worker binds its own listeners.
+One entry per port. On Linux the master binds every listener — TCP and UDP — before forking the workers, and the workers inherit the sockets (after dropping to `keel.user` when started as root). Workers never need the capability to bind ports below 1024, and every worker accepts on the same socket whether or not Keel started as root. On other platforms each worker binds its own listeners with `SO_REUSEPORT`.
 
 ```yaml
 listeners:

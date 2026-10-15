@@ -233,3 +233,77 @@ fn a_drain_outlives_a_control_worker_and_a_worker_restart() -> Result<()> {
     })?;
     Ok(())
 }
+
+/// Started without root, every worker still accepts: the master binds the
+/// listener and the workers share it. Each worker bound its own before, and
+/// all but the first waited for the port forever.
+#[test]
+#[ignore = "needs Docker"]
+fn without_root_every_worker_accepts() -> Result<()> {
+    const COMPOSE: &str = r#"
+networks:
+  net:
+    ipam:
+      config:
+        - subnet: 172.29.85.0/24
+services:
+  backend:
+    image: traefik/whoami
+    networks: { net: { ipv4_address: 172.29.85.20 } }
+  keel:
+    image: {image}
+    init: true
+    user: "65534:65534"
+    environment: [NO_COLOR=1]
+    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config:ro"]
+    ports: ["8080"]
+    networks: { net: { ipv4_address: 172.29.85.10 } }
+"#;
+    const NODE: &str = r#"
+keel:
+  workers: 2
+  state_dir: /tmp/keel/state
+  control_socket: /tmp/keel/keel.sock
+"#;
+    const CONFIG: &str = r#"
+listeners:
+  - address: 0.0.0.0:8080
+access_log:
+  dir: /tmp/keel/log
+pools:
+  web:
+    backends:
+      - address: 172.29.85.20:80
+vhosts:
+  - host: "*"
+    pool: web
+"#;
+    let stack = Stack::up("non-root", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let addr = stack.addr("keel", 8080)?;
+    wait_until("HTTP 200 through keel", Duration::from_secs(60), || {
+        Ok(http_get(addr, "e2e.test", "/").ok().filter(|(status, _)| *status == 200))
+    })?;
+
+    // Every process is `nobody`: the children of the master are the control
+    // worker and the two workers.
+    let procs = stack.procs("keel")?;
+    let keel: Vec<&Proc> = procs.iter().filter(|p| p.cmd.starts_with("/usr/local/bin/keel")).collect();
+    let master = keel.iter().find(|p| !keel.iter().any(|q| q.pid == p.ppid)).expect("a keel master");
+    let children: Vec<u32> = keel.iter().filter(|p| p.ppid == master.pid).map(|p| p.pid).collect();
+    assert_eq!(children.len(), 3, "control worker and two workers: {procs:?}");
+    let sockets = |pid: u32| -> Result<usize> {
+        let out = stack.exec("keel", &["sh", "-c", &format!("ls -l /proc/{pid}/fd | grep -c socket:")])?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0))
+    };
+    let before: Vec<usize> = children.iter().map(|p| sockets(*p)).collect::<Result<_>>()?;
+
+    // Idle connections stay with the worker that accepted them.
+    let held: Vec<std::net::TcpStream> = (0..100).map(|_| std::net::TcpStream::connect(addr)).collect::<std::io::Result<_>>()?;
+    std::thread::sleep(Duration::from_secs(2));
+    let after: Vec<usize> = children.iter().map(|p| sockets(*p)).collect::<Result<_>>()?;
+    drop(held);
+
+    let accepting = before.iter().zip(&after).filter(|(b, a)| **a > **b).count();
+    assert_eq!(accepting, 2, "both workers hold connections (sockets before {before:?}, after {after:?})");
+    Ok(())
+}
