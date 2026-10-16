@@ -6,16 +6,32 @@ Keel exposes Prometheus-format metrics at `GET /metrics` on
 metrics; there is no cluster aggregation — use your Prometheus setup's
 federation if needed.
 
-With more than one worker process, every worker tries to bind
-`metrics.address`; one succeeds and the others log `metrics: failed to bind`.
-The endpoint then serves that one worker's registry: counters and histograms
-cover only the traffic that worker handled, and the gauges show that
-worker's view of connections, health, drain and ejection. Which worker
-serves the endpoint can change after a restart.
+## One endpoint per node
 
-A metric series appears after its first event: `keel_tcp_*` series exist
-once the first L4 connection arrives, `keel_udp_*` once the first flow
-opens, `keel_requests_total` once the first HTTP request does, and so on.
+The master binds `metrics.address` and the control worker serves it. The
+workers count into one shared memory region, each into its own part, and the
+endpoint adds them up: every value is a node total, and no metric has a
+`worker` label.
+
+- **Counters count from the master's start** (`keel_start_time_seconds`).
+  Restarting Keel resets them to zero, which `rate()` and `increase()`
+  handle as any exporter restart. A worker that crashes or is replaced does
+  not: its replacement keeps counting where it left off.
+- **Gauges** are merged across the workers: `keel_active_connections` is
+  the sum, `keel_backend_healthy` is `0` if any worker sees the backend
+  unhealthy, `keel_backend_ejected` is `1` if any worker ejected it, and
+  `keel_backend_drain_state` is the least drained state of any worker.
+- **Series stay** until the master restarts, including those of vhosts,
+  routes and pools removed by a reload (with their last value).
+- The region is sized from the config with room for reloads. If it fills
+  up, new series are not recorded: a warning is logged once and
+  `keel_metrics_series_dropped_total` counts them.
+
+Series of routes (`keel_request_duration_seconds`, `keel_request_bytes_*`)
+and backends (`keel_active_connections`, `keel_backend_drain_state`, the
+backend histogram) exist from the start; `keel_requests_total` per status
+code once a request gets that status, `keel_tcp_*` once the first L4
+connection arrives, `keel_udp_*` once the first flow opens.
 
 ## Labels
 
@@ -23,7 +39,7 @@ opens, `keel_requests_total` once the first HTTP request does, and so on.
 |---|---|
 | `pool` | Configured pool name |
 | `backend` | Backend `address` as configured (`ip:port`) |
-| `vhost` | The configured vhost label serving the request: the exact host, `"*"` for wildcard matches, or `"unmatched"`. Never the raw `Host` header — cardinality stays bounded by config |
+| `vhost` | The configured vhost whose route served the request: the exact host, a `*.example.com` wildcard, or `"*"`; `"unmatched"` in `keel_lb_errors_total` when no vhost matched. Never the raw `Host` header — cardinality stays bounded by config |
 | `status` | HTTP status code of the response |
 | `reason` | Short error cause, per metric below |
 
@@ -78,6 +94,34 @@ One flow (client `ip:port` → backend, until idle timeout) is the unit for `kee
 | `keel_udp_errors_total` | counter | `pool`, `reason` | Dropped datagrams and flows ended by error. Reasons: `no_backend` (per dropped datagram), `flow_limit` (per dropped datagram), `proxy_protocol`, `upstream_bind`, `upstream_send`, `upstream_recv` (backend not listening — ICMP unreachable), `downstream_send`, `shutdown` |
 
 Normal flow expiry is not an error and is not counted here; `keel_udp_flows_total` minus `keel_active_connections` gives flows that have ended.
+
+## Worker health
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `keel_workers` | gauge | | Worker processes running |
+| `keel_workers_configured` | gauge | | `keel.workers` |
+| `keel_workers_unresponsive` | gauge | | Workers that did not answer the control worker's last liveness check (every 5s, 5s timeout) |
+| `keel_worker_restarts_total` | counter | `reason` | Workers the master replaced: `exit` (exited on its own) or `signal` (killed, including by the OOM killer) |
+| `keel_start_time_seconds` | gauge | | When the master started, unix time; uptime is `time() - keel_start_time_seconds` |
+| `keel_metrics_series_dropped_total` | counter | | Series not recorded because the shared memory region was full |
+
+Every restart and every unresponsive worker is also logged with the worker's
+index and pid.
+
+```promql
+# A worker crashed or was killed
+increase(keel_worker_restarts_total[10m]) > 0
+
+# A worker is hung (alert after a minute: a restarting worker misses a check)
+keel_workers_unresponsive > 0
+
+# Fewer workers than configured
+keel_workers < keel_workers_configured
+```
+
+Ready-made Grafana dashboards and Prometheus alerting rules are in
+[`contrib/`](../contrib/README.md).
 
 ## Useful queries
 

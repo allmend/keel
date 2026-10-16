@@ -4,7 +4,6 @@ use crate::{
     cache::CacheHandle,
     config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, VhostCacheConfig},
     health,
-    metrics::MetricsService,
     tls::CertStore,
     vhost::RoutingTable,
 };
@@ -43,6 +42,8 @@ pub struct ProxyCtx {
     /// Raw Host header from the client. Used only for the X-Forwarded-Host header.
     host_header: String,
     backend: Option<SocketAddr>,
+    /// Request metrics of the matched route.
+    series: Option<Arc<crate::metrics::RequestSeries>>,
     started_at: Instant,
     backend_started_at: Option<Instant>,
     request_bytes: usize,
@@ -279,6 +280,7 @@ impl ProxyHttp for KProxy {
             vhost: String::new(),
             host_header: String::new(),
             backend: None,
+            series: None,
             started_at: Instant::now(),
             backend_started_at: None,
             request_bytes: 0,
@@ -430,16 +432,15 @@ impl ProxyHttp for KProxy {
         ctx.client_ip = client_ip;
         ctx.is_tls = is_tls;
 
-        let pool_name = routing
-            .resolve(&host, &path)
-            .ok_or_else(|| {
-                crate::metrics::record_lb_error("", &ctx.vhost, "no_route");
-                Error::explain(
-                    ErrorType::HTTPStatus(502),
-                    format!("no vhost match for host='{host}' path='{path}'"),
-                )
-            })?
-            .to_owned();
+        let route = routing.resolve(&host, &path).ok_or_else(|| {
+            crate::metrics::record_lb_error("", &ctx.vhost, "no_route");
+            Error::explain(
+                ErrorType::HTTPStatus(502),
+                format!("no vhost match for host='{host}' path='{path}'"),
+            )
+        })?;
+        let pool_name = route.pool.clone();
+        ctx.series = Some(Arc::clone(&route.series));
 
         // Set pool before select() so logging() can distinguish no_route from no_backend.
         ctx.pool = pool_name.clone();
@@ -651,12 +652,12 @@ impl ProxyHttp for KProxy {
         if let Some(addr) = backend {
             self.pools.release(&ctx.pool, addr);
         }
-        let backend_label = backend.map(|a| a.to_string());
+        let backend_series = backend.and_then(|a| self.pools.series(&ctx.pool, a));
 
         // Backend was selected but proxying failed — count as a connection error.
         if e.is_some() {
-            if let Some(label) = &backend_label {
-                crate::metrics::record_backend_connection_error(&ctx.pool, label);
+            if let Some(series) = backend_series {
+                series.connection_error();
             }
         }
 
@@ -668,19 +669,12 @@ impl ProxyHttp for KProxy {
 
         let elapsed = ctx.started_at.elapsed().as_secs_f64();
 
-        if !ctx.pool.is_empty() {
-            crate::metrics::record_request(&ctx.pool, &ctx.vhost, status, elapsed);
-
-            if let Some(label) = &backend_label {
-                let backend_elapsed = ctx
-                    .backend_started_at
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(elapsed);
-                crate::metrics::record_backend_request(&ctx.pool, label, status, backend_elapsed);
+        if let Some(series) = ctx.series.take() {
+            series.record(status, elapsed, ctx.request_bytes, ctx.response_bytes);
+            if let Some(b) = backend_series {
+                let backend_elapsed = ctx.backend_started_at.map_or(elapsed, |t| t.elapsed().as_secs_f64());
+                b.record_request(status, backend_elapsed);
             }
-
-            crate::metrics::add_request_bytes_in(&ctx.pool, &ctx.vhost, ctx.request_bytes);
-            crate::metrics::add_request_bytes_out(&ctx.pool, &ctx.vhost, ctx.response_bytes);
         }
 
         if !self.access_logger.enabled() {
@@ -710,7 +704,7 @@ impl ProxyHttp for KProxy {
             client_addr: ctx.client_addr_str.take(),
             vhost: std::mem::take(&mut ctx.vhost),
             pool: std::mem::take(&mut ctx.pool),
-            backend_addr: backend_label,
+            backend_addr: backend.map(|a| a.to_string()),
             bytes_in: ctx.request_bytes,
             bytes_out: ctx.response_bytes,
             duration_ms: elapsed * 1000.0,
@@ -796,11 +790,6 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
             .zip(addrs.iter().copied())
             .collect();
         build_drain_entries(name, &configured, &mut drain)?;
-
-        // Initialise drain state metric for each backend
-        for addr in &addrs {
-            crate::metrics::set_drain_state(name, addr, crate::backend::DRAIN_ACTIVE);
-        }
 
         let pool = match pool_cfg.algorithm {
             LbAlgorithm::RoundRobin => {
@@ -1026,6 +1015,7 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
 // own control socket, where the control worker asks for its view and hands it
 // every applied config.
 pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
+    crate::metrics::init_worker(index);
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
     let mut inherited = inherited;
 
@@ -1108,7 +1098,6 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     }
 
     server.add_service(svc);
-    server.add_service(background_service("metrics", MetricsService::new(&cfg.metrics.address)));
     server.add_service(background_service(
         "control",
         crate::control::worker_socket::WorkerSocket {

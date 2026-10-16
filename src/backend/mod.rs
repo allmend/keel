@@ -99,27 +99,29 @@ pub struct BackendEntry {
     /// The resolved address as text, for metric labels and status output,
     /// formatted once instead of on every request.
     label: String,
-    /// `keel_active_connections` for this backend, bound once.
-    active_gauge: prometheus::Gauge,
+    /// This backend's metric series, resolved once.
+    series: crate::metrics::BackendSeries,
 }
 
 impl BackendEntry {
     fn new(pool: &str, addr: SocketAddr, config_address: &str) -> Self {
         let label = addr.to_string();
+        let series = crate::metrics::BackendSeries::new(pool, &label);
+        series.set_drain_state(DRAIN_ACTIVE);
         BackendEntry {
             drain_state: AtomicU8::new(DRAIN_ACTIVE),
             connections: AtomicI64::new(0),
             health: HealthState::new(),
             config_address: config_address.to_owned(),
-            active_gauge: crate::metrics::active_connections_gauge(pool, &label),
+            series,
             label,
         }
     }
 
     /// One more connection to this backend.
     fn acquire(&self) {
-        let count = self.connections.fetch_add(1, Ordering::Relaxed) + 1;
-        self.active_gauge.set(count as f64);
+        self.connections.fetch_add(1, Ordering::Relaxed);
+        self.series.connection_opened();
     }
 
     /// Eligible for new traffic: not draining, not failing its check, and
@@ -255,7 +257,7 @@ impl PoolRegistry {
         entry.health.ejected_until_ms.store(until.max(1), Ordering::Release);
         let reason = format!("{n} consecutive {what} failures");
         *entry.health.eject_reason.lock().unwrap() = Some(reason.clone());
-        crate::metrics::record_ejection(pool_name, &entry.label, true);
+        entry.series.set_ejected(true);
         tracing::warn!(
             pool = pool_name,
             backend = %addr,
@@ -287,7 +289,7 @@ impl PoolRegistry {
             if until != 0 && now >= until {
                 entry.health.ejected_until_ms.store(0, Ordering::Release);
                 *entry.health.eject_reason.lock().unwrap() = None;
-                crate::metrics::record_ejection(pool, &entry.label, false);
+                entry.series.set_ejected(false);
                 tracing::info!(pool, backend = entry.label, "passive: ejection expired, backend re-admitted");
                 readmitted += 1;
             }
@@ -306,11 +308,13 @@ impl PoolRegistry {
     pub fn release(&self, pool_name: &str, addr: SocketAddr) {
         if let Some(entry) = self.entry(pool_name, addr) {
             let prev = entry.connections.fetch_sub(1, Ordering::Relaxed);
-            entry.active_gauge.set((prev - 1).max(0) as f64);
+            if prev > 0 {
+                entry.series.connection_closed();
+            }
             // Auto-remove when last draining connection finishes
             if entry.drain_state.load(Ordering::Acquire) == DRAIN_DRAINING && prev <= 1 {
                 entry.drain_state.store(DRAIN_REMOVED, Ordering::Release);
-                crate::metrics::set_drain_state(pool_name, &entry.label, DRAIN_REMOVED);
+                entry.series.set_drain_state(DRAIN_REMOVED);
                 tracing::info!(pool = pool_name, backend = %addr, "drain complete: backend removed");
             }
         }
@@ -321,7 +325,7 @@ impl PoolRegistry {
     pub fn drain_backend(&self, pool_name: &str, addr: SocketAddr) -> bool {
         if let Some(entry) = self.entry(pool_name, addr) {
             entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-            crate::metrics::set_drain_state(pool_name, &entry.label, DRAIN_DRAINING);
+            entry.series.set_drain_state(DRAIN_DRAINING);
             tracing::info!(pool = pool_name, backend = %addr, "drain initiated");
             true
         } else {
@@ -334,7 +338,7 @@ impl PoolRegistry {
     pub fn activate_backend(&self, pool_name: &str, addr: SocketAddr) -> bool {
         if let Some(entry) = self.entry(pool_name, addr) {
             entry.drain_state.store(DRAIN_ACTIVE, Ordering::Release);
-            crate::metrics::set_drain_state(pool_name, &entry.label, DRAIN_ACTIVE);
+            entry.series.set_drain_state(DRAIN_ACTIVE);
             true
         } else {
             false
@@ -355,11 +359,11 @@ impl PoolRegistry {
         let Some(entry) = self.entry(pool_name, addr) else { return };
         match entry.health.observe(ok, reason, healthy_after, unhealthy_after) {
             Some(true) => {
-                crate::metrics::set_backend_healthy(pool_name, &entry.label, true);
+                entry.series.set_healthy(true);
                 tracing::info!(pool = pool_name, backend = %addr, "health: backend healthy");
             }
             Some(false) => {
-                crate::metrics::set_backend_healthy(pool_name, &entry.label, false);
+                entry.series.set_healthy(false);
                 tracing::warn!(
                     pool = pool_name,
                     backend = %addr,
@@ -376,7 +380,7 @@ impl PoolRegistry {
     pub fn mark_checked(&self, pool_name: &str) {
         for entry in self.drain.get(pool_name).into_iter().flat_map(HashMap::values) {
             entry.health.checked.store(true, Ordering::Relaxed);
-            crate::metrics::set_backend_healthy(pool_name, &entry.label, true);
+            entry.series.set_healthy(true);
         }
     }
 
@@ -386,6 +390,11 @@ impl PoolRegistry {
         self.entry(pool_name, addr)
             .map(|e| e.connections.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// The metric series of a backend.
+    pub fn series(&self, pool_name: &str, addr: SocketAddr) -> Option<&crate::metrics::BackendSeries> {
+        self.entry(pool_name, addr).map(|e| &e.series)
     }
 
     /// The pool selects by the key passed to `select` (consistent hashing);
@@ -428,7 +437,7 @@ impl PoolRegistry {
         for (pool, entry) in self.entries() {
             if entry.label == addr {
                 entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-                crate::metrics::set_drain_state(pool, addr, DRAIN_DRAINING);
+                entry.series.set_drain_state(DRAIN_DRAINING);
                 tracing::info!(pool, backend = addr, "control: drain initiated");
                 found.push(pool.to_owned());
             }
@@ -461,7 +470,7 @@ impl PoolRegistry {
                 let gone = !configured.contains(entry.config_address.as_str());
                 if gone && entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
                     entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-                    crate::metrics::set_drain_state(pool_name, &entry.label, DRAIN_DRAINING);
+                    entry.series.set_drain_state(DRAIN_DRAINING);
                     tracing::info!(
                         pool = pool_name,
                         backend = entry.label,

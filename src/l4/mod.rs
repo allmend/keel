@@ -283,12 +283,17 @@ impl ServerApp for TcpProxyApp {
             self.log(client_addr, None, &out, started);
             return None;
         };
-        crate::metrics::record_tcp_connection(&self.pool, &backend.to_string());
+        let series = self.pools.series(&self.pool, backend).map(|s| s.tcp());
+        if let Some(s) = series {
+            s.connection();
+        }
 
         let out = self.splice(session, backend, shutdown).await;
 
         self.pools.release(&self.pool, backend);
-        crate::metrics::add_tcp_bytes(&self.pool, &backend.to_string(), out.bytes_in, out.bytes_out);
+        if let Some(s) = series {
+            s.bytes(out.bytes_in, out.bytes_out);
+        }
         if let Some(reason) = out.error {
             crate::metrics::record_tcp_error(&self.pool, reason);
         }

@@ -120,7 +120,7 @@ metrics:
 |---|---|---|
 | `address` | string | `127.0.0.1:10790` |
 
-Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. With more than one worker, the endpoint is served by a single worker and shows that worker's numbers only — see [Metrics](metrics.md). Every exposed metric is listed in the [metrics reference](metrics.md).
+Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. The master binds the address (as root, before dropping privileges) and the values are totals over all workers — see [Metrics](metrics.md#one-endpoint-per-node). Every exposed metric is listed in the [metrics reference](metrics.md).
 
 > **Security:** metrics expose backend addresses, pool/vhost names, and traffic
 > volumes. The default binds to `127.0.0.1` so they are not world-readable. To

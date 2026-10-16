@@ -276,14 +276,16 @@ fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<Bound
     Ok(BoundListeners { tcp, udp, icmp4, icmp6 })
 }
 
-/// The instance control socket and the `control.remote` port, bound by the
-/// master and kept open for its lifetime, so a control worker that dies
-/// never leaves them unbound. Only the control worker serves them.
+/// The instance control socket, the `control.remote` port and the metrics
+/// port, bound by the master and kept open for its lifetime, so a control
+/// worker that dies never leaves them unbound. Only the control worker
+/// serves them.
 struct ControlListeners {
     socket: std::os::unix::net::UnixListener,
     /// (device, inode) of the socket file this master created.
     socket_file: Option<(u64, u64)>,
     remote: Option<std::net::TcpListener>,
+    metrics: std::net::TcpListener,
 }
 
 fn file_id(path: &str) -> Option<(u64, u64)> {
@@ -301,7 +303,7 @@ impl ControlListeners {
     }
 
     fn fds(&self) -> Vec<RawFd> {
-        std::iter::once(self.socket.as_raw_fd()).chain(self.remote.as_ref().map(AsRawFd::as_raw_fd)).collect()
+        [self.socket.as_raw_fd(), self.metrics.as_raw_fd()].into_iter().chain(self.remote.as_ref().map(AsRawFd::as_raw_fd)).collect()
     }
 }
 
@@ -329,8 +331,10 @@ fn bind_control(cfg: &Config, accounts: Option<&Accounts>) -> Result<ControlList
         }
         None => None,
     };
-    info!(socket = path, remote = remote.is_some(), "master: control listeners bound");
-    Ok(ControlListeners { socket, socket_file: file_id(path), remote })
+    let metrics = std::net::TcpListener::bind(&cfg.metrics.address)
+        .with_context(|| format!("master: cannot bind metrics.address {}", cfg.metrics.address))?;
+    info!(socket = path, remote = remote.is_some(), metrics = cfg.metrics.address, "master: control listeners bound");
+    Ok(ControlListeners { socket, socket_file: file_id(path), remote, metrics })
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -376,6 +380,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         None
     };
     let control_listeners = bind_control(&cfg, accounts.as_ref())?;
+    crate::metrics::create_region(&cfg)?;
     let data_fds = bound.as_ref().map(BoundListeners::fds).unwrap_or_default();
 
     let mut control = Some(spawn_control(&cfg, &control_listeners, &data_fds, accounts.as_ref(), force_new_cluster)?);
@@ -394,6 +399,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         info!(pid = pid.as_raw(), index = i, "master: worker started");
         pids.push((pid, i));
     }
+    crate::metrics::set_workers(pids.len());
 
     loop {
         std::thread::sleep(TICK);
@@ -425,9 +431,9 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         }
 
         loop {
-            let (dead, how) = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(pid, code)) => (pid, format!("exit code {code}")),
-                Ok(WaitStatus::Signaled(pid, sig, _)) => (pid, format!("signal {sig:?}")),
+            let (dead, how, signaled) = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(pid, code)) => (pid, format!("exit code {code}"), false),
+                Ok(WaitStatus::Signaled(pid, sig, _)) => (pid, format!("signal {sig:?}"), true),
                 Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Continued(_)) => break,
                 Ok(_) => continue,
                 Err(nix::errno::Errno::ECHILD) => break,
@@ -449,12 +455,15 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
                 control_due = Some(Instant::now() + control_delay);
                 continue;
             }
-            warn!(pid = dead.as_raw(), how, "master: worker died, restarting");
             let index = pids.iter().find(|(p, _)| *p == dead).map(|(_, i)| *i).unwrap_or(pids.len());
+            warn!(index, pid = dead.as_raw(), how, "master: worker died, restarting");
             pids.retain(|(p, _)| *p != dead);
+            crate::metrics::set_workers(pids.len());
+            crate::metrics::worker_restarted(signaled);
             let private = private_fds(&control_listeners, control.as_ref());
             let pid = spawn_worker(&worker_cfg, index, bound.as_ref(), accounts.as_ref(), &private)?;
             pids.push((pid, index));
+            crate::metrics::set_workers(pids.len());
             info!(index, pid = pid.as_raw(), "master: replacement worker started");
             if let Some(c) = &control {
                 control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index });
@@ -497,9 +506,15 @@ fn spawn_control(
             close_fds(data_fds);
             close_fds(&[link.as_raw_fd()]);
             become_account(accounts.map(|a| &a.control), "control");
-            let inherited = match (listeners.socket.try_clone(), listeners.remote.as_ref().map(|r| r.try_clone()).transpose()) {
-                (Ok(control_socket), Ok(remote)) => control_worker::Inherited { control_socket, remote, master: child_end },
-                (Err(e), _) | (_, Err(e)) => {
+            let inherited = match (
+                listeners.socket.try_clone(),
+                listeners.remote.as_ref().map(|r| r.try_clone()).transpose(),
+                listeners.metrics.try_clone(),
+            ) {
+                (Ok(control_socket), Ok(remote), Ok(metrics)) => {
+                    control_worker::Inherited { control_socket, remote, metrics, master: child_end }
+                }
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                     error!(error = %e, "control: cannot take over the control listeners");
                     std::process::exit(1);
                 }

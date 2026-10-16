@@ -21,9 +21,11 @@ pub struct RoutingTable {
     acme_challenge_dir: Option<std::path::PathBuf>,
 }
 
-struct Route {
+pub struct Route {
     path_prefix: String,
-    pool: String,
+    pub pool: String,
+    /// The route's request metrics, labelled with its pool and vhost.
+    pub series: std::sync::Arc<crate::metrics::RequestSeries>,
     /// Route-level cache config — overrides the vhost-level config when present.
     cache: Option<VhostCacheConfig>,
 }
@@ -45,6 +47,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: "/".into(),
                         pool: pool.clone(),
+                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(pool, &vhost.host)),
                         cache: None,
                     });
                 }
@@ -53,6 +56,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: r.path.clone(),
                         pool: r.pool.clone(),
+                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(&r.pool, &vhost.host)),
                         cache: r.cache.clone(),
                     });
                 }
@@ -101,14 +105,14 @@ impl RoutingTable {
         None
     }
 
-    /// Returns the pool name for the given host and path, or `None` if no match.
+    /// Returns the route for the given host and path, or `None` if no match.
     /// Order: exact host, then its one-label wildcard (`*.example.com` for
     /// `api.example.com`), then the catch-all `"*"`.
-    pub fn resolve<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
+    pub fn resolve<'a>(&'a self, host: &str, path: &str) -> Option<&'a Route> {
         let host = host.split(':').next().unwrap_or(host);
-        self.match_host(host, path)
-            .or_else(|| wildcard_of(host).and_then(|w| self.match_host(&w, path)))
-            .or_else(|| self.match_host("*", path))
+        self.match_route(host, path)
+            .or_else(|| wildcard_of(host).and_then(|w| self.match_route(&w, path)))
+            .or_else(|| self.match_route("*", path))
     }
 
     /// Returns the cache config for the given host and path, or `None` if caching is
@@ -164,10 +168,6 @@ impl RoutingTable {
         self.redirect_http.contains(host) || self.redirect_http.contains("*")
     }
 
-    fn match_host<'a>(&'a self, host: &str, path: &str) -> Option<&'a str> {
-        self.match_route(host, path).map(|r| r.pool.as_str())
-    }
-
     fn match_route<'a>(&'a self, host: &str, path: &str) -> Option<&'a Route> {
         let routes = self.vhosts.get(host)?;
         routes.iter().find(|r| path.starts_with(r.path_prefix.as_str()))
@@ -202,6 +202,10 @@ mod tests {
         Route as CfgRoute, Vhost, VhostCacheConfig,
     };
     use std::collections::HashMap;
+
+    fn routed<'a>(t: &'a RoutingTable, host: &str, path: &str) -> Option<&'a str> {
+        t.resolve(host, path).map(|r| r.pool.as_str())
+    }
 
     fn make_config(vhosts: Vec<Vhost>, pools: HashMap<String, Pool>) -> Config {
         Config {
@@ -264,15 +268,15 @@ mod tests {
         assert!(t.default_action("1.2.3.4:443").is_some());
         // Exact vhost with a pool routes normally — wildcard must not apply.
         assert!(t.default_action("api.example.com").is_none());
-        assert_eq!(t.resolve("api.example.com", "/"), Some("api"));
+        assert_eq!(routed(&t, "api.example.com", "/"), Some("api"));
     }
 
     #[test]
     fn exact_host_match() {
         let cfg = make_config(vec![vhost("api.example.com", "api")], [pool("api")].into());
         let t = RoutingTable::build(&cfg);
-        assert_eq!(t.resolve("api.example.com", "/foo"), Some("api"));
-        assert_eq!(t.resolve("other.com", "/foo"), None);
+        assert_eq!(routed(&t, "api.example.com", "/foo"), Some("api"));
+        assert_eq!(routed(&t, "other.com", "/foo"), None);
     }
 
     #[test]
@@ -294,22 +298,22 @@ mod tests {
             [pool("default"), pool("api")].into(),
         );
         let t = RoutingTable::build(&cfg);
-        assert_eq!(t.resolve("example.com", "/api/users"), Some("api"));
-        assert_eq!(t.resolve("example.com", "/static/x"), Some("default"));
+        assert_eq!(routed(&t, "example.com", "/api/users"), Some("api"));
+        assert_eq!(routed(&t, "example.com", "/static/x"), Some("default"));
     }
 
     #[test]
     fn wildcard_fallback() {
         let cfg = make_config(vec![vhost("*", "default")], [pool("default")].into());
         let t = RoutingTable::build(&cfg);
-        assert_eq!(t.resolve("anything.com", "/"), Some("default"));
+        assert_eq!(routed(&t, "anything.com", "/"), Some("default"));
     }
 
     #[test]
     fn host_with_port_stripped() {
         let cfg = make_config(vec![vhost("example.com", "web")], [pool("web")].into());
         let t = RoutingTable::build(&cfg);
-        assert_eq!(t.resolve("example.com:8080", "/"), Some("web"));
+        assert_eq!(routed(&t, "example.com:8080", "/"), Some("web"));
     }
 
     #[test]
@@ -404,11 +408,11 @@ mod tests {
             HashMap::from([pool("wild"), pool("api")]),
         );
         let table = RoutingTable::build(&cfg);
-        assert_eq!(table.resolve("api.example.com", "/"), Some("api"), "exact beats wildcard");
-        assert_eq!(table.resolve("www.example.com", "/"), Some("wild"));
-        assert_eq!(table.resolve("www.example.com:443", "/"), Some("wild"));
-        assert_eq!(table.resolve("deep.www.example.com", "/"), None, "one label only");
-        assert_eq!(table.resolve("example.com", "/"), None);
+        assert_eq!(routed(&table, "api.example.com", "/"), Some("api"), "exact beats wildcard");
+        assert_eq!(routed(&table, "www.example.com", "/"), Some("wild"));
+        assert_eq!(routed(&table, "www.example.com:443", "/"), Some("wild"));
+        assert_eq!(routed(&table, "deep.www.example.com", "/"), None, "one label only");
+        assert_eq!(routed(&table, "example.com", "/"), None);
         assert_eq!(table.vhost_label("www.example.com"), Some("*.example.com"));
         assert_eq!(table.vhost_label("deep.www.example.com"), None);
     }

@@ -35,6 +35,8 @@ pub const MAX_WORKER_LINE: u64 = 64 * 1024 * 1024;
 /// operator protocol.
 #[derive(Serialize, Deserialize)]
 pub enum WorkerRequest {
+    /// Liveness: the worker answers with its pid.
+    Ping,
     Status,
     BackendList { pool: String },
     Drain { address: String },
@@ -216,6 +218,26 @@ impl WorkerFanout {
             return None;
         }
         Some(responses.iter().map(|r| connections_in(r, address)).sum())
+    }
+
+    /// Ping every worker in parallel: per worker index, its pid, or why it
+    /// did not answer within the worker timeout.
+    pub async fn ping_all(&self) -> Vec<Result<u32, String>> {
+        let Ok(line) = serde_json::to_string(&WorkerRequest::Ping) else { return Vec::new() };
+        let mut calls = tokio::task::JoinSet::new();
+        for (index, path) in self.sockets.iter().enumerate() {
+            let (path, line) = (path.clone(), line.clone());
+            calls.spawn(async move {
+                let pid = match ask_one(&path, &line).await {
+                    Ok(r) => r.data.and_then(|d| d["pid"].as_u64()).map(|p| p as u32).ok_or_else(|| "no pid in the answer".to_owned()),
+                    Err(e) => Err(e.to_string()),
+                };
+                (index, pid)
+            });
+        }
+        let mut answers = calls.join_all().await;
+        answers.sort_by_key(|(index, _)| *index);
+        answers.into_iter().map(|(_, pid)| pid).collect()
     }
 
     /// Hand `applied` to every worker, in parallel, each waiting for its

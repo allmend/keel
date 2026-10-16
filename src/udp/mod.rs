@@ -36,7 +36,7 @@ use tracing::{debug, error, info};
 
 use crate::access_log::{AccessLogger, UdpLogEntry};
 use crate::backend::PoolRegistry;
-use crate::metrics::UdpFlowCounters;
+use crate::metrics::UdpSeries;
 
 /// Largest payload a UDP datagram can carry. Receive buffers are this size so
 /// no datagram is ever truncated.
@@ -142,7 +142,7 @@ struct Flow {
     backend: SocketAddr,
     upstream: Arc<UdpSocket>,
     stats: Arc<FlowStats>,
-    counters: UdpFlowCounters,
+    counters: UdpSeries,
     reply_task: tokio::task::JoinHandle<()>,
 }
 
@@ -185,16 +185,16 @@ impl UdpProxyService {
             }
         };
 
-        let backend_label = backend.to_string();
-        crate::metrics::record_udp_flow(&self.pool, &backend_label);
-        let counters = crate::metrics::udp_flow_counters(&self.pool, &backend_label);
+        // A selected backend is always in the registry.
+        let counters = *self.pools.series(&self.pool, backend)?.udp();
+        counters.flow();
         let stats = Arc::new(FlowStats::new(now));
         let reply_task = tokio::spawn(reply_loop(
             Arc::clone(&upstream),
             Arc::clone(downstream),
             reply_to,
             Arc::clone(&stats),
-            counters.clone(),
+            counters,
             self.pool.clone(),
             backend,
             Arc::clone(&self.pools),
@@ -386,7 +386,7 @@ async fn reply_loop(
     downstream: Arc<UdpSocket>,
     reply_to: SocketAddr,
     stats: Arc<FlowStats>,
-    counters: UdpFlowCounters,
+    counters: UdpSeries,
     pool: String,
     backend: SocketAddr,
     pools: Arc<PoolRegistry>,

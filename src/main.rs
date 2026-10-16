@@ -10,6 +10,7 @@ mod health;
 mod l4;
 mod metrics;
 mod process;
+mod shm;
 mod proxy;
 mod proxy_protocol;
 #[cfg(test)]

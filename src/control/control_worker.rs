@@ -43,8 +43,12 @@ const MAX_MASTER_LINE: u64 = 4096;
 pub struct Inherited {
     pub control_socket: std::os::unix::net::UnixListener,
     pub remote: Option<std::net::TcpListener>,
+    pub metrics: std::net::TcpListener,
     pub master: std::os::unix::net::UnixStream,
 }
+
+/// How often the workers are pinged for `keel_workers_unresponsive`.
+const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Entry point after the fork and the privilege drop. Never returns.
 pub fn run(cfg: Config, inherited: Inherited, force_new_cluster: bool) -> ! {
@@ -160,6 +164,12 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
         let mut shutdown = shutdown.clone();
         tokio::spawn(async move { server.serve(&mut shutdown).await });
     }
+    {
+        let server = crate::metrics::MetricsServer { listener: inherited.metrics };
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move { server.serve(&mut shutdown).await });
+    }
+    tokio::spawn(liveness(WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers)));
     tokio::spawn(master_link(inherited.master, cluster, restarted_tx, Arc::clone(&shutdown_tx)));
 
     let mut shutdown = shutdown;
@@ -172,6 +182,41 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
     // Let Raft and the listeners observe it.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
+}
+
+/// Ping the workers on an interval and publish how many did not answer. A
+/// worker that stops answering, or answers again, is logged with its index
+/// and the pid it last answered with.
+async fn liveness(fanout: WorkerFanout) {
+    let mut pids: Vec<Option<u32>> = Vec::new();
+    let mut down: Vec<bool> = Vec::new();
+    let mut tick = tokio::time::interval(LIVENESS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await; // the first tick is immediate; workers are still starting
+    loop {
+        tick.tick().await;
+        let answers = fanout.ping_all().await;
+        pids.resize(answers.len(), None);
+        down.resize(answers.len(), false);
+        for (index, answer) in answers.iter().enumerate() {
+            match answer {
+                Ok(pid) => {
+                    if down[index] {
+                        info!(index, pid, "control: worker answers again");
+                    }
+                    pids[index] = Some(*pid);
+                    down[index] = false;
+                }
+                Err(e) => {
+                    if !down[index] {
+                        warn!(index, pid = pids[index], error = %e, "control: worker unresponsive");
+                    }
+                    down[index] = true;
+                }
+            }
+        }
+        crate::metrics::set_unresponsive(down.iter().filter(|d| **d).count());
+    }
 }
 
 /// Read the master's messages. The master never reads anything back: no

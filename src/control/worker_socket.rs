@@ -79,6 +79,7 @@ impl pingora::services::background::BackgroundService for WorkerSocket {
 
 fn answer(request: WorkerRequest, pools: &PoolRegistry, applier: &dyn Apply, started_at: Instant) -> String {
     match request {
+        WorkerRequest::Ping => ControlResponse::ok(serde_json::json!({ "pid": std::process::id() })),
         WorkerRequest::Status => crate::control::cmd_status(pools, started_at),
         WorkerRequest::BackendList { pool } => crate::control::cmd_backend_list(pools, &pool),
         WorkerRequest::Drain { address } => {
