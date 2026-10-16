@@ -14,6 +14,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   dead or alive, from any node. The node ID is refused for good: its
   certificate by every peer, and any join under it. See
   [Removing a member](docs/cluster.md#removing-a-member).
+- Worker health metrics: `keel_workers`, `keel_workers_configured`,
+  `keel_workers_unresponsive` (the control worker pings every worker every
+  5s), `keel_worker_restarts_total{reason}`, `keel_start_time_seconds` and
+  `keel_metrics_series_dropped_total`. A worker that stops answering is
+  logged with its index and pid.
+- Grafana dashboards (overview, HTTP, backends, TCP and UDP) and Prometheus
+  alerting rules in [`contrib/`](contrib/README.md). The development
+  compose stack runs them with Prometheus, Grafana and a little traffic.
 
 ### Changed
 
@@ -30,9 +38,21 @@ Versioning: [Semantic Versioning](https://semver.org/).
   drained) gets 503 Service Unavailable instead of 502. 502 stays for a
   backend that was selected and failed. Logged and counted as `no_backend`
   as before.
+- Metric series of routes and backends exist from the start, at zero,
+  instead of appearing with their first event; `vhost` on request metrics
+  is the vhost whose route served the request.
 
 ### Fixed
 
+- With more than one worker, `/metrics` showed one worker's numbers: every
+  worker tried to bind `metrics.address`, one won (`metrics: failed to bind`
+  in the others' logs), and counters covered only its share of the traffic.
+  Workers now count into shared memory and the endpoint, bound by the
+  master and served by the control worker, shows node totals. Counters
+  count from the master's start; a crashed or replaced worker no longer
+  takes its counts with it. Gauges are merged: connections summed, a
+  backend unhealthy or ejected in any worker shows as such, drain state is
+  the least drained. See [Metrics](docs/metrics.md#one-endpoint-per-node).
 - Started without root on Linux (including the container image run with
   `--user`), only one worker accepted connections: each worker bound the
   listener itself and the others waited for the port forever. The master

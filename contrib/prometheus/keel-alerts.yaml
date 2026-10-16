@@ -1,0 +1,148 @@
+# Prometheus alerting rules for Keel. Load with `rule_files:` in
+# prometheus.yml. The thresholds are starting points: tune them to your
+# traffic. `up{job="keel"}` assumes the scrape job is named keel.
+groups:
+  - name: keel-process
+    rules:
+      - alert: KeelDown
+        expr: up{job="keel"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keel on {{ $labels.instance }} cannot be scraped"
+          description: "The metrics endpoint has not answered for a minute: the node is down or metrics.address is unreachable."
+
+      - alert: KeelWorkerUnresponsive
+        expr: keel_workers_unresponsive > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} Keel worker(s) on {{ $labels.instance }} not answering"
+          description: "A worker has missed the control worker's liveness checks for a minute: it is hung. The log names its index and pid."
+
+      - alert: KeelWorkersMissing
+        expr: keel_workers < keel_workers_configured
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keel on {{ $labels.instance }} runs fewer workers than configured"
+          description: "{{ $value }} workers running. The master restarts a worker at once, so this means restarts are failing."
+
+      - alert: KeelWorkerRestarted
+        expr: increase(keel_worker_restarts_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Keel worker on {{ $labels.instance }} was restarted ({{ $labels.reason }})"
+          description: "The master replaced a worker in the last 10 minutes. reason=signal includes the OOM killer. The log has the worker's index, pid and exit status."
+
+      - alert: KeelMetricsSeriesDropped
+        expr: increase(keel_metrics_series_dropped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Keel on {{ $labels.instance }} is not recording some metric series"
+          description: "The shared memory region for metrics is full. It is sized from the config at start; restart Keel to size it for the current config."
+
+  - name: keel-backends
+    rules:
+      # A backend is available when it is active, not unhealthy and not
+      # ejected. A pool with backends but none available answers 503.
+      - alert: KeelPoolNoAvailableBackend
+        expr: |
+          count by (instance, pool) (keel_backend_drain_state == 0)
+          unless on (instance, pool)
+          count by (instance, pool) (
+            (keel_backend_drain_state == 0)
+            unless on (instance, pool, backend) (keel_backend_healthy == 0)
+            unless on (instance, pool, backend) (keel_backend_ejected == 1)
+          )
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pool {{ $labels.pool }} on {{ $labels.instance }} has no available backend"
+          description: "Every active backend is unhealthy or ejected. HTTP requests to the pool get 503, TCP connections are closed and UDP datagrams dropped."
+
+      - alert: KeelBackendUnhealthy
+        expr: keel_backend_healthy == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend {{ $labels.backend }} in pool {{ $labels.pool }} is unhealthy"
+          description: "It has failed its health check for 5 minutes on {{ $labels.instance }}. `keel backend list --pool {{ $labels.pool }}` shows the reason."
+
+      - alert: KeelBackendEjectedRepeatedly
+        expr: increase(keel_backend_ejections_total[15m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend {{ $labels.backend }} in pool {{ $labels.pool }} keeps being ejected"
+          description: "Passively ejected {{ $value | humanize }} times in 15 minutes on {{ $labels.instance }}: real traffic to it keeps failing to connect."
+
+      - alert: KeelBackendDrainStuck
+        expr: keel_backend_drain_state == 1 and on (instance, pool, backend) keel_active_connections > 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Draining {{ $labels.backend }} in pool {{ $labels.pool }} has not finished"
+          description: "It has been draining for 30 minutes and still has open connections on {{ $labels.instance }}."
+
+  - name: keel-traffic
+    rules:
+      - alert: KeelHigh5xxRatio
+        expr: |
+          sum by (instance, vhost) (rate(keel_requests_total{status=~"5.."}[5m]))
+            / sum by (instance, vhost) (rate(keel_requests_total[5m])) > 0.05
+          and sum by (instance, vhost) (rate(keel_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests to {{ $labels.vhost }} fail with 5xx"
+          description: "More than 5% 5xx for 5 minutes on {{ $labels.instance }}. 502: a backend failed; 503: no backend available."
+
+      - alert: KeelHighLatency
+        expr: |
+          histogram_quantile(0.99, sum by (instance, vhost, le) (rate(keel_request_duration_seconds_bucket[5m]))) > 1
+          and sum by (instance, vhost) (rate(keel_requests_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency of {{ $labels.vhost }} is {{ $value | humanizeDuration }}"
+          description: "Above 1s for 10 minutes on {{ $labels.instance }}."
+
+      - alert: KeelBackendConnectionErrors
+        expr: sum by (instance, pool, backend) (rate(keel_backend_connection_errors_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests to {{ $labels.backend }} in pool {{ $labels.pool }} fail"
+          description: "{{ $value | humanize }} failed upstream connections per second for 5 minutes on {{ $labels.instance }}."
+
+      - alert: KeelNoRoute
+        expr: sum by (instance) (rate(keel_lb_errors_total{reason="no_route"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Requests to {{ $labels.instance }} match no vhost"
+          description: "More than one request per second matches no vhost or route. A missing vhost, or scanners; a catch-all vhost with default_action quiets the latter."
+
+      - alert: KeelL4NoBackend
+        expr: |
+          sum by (instance, pool) (rate(keel_tcp_errors_total{reason="no_backend"}[5m])) > 0
+          or sum by (instance, pool) (rate(keel_udp_errors_total{reason="no_backend"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TCP or UDP traffic for pool {{ $labels.pool }} finds no backend"
+          description: "Connections are closed or datagrams dropped on {{ $labels.instance }} because the pool has no available backend."

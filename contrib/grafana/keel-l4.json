@@ -1,0 +1,629 @@
+{
+  "uid": "keel-l4",
+  "title": "Keel / TCP and UDP",
+  "description": "Layer 4 listeners: TCP connections and UDP flows per pool and backend.",
+  "tags": [
+    "keel"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "tags": [
+        "keel"
+      ],
+      "asDropdown": true,
+      "title": "Keel dashboards",
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(keel_workers, job)",
+          "refId": "job"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(keel_workers{job=~\"$job\"}, instance)",
+          "refId": "instance"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "pool",
+        "label": "Pool",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"keel_(tcp|udp)_.*\",job=~\"$job\",instance=~\"$instance\"}, pool)",
+          "refId": "pool"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Keel restarts",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "iconColor": "purple",
+        "expr": "changes(keel_start_time_seconds{job=~\"$job\",instance=~\"$instance\"}[2m]) > 0",
+        "titleFormat": "Keel restarted",
+        "textFormat": "{{instance}}",
+        "step": "1m"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "TCP",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections / s",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool, backend) (rate(keel_tcp_connections_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} {{backend}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes to clients",
+      "description": "Counted when a connection ends.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_tcp_bytes_out_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes from clients",
+      "description": "Counted when a connection ends.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_tcp_bytes_in_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "TCP errors",
+      "description": "no_backend, proxy_protocol, tls_handshake, upstream_connect, upstream_tls, io, shutdown.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool, reason) (rate(keel_tcp_errors_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "UDP",
+      "id": 6,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Flows opened / s",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool, backend) (rate(keel_udp_flows_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} {{backend}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Datagrams",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_udp_packets_in_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} from clients",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_udp_packets_out_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} to clients",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes",
+      "description": "",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_udp_bytes_in_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} from clients",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool) (rate(keel_udp_bytes_out_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} to clients",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "UDP errors",
+      "description": "no_backend and flow_limit count dropped datagrams; upstream_recv is usually a backend not listening.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (pool, reason) (rate(keel_udp_errors_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\"}[$__rate_interval]))",
+          "legendFormat": "{{pool}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        }
+      },
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    }
+  ]
+}
