@@ -108,6 +108,7 @@ impl BackendEntry {
         let label = addr.to_string();
         let series = crate::metrics::BackendSeries::new(pool, &label);
         series.set_drain_state(DRAIN_ACTIVE);
+        series.set_ejected(false);
         BackendEntry {
             drain_state: AtomicU8::new(DRAIN_ACTIVE),
             connections: AtomicI64::new(0),

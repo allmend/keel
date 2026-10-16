@@ -28,8 +28,8 @@ endpoint adds them up: every value is a node total, and no metric has a
   `keel_metrics_series_dropped_total` counts them.
 
 Series of routes (`keel_request_duration_seconds`, `keel_request_bytes_*`)
-and backends (`keel_active_connections`, `keel_backend_drain_state`, the
-backend histogram) exist from the start; `keel_requests_total` per status
+and backends (`keel_active_connections`, `keel_backend_drain_state`,
+`keel_backend_ejected`, the backend histogram) exist from the start; `keel_requests_total` per status
 code once a request gets that status, `keel_tcp_*` once the first L4
 connection arrives, `keel_udp_*` once the first flow opens.
 
