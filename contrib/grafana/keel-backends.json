@@ -153,14 +153,14 @@
     {
       "type": "table",
       "title": "Backends",
-      "description": "Health is empty for pools without a health_check. Requests and p95 over the last 5 minutes.",
+      "description": "One row per backend: the worst state any Keel instance shown reports (pick one instance to see its view). Health is empty for pools without a health_check. Requests and p95 over the last 5 minutes.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (instance, pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
+          "expr": "max by (pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
           "legendFormat": "",
           "refId": "A",
           "instant": true,
@@ -172,7 +172,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
+          "expr": "min by (pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
           "legendFormat": "",
           "refId": "B",
           "instant": true,
@@ -184,7 +184,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
+          "expr": "max by (pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
           "legendFormat": "",
           "refId": "C",
           "instant": true,
@@ -196,7 +196,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (instance, pool, backend) (keel_active_connections{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
+          "expr": "sum by (pool, backend) (keel_active_connections{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"})",
           "legendFormat": "",
           "refId": "D",
           "instant": true,
@@ -208,7 +208,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (instance, pool, backend) (rate(keel_backend_requests_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}[5m]))",
+          "expr": "sum by (pool, backend) (rate(keel_backend_requests_total{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}[5m]))",
           "legendFormat": "",
           "refId": "E",
           "instant": true,
@@ -220,7 +220,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (instance, pool, backend, le) (rate(keel_backend_response_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (pool, backend, le) (rate(keel_backend_response_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}[5m])))",
           "legendFormat": "",
           "refId": "F",
           "instant": true,
@@ -238,7 +238,31 @@
           "options": {
             "excludeByName": {
               "Time": true
+            },
+            "indexByName": {
+              "pool": 0,
+              "backend": 1
             }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "backend"
+              }
+            ]
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "pool"
+              }
+            ]
           }
         }
       ],
@@ -430,14 +454,14 @@
     {
       "type": "state-timeline",
       "title": "Availability over time",
-      "description": "Green: available. Red: unhealthy or ejected. Orange: draining. Grey: removed.",
+      "description": "Worst state over the Keel instances shown. Green: available. Red: unhealthy or ejected. Orange: draining. Grey: removed.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(max by (instance, pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 1) * 2 or (max by (instance, pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 2) + 1 or (max by (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 0) + 1 or (max by (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 1) or (max by (instance, pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 0)",
+          "expr": "(max by (pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 1) * 2 or (max by (pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 2) + 1 or (min by (pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 0) + 1 or (max by (pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 1) or (max by (pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\",pool=~\"$pool\",backend=~\"$backend\"}) == 0)",
           "legendFormat": "{{pool}} {{backend}}",
           "refId": "A"
         }

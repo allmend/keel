@@ -371,14 +371,14 @@
     {
       "type": "stat",
       "title": "Backends available",
-      "description": "Active, not unhealthy, not ejected.",
+      "description": "Active, not unhealthy, not ejected, on every Keel instance shown.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count((keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\"} == 1)) or vector(0)",
+          "expr": "count(count by (pool, backend) ((keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\"} == 1))) or vector(0)",
           "legendFormat": "",
           "refId": "A",
           "instant": true,
@@ -431,14 +431,14 @@
     {
       "type": "stat",
       "title": "Backends unavailable",
-      "description": "Unhealthy, ejected, draining or removed.",
+      "description": "Unhealthy, ejected, draining or removed on at least one Keel instance shown.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count(keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"}) - (count((keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\"} == 1)) or vector(0))",
+          "expr": "count(count by (pool, backend) (keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"})) - (count(count by (pool, backend) ((keel_backend_drain_state{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_healthy{job=~\"$job\",instance=~\"$instance\"} == 0) unless on (instance, pool, backend) (keel_backend_ejected{job=~\"$job\",instance=~\"$instance\"} == 1))) or vector(0))",
           "legendFormat": "",
           "refId": "A",
           "instant": true,
