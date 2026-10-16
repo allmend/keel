@@ -41,7 +41,7 @@ This listens on port 8080 and proxies all traffic to a single backend at `127.0.
 ./keel --config node.yaml
 ```
 
-Started as root, Keel binds the listening ports and the control socket, then forks a control worker running as `keel-control` and worker processes running as `keel`; create both users first. Started as another user, every process runs as that user. The node is a cluster of one: see [Cluster](cluster.md) to add nodes.
+Started as root, Keel binds the listening ports and the control socket, then forks a control worker running as `keel-control` and worker processes running as `keel`; create both users first. Started as another user, every process runs as that user. The node is a cluster of one: see [Cluster](cluster.md) to add nodes, and [Architecture](architecture.md) for how the processes fit together.
 
 ## Verify
 
@@ -53,6 +53,7 @@ Check that the request reaches your backend and returns a response.
 
 ## Next steps
 
+- [Architecture](architecture.md) — processes, sockets, config flow, cluster, in diagrams
 - [Configuration reference](configuration.md) — full schema for all sections
 - [Virtual hosts](virtual-hosts.md) — host-based routing, TLS, path routing
 - [Automatic TLS (ACME)](acme.md) — Let's Encrypt / ACME v2 certificates and renewal

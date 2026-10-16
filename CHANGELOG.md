@@ -8,6 +8,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- [Architecture](docs/architecture.md): the processes of a node, who binds
+  and serves which socket, a request's path, how config, health, metrics
+  and logs move, and what happens when a process dies, in diagrams.
+
 ---
 
 ## [0.25.0] — 2026-10-17
