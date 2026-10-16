@@ -213,7 +213,7 @@ where
     }
 }
 
-/// Copy one direction, counting bytes. A peer that drops the TCP connection
+/// Copy one direction, counting bytes, flushing as it goes. A peer that drops the TCP connection
 /// without a TLS close_notify surfaces as `UnexpectedEof` from rustls; many
 /// TCP clients close that way, so it counts as a normal end, not an error.
 async fn pump<R, W>(r: &mut R, w: &mut W) -> (u64, Option<&'static str>)
@@ -229,7 +229,10 @@ where
         match r.read(&mut buf).await {
             Ok(0) => return (total, None),
             Ok(n) => {
-                if let Err(e) = w.write_all(&buf[..n]).await {
+                // Flush every chunk: Pingora's client stream and TLS streams
+                // buffer writes, and a client waiting for an answer would
+                // otherwise only get it when the connection closes.
+                if let Err(e) = w.write_all(&buf[..n]).await.and(w.flush().await) {
                     debug!(error = %e, "tcp: write failed");
                     return (total, Some("io"));
                 }
@@ -393,6 +396,30 @@ mod tests {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let name = ServerName::try_from(sni).unwrap();
         tokio_rustls::TlsConnector::from(crate::tls::insecure_client_config()).connect(name, tcp).await.unwrap()
+    }
+
+    /// Pingora hands the splice a buffered stream: an answer the client
+    /// waits for (DNS over TCP, say) must reach it while the connection stays
+    /// open, not when it closes.
+    #[tokio::test]
+    async fn a_buffered_client_gets_the_answer_before_it_closes() {
+        let backend = echo_backend().await;
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (_keep, rx) = tokio::sync::watch::channel(false);
+        let app = app(TlsMode::Passthrough, None, None, backend);
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            app.splice(tokio::io::BufStream::new(s), backend, &rx).await
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"query").await.unwrap();
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(std::time::Duration::from_secs(2), c.read_exact(&mut buf))
+            .await
+            .expect("the answer stayed in the buffer")
+            .unwrap();
+        assert_eq!(&buf, b"query");
     }
 
     #[tokio::test]

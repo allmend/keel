@@ -44,6 +44,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- TCP (L4) listeners held data for the client in a write buffer until the
+  connection closed: a client that waits for an answer before closing, such
+  as DNS over TCP, timed out. Every chunk is now flushed as it is copied.
 - With more than one worker, `/metrics` showed one worker's numbers: every
   worker tried to bind `metrics.address`, one won (`metrics: failed to bind`
   in the others' logs), and counters covered only its share of the traffic.
