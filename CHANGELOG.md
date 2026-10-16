@@ -8,18 +8,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-
-- [Architecture](docs/architecture.md): the processes of a node, who binds
-  and serves which socket, a request's path, how config, health, metrics
-  and logs move, and what happens when a process dies, in diagrams.
-
 ---
 
 ## [0.25.0] — 2026-10-17
 
 ### Added
 
+- [Architecture](docs/architecture.md): the processes of a node, who binds
+  and serves which socket, a request's path, how config, health, metrics
+  and logs move, and what happens when a process dies, in diagrams.
 - **`keel cluster remove <node_id>`** (and `keelctl`): remove another member,
   dead or alive, from any node. The node ID is refused for good: its
   certificate by every peer, and any join under it. See
