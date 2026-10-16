@@ -86,8 +86,10 @@ pools:
 ```
 
 Omit `health_check` to disable health checks for a pool. All backends in
-that pool are then always considered healthy. If all backends in a pool are
-unhealthy, Keel returns 502 for requests routed to that pool.
+that pool are then always considered healthy. If no backend in a pool is
+available (all unhealthy, ejected or drained), Keel returns 503 for requests
+routed to that pool. A backend that is selected but cannot be reached gives
+502.
 
 ---
 

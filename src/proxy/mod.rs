@@ -455,8 +455,9 @@ impl ProxyHttp for KProxy {
             .select(&pool_name, &key)
             .ok_or_else(|| {
                 crate::metrics::record_lb_error(&pool_name, &ctx.vhost, "no_backend");
+                // No upstream failed, there is none to try: 503, not 502.
                 Error::explain(
-                    ErrorType::HTTPStatus(502),
+                    ErrorType::HTTPStatus(503),
                     format!("pool '{pool_name}' has no available backends"),
                 )
             })?;

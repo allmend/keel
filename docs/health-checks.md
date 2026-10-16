@@ -255,7 +255,7 @@ The transitions are logged at `warn` (unhealthy, with the reason) and `info`
 ## Behavior notes
 
 - If every backend of a pool is unhealthy, HTTP requests to that pool get a
-  502, TCP connections are closed, and UDP datagrams are dropped, all logged
+  503, TCP connections are closed, and UDP datagrams are dropped, all logged
   as `no_backend`.
 - Health, ejection, and drain are independent: a draining backend keeps
   being probed, an unhealthy backend can be drained, and an ejected backend

@@ -99,8 +99,8 @@ When `error` is non-null, it contains one of these short strings:
 | Value | Meaning |
 |---|---|
 | `no_route` | The request was not routed to a pool: no vhost or route matched, or Keel answered the request itself (see below) |
-| `no_backend` | Pool exists but no healthy backend was available |
-| `upstream_connect` | Proxying to the selected backend failed — a connect failure, a timeout, or an error after the connection was established |
+| `no_backend` | Pool exists but no backend was available (unhealthy, ejected or drained); Keel answers 503 |
+| `upstream_connect` | Proxying to the selected backend failed — a connect failure, a timeout, or an error after the connection was established; Keel answers 502 if no response was sent yet |
 
 Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` redirects and `default_action` responses — are logged before a vhost is resolved: `vhost`, `method` and `uri` are empty, `error` is `no_route`, `status` is the status Keel sent, and the entry goes to `access_unknown.log` and `error_unknown.log`.
 

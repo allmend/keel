@@ -26,6 +26,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
   is looked up by address instead of by a string formatted per request; the
   access-log fields are captured only when the access log is on; the
   consistent-hash key is built only for `consistent_hash` pools.
+- A request to a pool with no available backend (all unhealthy, ejected or
+  drained) gets 503 Service Unavailable instead of 502. 502 stays for a
+  backend that was selected and failed. Logged and counted as `no_backend`
+  as before.
 
 ### Fixed
 
