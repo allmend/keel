@@ -1,7 +1,7 @@
-//! Inbound PROXY protocol (HAProxy spec v1 and v2).
+//! Inbound PROXY protocol, v1 (text) and v2 (binary).
 //!
-//! A load balancer in front of Keel that terminates the client's TCP
-//! connection (AWS NLB, HAProxy, another Keel) can prepend a header carrying
+//! An L4 load balancer in front of Keel that terminates the client's TCP
+//! connection (a cloud load balancer, another proxy, another Keel) can prepend a header carrying
 //! the original client address. Keel reads it once per connection — or, for
 //! UDP, once per datagram — before anything else touches the bytes, and
 //! treats the address it names as the client for routing keys, forwarded

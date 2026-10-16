@@ -121,7 +121,7 @@ Forwarded header configuration defaults to `mode: replace` if the `forwarded_hea
 
 ## PROXY Protocol
 
-A load balancer that terminates the client's TCP connection in front of Keel (AWS NLB, HAProxy, another Keel) can prepend a PROXY Protocol header naming the original client. With `proxy_protocol: true` on a listener, Keel reads that header before anything else and uses the address it carries as the client's: in forwarded headers, access logs, the consistent-hash key, and passive health.
+An L4 load balancer that terminates the client's TCP connection in front of Keel (a cloud load balancer, another proxy, another Keel) can prepend a PROXY Protocol header naming the original client. With `proxy_protocol: true` on a listener, Keel reads that header before anything else and uses the address it carries as the client's: in forwarded headers, access logs, the consistent-hash key, and passive health.
 
 ```yaml
 listeners:
