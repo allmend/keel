@@ -64,6 +64,21 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 | `keel_backend_ejections_total` | counter | `pool`, `backend` | Passive ejections |
 | `keel_proxy_protocol_errors_total` | counter | `listener` | Connections or datagrams rejected for a missing or malformed PROXY protocol header |
 
+## Cache metrics
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `keel_cache_requests_total` | counter | `pool`, `vhost`, `result` | Requests on a route with caching on: `hit` (answered from the cache) or `miss` (from the backend) |
+| `keel_cache_hits_total` | counter | `tier` | Hits by the tier that served them: `memory` or `disk` |
+
+A route's series appear with its first cached request. Hits also count in `keel_requests_total` and the access log, under their vhost and pool.
+
+```promql
+# Hit ratio per vhost
+sum by (vhost) (rate(keel_cache_requests_total{result="hit"}[5m]))
+  / sum by (vhost) (rate(keel_cache_requests_total[5m]))
+```
+
 ## Backends per pool
 
 `keel_pool_backends{pool, state}` — gauge, computed at each scrape from the node's view of every backend. Each backend that is not removed counts in exactly one state; the four values add up to the pool's backends. All four are emitted for every pool, zeros included.

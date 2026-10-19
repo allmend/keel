@@ -98,6 +98,8 @@ families! {
     UDP_PACKETS_OUT = "keel_udp_packets_out_total", Kind::Counter, POOL_BACKEND, "Total datagrams sent to UDP (L4) clients";
     UDP_BYTES_IN = "keel_udp_bytes_in_total", Kind::Counter, POOL_BACKEND, "Total bytes received from UDP (L4) clients";
     UDP_BYTES_OUT = "keel_udp_bytes_out_total", Kind::Counter, POOL_BACKEND, "Total bytes sent to UDP (L4) clients";
+    CACHE_REQUESTS = "keel_cache_requests_total", Kind::Counter, &["pool", "vhost", "result"], "HTTP requests with caching on, by result (hit, miss)";
+    CACHE_HITS = "keel_cache_hits_total", Kind::Counter, &["tier"], "Cache hits by the tier that served them (memory, disk)";
     UDP_ERRORS = "keel_udp_errors_total", Kind::Counter, POOL_REASON, "UDP (L4) datagrams dropped or flows ended by an error";
 }
 
@@ -332,21 +334,37 @@ impl StatusCounters {
 
 /// Series of one route: requests to `pool` through `vhost`.
 pub struct RequestSeries {
+    pool: String,
+    vhost: String,
     requests: StatusCounters,
     duration: Histogram,
     bytes_in: Counter,
     bytes_out: Counter,
+    /// Hits and misses, on the first request with caching on.
+    cache: OnceLock<[Counter; 2]>,
 }
 
 impl RequestSeries {
     pub fn new(pool: &str, vhost: &str) -> Self {
         let labels = [pool, vhost];
         RequestSeries {
+            pool: pool.to_owned(),
+            vhost: vhost.to_owned(),
             requests: StatusCounters::new(F::REQUESTS, pool, vhost),
             duration: Histogram::of(F::REQUEST_DURATION, &labels),
             bytes_in: Counter::of(F::REQUEST_BYTES_IN, &labels),
             bytes_out: Counter::of(F::REQUEST_BYTES_OUT, &labels),
+            cache: OnceLock::new(),
         }
+    }
+
+    /// A request with caching on was answered from the cache, or not.
+    pub fn cache_lookup(&self, hit: bool) {
+        let [hits, misses] = self.cache.get_or_init(|| {
+            let (p, v) = (self.pool.as_str(), self.vhost.as_str());
+            [Counter::of(F::CACHE_REQUESTS, &[p, v, "hit"]), Counter::of(F::CACHE_REQUESTS, &[p, v, "miss"])]
+        });
+        if hit { hits } else { misses }.inc();
     }
 
     pub fn record(&self, status: u16, secs: f64, bytes_in: usize, bytes_out: usize) {
@@ -507,6 +525,11 @@ impl UdpSeries {
 }
 
 // Rare events: looked up through the cache
+
+/// A cache hit served by `tier`: `memory` or `disk`.
+pub fn record_cache_hit(tier: &'static str) {
+    Counter::of(F::CACHE_HITS, &[tier]).inc();
+}
 
 pub fn record_lb_error(pool: &str, vhost: &str, reason: &str) {
     Counter::of(F::LB_ERRORS, &[pool, vhost, reason]).inc();

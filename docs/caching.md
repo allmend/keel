@@ -87,6 +87,10 @@ A response with `Vary` is stored per combination of the named request headers' v
 
 Content types are matched without parameters (`text/html; charset=utf-8` is `text/html`). A trailing `*` is a prefix match: `image/*` matches `image/png`.
 
+## Metrics
+
+`keel_cache_requests_total{pool, vhost, result}` counts hits and misses per route, `keel_cache_hits_total{tier}` hits per tier. See [Metrics](metrics.md#cache-metrics).
+
 ## X-Cache
 
 Responses on a vhost or route with caching enabled carry `X-Cache: HIT` (from cache) or `X-Cache: MISS` (from the backend). Others carry none.

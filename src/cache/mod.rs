@@ -1,4 +1,5 @@
-pub mod disk;
+mod counted;
+mod disk;
 pub mod tiered;
 
 use anyhow::{bail, Result};
@@ -6,6 +7,7 @@ use pingora::cache::{eviction::lru::Manager, MemCache, Storage};
 
 use crate::config::CacheConfig;
 use disk::DiskStore;
+use counted::Counted;
 use tiered::TieredStore;
 
 /// Returned by [init] — holds `'static` pointers required by Pingora.
@@ -26,7 +28,7 @@ pub fn init(cfg: &CacheConfig) -> Result<Option<CacheHandle>> {
         (None, None) => Ok(None),
 
         (Some(mem), None) => {
-            let storage = Box::leak(Box::new(MemCache::new()));
+            let storage = counted(Box::leak(Box::new(MemCache::new())), "memory");
             let capacity = (mem / (16 * 1024)).max(256);
             let eviction = Box::leak(Box::new(Manager::<16>::with_capacity(mem, capacity)));
             Ok(Some(CacheHandle { storage, eviction }))
@@ -37,8 +39,7 @@ pub fn init(cfg: &CacheConfig) -> Result<Option<CacheHandle>> {
             let capacity = (disk_bytes / (64 * 1024)).max(256);
             let eviction: &'static Manager<16> =
                 Box::leak(Box::new(Manager::<16>::with_capacity(disk_bytes, capacity)));
-            let store: &'static DiskStore =
-                Box::leak(Box::new(DiskStore::new(&disk.path, eviction)));
+            let store = counted(Box::leak(Box::new(DiskStore::new(&disk.path, eviction))), "disk");
             Ok(Some(CacheHandle { storage: store, eviction }))
         }
 
@@ -49,19 +50,23 @@ pub fn init(cfg: &CacheConfig) -> Result<Option<CacheHandle>> {
             let mem_capacity = (mem / (16 * 1024)).max(256);
             let mem_eviction: &'static Manager<16> =
                 Box::leak(Box::new(Manager::<16>::with_capacity(mem, mem_capacity)));
-            let l1: &'static MemCache = Box::leak(Box::new(MemCache::new()));
+            let l1 = counted(Box::leak(Box::new(MemCache::new())), "memory");
 
             // Disk eviction is tracked separately by DiskStore internally.
             let disk_capacity = (disk_bytes / (64 * 1024)).max(256);
             let disk_eviction: &'static Manager<16> =
                 Box::leak(Box::new(Manager::<16>::with_capacity(disk_bytes, disk_capacity)));
-            let l2: &'static DiskStore =
-                Box::leak(Box::new(DiskStore::new(&disk.path, disk_eviction)));
+            let l2 = counted(Box::leak(Box::new(DiskStore::new(&disk.path, disk_eviction))), "disk");
 
             let tiered: &'static TieredStore = Box::leak(Box::new(TieredStore { l1, l2 }));
             Ok(Some(CacheHandle { storage: tiered, eviction: mem_eviction }))
         }
     }
+}
+
+/// A tier that counts its hits, for the life of the process.
+fn counted<S: Storage + Sync + Send + 'static>(inner: &'static S, tier: &'static str) -> &'static Counted<S> {
+    Box::leak(Box::new(Counted { inner, tier }))
 }
 
 /// Parse a human-readable size string into bytes.

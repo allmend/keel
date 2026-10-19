@@ -169,3 +169,64 @@ fn backends_per_pool_by_state() -> Result<()> {
     assert_eq!(sample(&stack, r#"keel_backend_drain_state{pool="web",backend="172.29.87.20:80"}"#)?, 2.0, "removed");
     Ok(())
 }
+
+// One worker: the memory cache is per worker.
+const CACHE_NODE: &str = r#"
+keel {
+  workers = 1
+  user    = "nobody"
+  group   = "nogroup"
+}
+
+metrics {
+  address = "0.0.0.0:10790"
+}
+"#;
+
+const CACHE_CONFIG: &str = r#"
+listener "http" "0.0.0.0:80" {}
+
+access_log {
+  dir = "-"
+}
+
+cache {
+  memory = "8M"
+}
+
+pool "web" {
+  backend "172.29.87.20:80" {}
+}
+
+vhost "*" {
+  pool = "web"
+
+  cache {
+    enabled = true
+    ttl     = "1m"
+  }
+}
+"#;
+
+#[test]
+#[ignore = "needs Docker"]
+fn cache_hits_and_misses_are_counted_per_route_and_tier() -> Result<()> {
+    let stack = Stack::up("cache-metrics", COMPOSE, &[("node.hcl", CACHE_NODE.to_owned()), ("config/keel.hcl", CACHE_CONFIG.to_owned())])?;
+    let addr = stack.addr("keel", 80)?;
+    wait_until("HTTP 200 through keel", Duration::from_secs(60), || {
+        Ok(http_get(addr, "e2e.test", "/cached").ok().filter(|(status, _)| *status == 200))
+    })?;
+    // The first request was the miss that filled the cache.
+    assert_eq!(http_get(addr, "e2e.test", "/cached")?.0, 200);
+    let hit = r#"keel_cache_requests_total{pool="web",vhost="*",result="hit"}"#;
+    wait_until("the hit counted", Duration::from_secs(10), || Ok((sample(&stack, hit).ok() == Some(1.0)).then_some(())))?;
+    assert_eq!(sample(&stack, r#"keel_cache_requests_total{pool="web",vhost="*",result="miss"}"#)?, 1.0);
+    assert_eq!(sample(&stack, r#"keel_cache_hits_total{tier="memory"}"#)?, 1.0);
+    // A hit is a request of its route like any other.
+    assert_eq!(sample(&stack, r#"keel_requests_total{pool="web",vhost="*",status="200"}"#)?, 2.0);
+    let logs = stack.logs("keel")?;
+    let entries: Vec<&str> = logs.lines().filter(|l| l.contains(r#""uri":"/cached""#)).collect();
+    assert_eq!(entries.len(), 2, "{logs}");
+    assert!(entries.iter().all(|e| e.contains(r#""vhost":"*""#) && e.contains(r#""pool":"web""#)), "{entries:?}");
+    Ok(())
+}

@@ -69,9 +69,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - HTTP access entries carry `"type": "http"`, as TCP and UDP entries
   carry theirs. [Access logging](docs/access-logging.md#containers)
   describes stdout and stderr in a container.
+- Cache metrics: `keel_cache_requests_total{pool, vhost, result}` (hit,
+  miss) and `keel_cache_hits_total{tier}` (memory, disk).
 
 ### Fixed
 
+- A cache hit is counted in `keel_requests_total` and logged under its
+  vhost and pool; hits were missing from the metrics and logged to
+  `access_unknown.log`.
 - A drained backend no worker holds a connection to is removed at once.
   A worker without connections to it never marked it removed, so
   `keel status` and `keel_backend_drain_state` showed a finished drain as

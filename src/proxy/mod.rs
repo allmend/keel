@@ -195,6 +195,28 @@ fn vary_names(resp: &pingora::http::ResponseHeader) -> Vec<String> {
 }
 
 impl KProxy {
+    /// Resolve the request's vhost and route into `ctx`, once. The Host
+    /// header becomes a bounded, operator-configured label before it is used
+    /// as a metric label or log file name: an unmatched host is "unmatched",
+    /// never the raw value. Without a route, `ctx.series` stays `None`.
+    fn bind_route(&self, session: &Session, ctx: &mut <Self as ProxyHttp>::CTX) {
+        if !ctx.vhost.is_empty() {
+            return;
+        }
+        let req = session.req_header();
+        let host = requested_host_or(req, "*").to_owned();
+        let routing = self.routing.load();
+        ctx.vhost = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
+        ctx.client_ip = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
+        ctx.is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
+        if let Some(route) = routing.resolve(&host, req.uri.path()) {
+            ctx.series = Some(Arc::clone(&route.series));
+            // Set before select() so logging() can tell no_route from no_backend.
+            ctx.pool = route.pool.clone();
+        }
+        ctx.host_header = host;
+    }
+
     /// X-Forwarded-* and RFC 7239 headers toward the backend, per the vhost's
     /// `forwarded_headers` mode.
     fn apply_forwarded_headers(
@@ -408,40 +430,17 @@ impl ProxyHttp for KProxy {
             ctx.user_agent = ds.get_header("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
             ctx.client_addr_str = ds.client_addr().and_then(|a| a.as_inet()).map(|a| a.to_string());
         }
-        let host = requested_host_or(ds.req_header(), "*").to_owned();
-        let path = ds.req_header().uri.path().to_owned();
-        let client_ip: Option<IpAddr> = ds
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.ip());
-        let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
-
-        // Resolve the raw Host header to a bounded, operator-configured label before
-        // using it as a metric label or log filename. Unmatched hosts collapse into a
-        // single "unmatched" bucket — never the raw client-supplied value.
-        let routing = self.routing.load();
-        let vhost_label = routing
-            .vhost_label(&host)
-            .unwrap_or("unmatched")
-            .to_owned();
-
-        ctx.vhost = vhost_label;
-        ctx.host_header = host.clone();
-        ctx.client_ip = client_ip;
-        ctx.is_tls = is_tls;
-
-        let route = routing.resolve(&host, &path).ok_or_else(|| {
+        self.bind_route(session, ctx);
+        if ctx.series.is_none() {
             crate::metrics::record_lb_error("", &ctx.vhost, "no_route");
-            Error::explain(
+            let req = session.req_header();
+            return Err(Error::explain(
                 ErrorType::HTTPStatus(502),
-                format!("no vhost match for host='{host}' path='{path}'"),
-            )
-        })?;
-        let pool_name = route.pool.clone();
-        ctx.series = Some(Arc::clone(&route.series));
-
-        // Set pool before select() so logging() can distinguish no_route from no_backend.
-        ctx.pool = pool_name.clone();
+                format!("no vhost match for host='{}' path='{}'", ctx.host_header, req.uri.path()),
+            ));
+        }
+        let pool_name = ctx.pool.clone();
+        let client_ip = ctx.client_ip;
 
         // Client IP as consistent-hash key; fall back to empty bytes.
         let key: Vec<u8> = match client_ip {
@@ -509,8 +508,11 @@ impl ProxyHttp for KProxy {
     fn request_cache_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        // A cache hit never reaches upstream_peer: bind the route here, so a
+        // hit is logged and counted under its vhost and pool.
+        self.bind_route(session, ctx);
         let Some(ref cache) = self.cache else { return Ok(()); };
 
         if !request_cacheable(session.req_header()) {
@@ -596,16 +598,19 @@ impl ProxyHttp for KProxy {
         &self,
         session: &mut Session,
         upstream_response: &mut pingora::http::ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         use pingora::cache::CachePhase;
-        let value = match session.cache.phase() {
-            CachePhase::Hit | CachePhase::Stale | CachePhase::Revalidated => Some("HIT"),
+        let hit = match session.cache.phase() {
+            CachePhase::Hit | CachePhase::Stale | CachePhase::Revalidated => Some(true),
             CachePhase::Disabled(_) | CachePhase::Bypass => None,
-            _ => Some("MISS"),
+            _ => Some(false),
         };
-        if let Some(value) = value {
-            let _ = upstream_response.insert_header("x-cache", value);
+        if let Some(hit) = hit {
+            let _ = upstream_response.insert_header("x-cache", if hit { "HIT" } else { "MISS" });
+            if let Some(series) = &ctx.series {
+                series.cache_lookup(hit);
+            }
         }
         Ok(())
     }

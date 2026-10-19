@@ -269,10 +269,8 @@ impl Config {
                     anyhow::bail!("pool '{name}': health_check.port must be 1-65535");
                 }
                 match &hc.probe {
-                    ProbeConfig::Http { path, expect_status, .. } => {
-                        if !path.starts_with('/') {
-                            anyhow::bail!("pool '{name}': health_check.path must start with '/'");
-                        }
+                    ProbeConfig::Http { path, .. } if !path.starts_with('/') => {
+                        anyhow::bail!("pool '{name}': health_check.path must start with '/'");
                     }
                     ProbeConfig::Tls { sni: Some(sni), .. } => {
                         let labels: Vec<&str> = sni.split('.').collect();

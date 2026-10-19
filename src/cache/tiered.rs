@@ -8,6 +8,7 @@ use pingora::cache::{
 };
 use pingora::cache::trace::SpanHandle;
 
+use super::counted::Counted;
 use super::disk::DiskStore;
 
 /// L1 (memory) + L2 (disk) tiered cache.
@@ -16,8 +17,8 @@ use super::disk::DiskStore;
 /// `get_miss_handler` writes to both tiers simultaneously so every cached
 /// response ends up in both after the first miss.
 pub struct TieredStore {
-    pub l1: &'static MemCache,
-    pub l2: &'static DiskStore,
+    pub l1: &'static Counted<MemCache>,
+    pub l2: &'static Counted<DiskStore>,
 }
 
 #[async_trait]
