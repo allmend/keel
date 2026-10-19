@@ -40,6 +40,10 @@ keel {
 const CONFIG: &str = r#"
 listener "http" "0.0.0.0:80" {}
 
+access_log {
+  dir = "-"
+}
+
 pool "web" {
   algorithm = "round_robin"
 
@@ -73,6 +77,11 @@ fn a_pool_weighted_one_to_three_splits_traffic_one_to_three() -> Result<()> {
     }
     // Expected 100 of 400; an unweighted pool gives about 200.
     assert!((80..=120).contains(&light), "light backend served {light} of {REQUESTS}, expected about 100");
+
+    // The access log on stdout, one JSON entry per request, typed.
+    let logs = stack.logs("keel")?;
+    let entry = logs.lines().find(|l| l.starts_with('{')).expect("an access entry on stdout");
+    assert!(entry.contains(r#""type":"http""#), "{entry}");
     Ok(())
 }
 

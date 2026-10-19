@@ -62,6 +62,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - Minimum Rust version 1.90, declared as `rust-version` and built in CI.
 - CI runs `cargo deny`: advisories, licenses, duplicate versions.
   Dependabot proposes cargo and GitHub Actions updates weekly.
+- HTTP access entries carry `"type": "http"`, as TCP and UDP entries
+  carry theirs. [Access logging](docs/access-logging.md#containers)
+  describes stdout and stderr in a container.
 
 ### Fixed
 

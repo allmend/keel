@@ -694,6 +694,7 @@ impl ProxyHttp for KProxy {
             .map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
         let entry = AccessLogEntry {
+            r#type: "http",
             timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
             method: std::mem::take(&mut ctx.method),
             uri: std::mem::take(&mut ctx.uri),

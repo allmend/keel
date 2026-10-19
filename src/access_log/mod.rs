@@ -8,6 +8,8 @@ use std::sync::Mutex;
 #[derive(Serialize)]
 pub struct AccessLogEntry {
     pub timestamp: String,
+    /// Always `http`; TCP and UDP entries say `tcp`, `tls` or `udp`.
+    pub r#type: &'static str,
     pub method: String,
     pub uri: String,
     pub protocol: String,

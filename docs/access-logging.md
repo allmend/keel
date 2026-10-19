@@ -14,7 +14,15 @@ access_log {
 | `enabled` | `true` | |
 | `dir` | `/var/log/keel` | Absolute directory, or `-` for stdout |
 
-With `dir = "-"` every entry goes to stdout, and Keel's own log stays on stderr.
+## Containers
+
+```hcl
+access_log {
+  dir = "-"
+}
+```
+
+stdout carries the access log, one JSON object per line; stderr carries Keel's own log, as text. A log stack tells them apart by stream, and the access entries by their `type`: `http`, `tcp`, `tls` or `udp`.
 
 ## Files
 
@@ -32,6 +40,7 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 ```json
 {
   "timestamp":           "2026-04-28T12:34:56.789Z",
+  "type":                "http",
   "method":              "GET",
   "uri":                 "/api/v1/users?page=1",
   "protocol":            "HTTP/1.1",
@@ -53,6 +62,7 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 | Field | Notes |
 |---|---|
 | `timestamp` | ISO 8601 UTC, milliseconds |
+| `type` | `http` |
 | `uri` | Path and query string |
 | `protocol` | `HTTP/1.1` or `HTTP/2.0` |
 | `status` | Status sent to the client; `0` if none was sent |
