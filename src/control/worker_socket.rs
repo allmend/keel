@@ -82,17 +82,20 @@ fn answer(request: WorkerRequest, pools: &PoolRegistry, applier: &dyn Apply, sta
         WorkerRequest::Ping => ControlResponse::ok(serde_json::json!({ "pid": std::process::id() })),
         WorkerRequest::Status => crate::control::cmd_status(pools, started_at),
         WorkerRequest::BackendList { pool } => crate::control::cmd_backend_list(pools, &pool),
-        WorkerRequest::Drain { address } => {
-            let found = pools.drain_by_address(&address);
-            if found.is_empty() {
-                ControlResponse::err(format!("backend '{address}' not found in any pool"))
-            } else {
-                ControlResponse::ok(serde_json::json!({ "pools": found }))
-            }
-        }
+        WorkerRequest::Drain { address } => found(&address, pools.drain_by_address(&address)),
+        WorkerRequest::Activate { address } => found(&address, pools.activate_by_address(&address)),
         WorkerRequest::Apply(applied) => match applier.apply(&applied) {
             Ok(()) => ControlResponse::ok(serde_json::json!({ "version": applied.version })),
             Err(e) => ControlResponse::err(e),
         },
+    }
+}
+
+/// The pools an address was found in, or an error naming it.
+fn found(address: &str, pools: Vec<String>) -> String {
+    if pools.is_empty() {
+        ControlResponse::err(format!("backend '{address}' not found in any pool"))
+    } else {
+        ControlResponse::ok(serde_json::json!({ "pools": pools }))
     }
 }

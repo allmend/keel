@@ -22,6 +22,8 @@ pub enum ClientRequest {
     SetConfigFiles { files: crate::config::FileSet },
     /// Drain a backend address in every pool, on every node.
     DrainBackend { address: String },
+    /// Return every drained backend `address` names to service.
+    ActivateBackend { address: String },
     /// Refuse a removed member's node ID for good: its certificate and any
     /// join under its ID.
     RetireNode { node_id: NodeId },

@@ -106,7 +106,7 @@ config version 42 committed; every node applies it
 
 ## Drain
 
-`keel backend drain` is committed through Raft: every worker of every node stops sending the backend new connections. The receiving node drains at once, the others on commit. `--wait` follows the receiving node's connection count. A drain outlives restarts of workers, the control worker and the node.
+`keel backend drain` is committed through Raft: every worker of every node stops sending the backend new connections. The receiving node drains at once, the others on commit. `--wait` follows the receiving node's connection count. A drain outlives restarts of workers, the control worker and the node, until `keel backend activate` is committed the same way.
 
 ## Stepdown
 

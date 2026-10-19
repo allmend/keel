@@ -42,6 +42,7 @@ A keelconfig is one HCL file: the endpoint, the control CA certificate, and a cl
 keelctl status
 keelctl backend list --pool web
 keelctl backend drain 10.0.0.1:8080 --wait
+keelctl backend activate 10.0.0.1:8080
 keelctl config reload
 keelctl config push ./config
 keelctl cluster status
@@ -57,7 +58,7 @@ The keelconfig is found in this order:
 
 ## Cluster
 
-Every node with `control.remote` listens. Writes sent to a follower (`cluster stepdown`, `cluster remove`, `config push`, `config reload`, `backend drain`, `credentials revoke-all`) go to the leader; `status` and `backend list` answer for the receiving node.
+Every node with `control.remote` listens. Writes sent to a follower (`cluster stepdown`, `cluster remove`, `config push`, `config reload`, `backend drain`, `backend activate`, `credentials revoke-all`) go to the leader; `status` and `backend list` answer for the receiving node.
 
 The leader commits its control CA to Raft; every node, later joiners included, takes it and re-keys its listener. One keelconfig works on every node, and `keel credentials create` works on any node. A node joining with another CA adopts the cluster's and logs it; keelconfigs from its old CA stop working.
 

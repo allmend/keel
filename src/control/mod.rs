@@ -101,9 +101,19 @@ impl Dispatch {
     async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
         let outcome = self.fanout.drain(address).await?;
         self.cluster
-            .drain(address.to_owned())
+            .set_drained(address.to_owned(), true)
             .await
             .map_err(|e| format!("drained on this node, but not committed to the cluster: {e:#}"))?;
+        Ok(outcome)
+    }
+
+    /// Return `address` to service on this node's workers, then commit it.
+    async fn activate(&self, address: &str) -> Result<DrainOutcome, String> {
+        let outcome = self.fanout.activate(address).await?;
+        self.cluster
+            .set_drained(address.to_owned(), false)
+            .await
+            .map_err(|e| format!("activated on this node, but not committed to the cluster: {e:#}"))?;
         Ok(outcome)
     }
 }
@@ -153,6 +163,14 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 
         ControlRequest::BackendList { pool } => {
             write_line(&mut writer, &dispatch.fanout.backend_list(&pool).await).await?;
+        }
+
+        ControlRequest::BackendActivate { address } => {
+            let response = match dispatch.activate(&address).await {
+                Ok(outcome) => ControlResponse::ok(serde_json::json!({ "pools": outcome.pools })),
+                Err(e) => ControlResponse::err(e),
+            };
+            write_line(&mut writer, &response).await?;
         }
 
         ControlRequest::BackendDrain { address, wait } => {

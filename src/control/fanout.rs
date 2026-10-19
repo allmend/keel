@@ -40,6 +40,7 @@ pub enum WorkerRequest {
     Status,
     BackendList { pool: String },
     Drain { address: String },
+    Activate { address: String },
     Apply(Box<Applied>),
 }
 
@@ -206,7 +207,14 @@ impl WorkerFanout {
     }
 
     pub async fn drain(&self, address: &str) -> Result<DrainOutcome, String> {
-        let request = WorkerRequest::Drain { address: address.to_owned() };
+        self.set_drained(WorkerRequest::Drain { address: address.to_owned() }).await
+    }
+
+    pub async fn activate(&self, address: &str) -> Result<DrainOutcome, String> {
+        self.set_drained(WorkerRequest::Activate { address: address.to_owned() }).await
+    }
+
+    async fn set_drained(&self, request: WorkerRequest) -> Result<DrainOutcome, String> {
         let responses = self.ask_all(&request).await;
         if responses.is_empty() {
             return Err("no worker answered".into());

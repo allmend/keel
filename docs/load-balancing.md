@@ -98,4 +98,4 @@ Draining 10.0.0.1:8080 from pools: web
 Drain complete (22s elapsed).
 ```
 
-The address is drained in every pool that has it. A drain is committed through Raft: it applies on every node and stays across reloads, pushes and restarts. See [Cluster](cluster.md#drain).
+The address is drained in every pool that has it; a bare IP drains every backend on it. `keel backend activate <address>` returns it to service. A drain is committed through Raft: it applies on every node and stays across reloads, pushes and restarts. See [Cluster](cluster.md#drain).

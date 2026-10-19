@@ -364,17 +364,32 @@ impl PoolRegistry {
         result
     }
 
-    /// Initiate drain for all pools containing `addr`. Returns the pool names where found.
+    /// Drain every backend `addr` names, in every pool. Returns the pools.
     pub fn drain_by_address(&self, addr: &str) -> Vec<String> {
+        self.each_named(addr, |pool, entry| {
+            entry.start_drain();
+            tracing::info!(pool, backend = entry.label, "control: drain initiated");
+        })
+    }
+
+    /// Return every backend `addr` names to service, in every pool. Its open
+    /// connections are untouched. Returns the pools.
+    pub fn activate_by_address(&self, addr: &str) -> Vec<String> {
+        self.each_named(addr, |pool, entry| {
+            entry.drain_state.store(DRAIN_ACTIVE, Ordering::Release);
+            entry.series.set_drain_state(DRAIN_ACTIVE);
+            tracing::info!(pool, backend = entry.label, "control: backend activated");
+        })
+    }
+
+    fn each_named(&self, addr: &str, mut f: impl FnMut(&str, &BackendEntry)) -> Vec<String> {
         let mut found = Vec::new();
-        for (pool, entry) in self.entries() {
-            if entry.label == addr {
-                entry.start_drain();
-                tracing::info!(pool, backend = addr, "control: drain initiated");
-                found.push(pool.to_owned());
-            }
+        for (pool, entry) in self.entries().filter(|(_, e)| names(addr, &e.label)) {
+            f(pool, entry);
+            found.push(pool.to_owned());
         }
         found.sort();
+        found.dedup();
         found
     }
 
@@ -427,6 +442,17 @@ impl PoolRegistry {
 }
 
 // Helpers
+
+/// `addr` names a backend: `ip:port` exactly, or an IP for every port on it.
+pub fn names(addr: &str, label: &str) -> bool {
+    if addr == label {
+        return true;
+    }
+    match (addr.parse::<std::net::IpAddr>(), label.parse::<SocketAddr>()) {
+        (Ok(ip), Ok(backend)) => backend.ip() == ip,
+        _ => false,
+    }
+}
 
 fn is_available(entries: &HashMap<SocketAddr, BackendEntry>, addr: &SocketAddr, now_ms: u64) -> bool {
     entries
@@ -537,6 +563,15 @@ pub fn build_drain_entries(pool_name: &str, addrs: &[(&str, &str)], drain: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_names_a_backend_exactly_or_by_ip() {
+        assert!(names("10.0.0.1:80", "10.0.0.1:80"));
+        assert!(names("10.0.0.1", "10.0.0.1:80"));
+        assert!(names("::1", "[::1]:80"));
+        assert!(!names("10.0.0.1:81", "10.0.0.1:80"));
+        assert!(!names("10.0.0.10", "10.0.0.1:80"));
+    }
 
     fn registry(eject_for: Duration) -> PoolRegistry {
         registry_of(["127.0.0.1:1", "127.0.0.1:2"], eject_for)

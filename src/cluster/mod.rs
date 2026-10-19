@@ -204,15 +204,15 @@ impl ClusterHandle {
         }
     }
 
-    /// Commit a drain of `address` through the leader: every node and its
-    /// workers stop sending it new connections.
-    pub async fn drain(&self, address: String) -> Result<()> {
+    /// Commit a drain of `address` through the leader (`drain`), or its
+    /// return to service: every node and its workers follow.
+    pub async fn set_drained(&self, address: String, drain: bool) -> Result<()> {
         let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
             anyhow::bail!("cluster not yet initialized");
         };
         match leader_addr(&raft)? {
-            None => commit_drain(&raft, address).await,
-            Some(leader) => crate::cluster::network::send_drain(&leader, tls, address).await,
+            None => commit_drained(&raft, address, drain).await,
+            Some(leader) => crate::cluster::network::send_drained(&leader, tls, address, drain).await,
         }
     }
 
@@ -484,6 +484,7 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
         | RpcRequest::PushConfig { .. }
         | RpcRequest::RevokeOperatorCredentials
         | RpcRequest::Drain { .. }
+        | RpcRequest::Activate { .. }
         | RpcRequest::Remove { .. } => None,
     }
 }
@@ -577,14 +578,8 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             .unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
         },
-        Ok(RpcRequest::Drain { address }) => match commit_drain(&raft, address).await {
-            Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
-                ok: Some(crate::cluster::network::StepDownReply { message: "drained".into() }),
-                err: None,
-            })
-            .unwrap(),
-            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
-        },
+        Ok(RpcRequest::Drain { address }) => drained_reply(commit_drained(&raft, address, true).await),
+        Ok(RpcRequest::Activate { address }) => drained_reply(commit_drained(&raft, address, false).await),
         Ok(RpcRequest::PushConfig { files }) => match push_config(&raft, ctx.tls, &ctx.node_file, files).await {
             Ok(version) => serde_json::to_vec(&RpcResponse::<_> {
                 ok: Some(crate::cluster::network::PushReply { version }),
@@ -1435,10 +1430,20 @@ pub async fn push_acme_account(raft: &ClusterRaft, issuer: String, account: Stri
     Ok(())
 }
 
-async fn commit_drain(raft: &ClusterRaft, address: String) -> Result<()> {
-    raft.client_write(ClientRequest::DrainBackend { address })
-        .await
-        .map_err(|e| anyhow::anyhow!("drain not committed: {e:?}"))?;
+fn drained_reply(result: Result<()>) -> Vec<u8> {
+    match result {
+        Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
+            ok: Some(crate::cluster::network::StepDownReply { message: "done".into() }),
+            err: None,
+        })
+        .unwrap(),
+        Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+    }
+}
+
+async fn commit_drained(raft: &ClusterRaft, address: String, drain: bool) -> Result<()> {
+    let request = if drain { ClientRequest::DrainBackend { address } } else { ClientRequest::ActivateBackend { address } };
+    raft.client_write(request).await.map_err(|e| anyhow::anyhow!("not committed: {e:?}"))?;
     Ok(())
 }
 

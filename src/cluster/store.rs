@@ -356,6 +356,13 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                             }
                             ClientResponse::ok()
                         }
+                        ClientRequest::ActivateBackend { address } => {
+                            d.state.drained.retain(|a| !crate::backend::names(&address, a));
+                            if let Some(tx) = &d.drained_tx {
+                                tx.send_replace(d.state.drained.clone());
+                            }
+                            ClientResponse::ok()
+                        }
                         ClientRequest::RetireNode { node_id } => {
                             d.state.retired.insert(node_id);
                             if let Some(tx) = &d.retired_tx {

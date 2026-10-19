@@ -40,6 +40,8 @@ pub enum RpcRequest {
     RevokeOperatorCredentials,
     /// Ask the receiving node (must be the leader) to commit a drain.
     Drain { address: String },
+    /// Ask the receiving node (must be the leader) to commit an activation.
+    Activate { address: String },
     /// Ask the receiving node (must be the leader) to remove a member for good.
     Remove { node_id: NodeId },
 }
@@ -194,13 +196,15 @@ pub(crate) async fn send_revoke(leader_addr: &str, tls: Arc<rustls::ClientConfig
     Ok(())
 }
 
-/// Forward a drain to the leader.
-pub(crate) async fn send_drain(leader_addr: &str, tls: Arc<rustls::ClientConfig>, address: String) -> anyhow::Result<()> {
+/// Forward a drain, or an activation, to the leader.
+pub(crate) async fn send_drained(leader_addr: &str, tls: Arc<rustls::ClientConfig>, address: String, drain: bool) -> anyhow::Result<()> {
     let mut net = ClusterNetwork { target_addr: leader_addr.to_owned(), tls };
+    let (request, what) =
+        if drain { (RpcRequest::Drain { address }, "drain") } else { (RpcRequest::Activate { address }, "activate") };
     let _: StepDownReply = net
-        .call(&RpcRequest::Drain { address })
+        .call(&request)
         .await
-        .map_err(|e| anyhow::anyhow!("drain request to the leader at {leader_addr} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{what} request to the leader at {leader_addr} failed: {e}"))?;
     Ok(())
 }
 

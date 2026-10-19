@@ -65,6 +65,8 @@ pub enum ControlRequest {
     Status,
     BackendList { pool: String },
     BackendDrain { address: String, #[serde(default)] wait: bool },
+    /// Return a drained backend to service: `ip:port`, or an IP for every port.
+    BackendActivate { address: String },
     ConfigReload,
     ClusterStatus,
     ClusterDemote,
@@ -88,6 +90,7 @@ impl ControlRequest {
             ControlRequest::Status => "status",
             ControlRequest::BackendList { .. } => "backend_list",
             ControlRequest::BackendDrain { .. } => "backend_drain",
+            ControlRequest::BackendActivate { .. } => "backend_activate",
             ControlRequest::ConfigReload => "config_reload",
             ControlRequest::ClusterStatus => "cluster_status",
             ControlRequest::ClusterDemote => "cluster_demote",

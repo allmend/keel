@@ -58,7 +58,7 @@ Pool: web (3 backends)
 keel backend drain <address> [--wait]
 ```
 
-Stops new connections to the backend in every pool that has it. `address` is as written in the config; an address in no pool is refused. The receiving node's workers drain at once, then the drain is committed through Raft for every node. It survives restarts, and needs a majority of the voters.
+Stops new connections to the backend in every pool that has it. `address` is `ip:port` as written in the config, or an IP for every backend on it; an address in no pool is refused. The receiving node's workers drain at once, then the drain is committed through Raft for every node. It survives restarts, and needs a majority of the voters.
 
 Without `--wait` it returns once applied (`Drain complete.`); the backend is `draining`. With `--wait` it follows the connection count, summed over the workers, every 500 ms until 0:
 
@@ -69,6 +69,14 @@ Drain complete (22s elapsed).
 ```
 
 It warns when not every worker applied the drain.
+
+## keel backend activate
+
+```bash
+keel backend activate <address>
+```
+
+Returns a drained backend to service in every pool that has it, on every node. `address` as for `drain`. Committed through Raft like a drain. Health checks and passive ejection still apply.
 
 ## keel config reload
 

@@ -959,22 +959,39 @@ fn the_local_control_socket_answers_on_every_node() -> Result<()> {
 
 #[test]
 #[ignore = "needs Docker"]
-fn a_drain_sent_to_one_node_is_applied_on_every_node() -> Result<()> {
+fn drain_and_activate_sent_to_one_node_apply_on_every_node() -> Result<()> {
     let cluster = Cluster::up("cluster-drain")?;
-    let follower = NODES.iter().find(|n| **n != cluster.leader().unwrap_or_default()).expect("a follower").to_string();
+    let leader = cluster.leader()?;
+    let follower = NODES.iter().find(|n| **n != leader).expect("a follower").to_string();
+    let state_on = |node: &str| -> Result<String> {
+        let list = cluster.request(node, &ControlRequest::BackendList { pool: "web".into() })?;
+        Ok(list["backends"][0]["state"].as_str().unwrap_or_default().to_owned())
+    };
     cluster.request(&follower, &ControlRequest::BackendDrain { address: "172.29.83.20:80".into(), wait: false })?;
     for node in NODES {
         wait_until(&format!("{node} drains the backend"), Duration::from_secs(30), || {
-            let list = cluster.request(node, &ControlRequest::BackendList { pool: "web".into() })?;
-            let state = list["backends"][0]["state"].as_str().unwrap_or_default().to_owned();
+            let state = state_on(node)?;
             Ok((state == "draining" || state == "removed").then_some(()))
         })?;
     }
-    let err = cluster
-        .request("node1", &ControlRequest::BackendDrain { address: "10.9.9.9:80".into(), wait: false })
-        .expect_err("an address in no pool")
-        .to_string();
-    assert!(err.contains("not found in any pool"), "{err}");
+
+    // A bare IP: every port of that address, through another node.
+    let other = NODES.iter().find(|n| **n != follower).expect("another node").to_string();
+    cluster.request(&other, &ControlRequest::BackendActivate { address: "172.29.83.20".into() })?;
+    for node in NODES {
+        wait_until(&format!("{node} activates the backend"), Duration::from_secs(30), || {
+            Ok((state_on(node)? == "active").then_some(()))
+        })?;
+        assert_eq!(http_get(cluster.stack.addr(node, 80)?, "e2e.test", "/")?.0, 200, "{node} serves through it again");
+    }
+
+    for request in [
+        ControlRequest::BackendDrain { address: "10.9.9.9:80".into(), wait: false },
+        ControlRequest::BackendActivate { address: "10.9.9.9".into() },
+    ] {
+        let err = cluster.request("node1", &request).expect_err("an address in no pool").to_string();
+        assert!(err.contains("not found in any pool"), "{err}");
+    }
     Ok(())
 }
 

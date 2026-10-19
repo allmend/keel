@@ -76,6 +76,9 @@ enum BackendCommand {
         #[arg(long)]
         wait: bool,
     },
+    /// Return a drained backend to service: `ip:port`, or an IP for every
+    /// port, in every pool
+    Activate { address: String },
 }
 
 #[derive(Subcommand)]
@@ -116,6 +119,9 @@ fn main() -> Result<()> {
             BackendCommand::List { pool } => client::backend_list(&mut stream, pool),
             BackendCommand::Drain { address, wait } => {
                 client::backend_drain(&mut stream, address, *wait)
+            }
+            BackendCommand::Activate { address } => {
+                client::message(&mut stream, &ControlRequest::BackendActivate { address: address.clone() })
             }
         },
         Command::Config { command } => match command {

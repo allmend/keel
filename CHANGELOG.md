@@ -55,6 +55,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `keel backend activate <address>` returns a drained backend to service,
+  on every node through Raft. `drain` and `activate` take `ip:port` or a
+  bare IP, which names every backend on that IP.
 - `keel config validate [node.hcl]`: load a node file and its config
   directory as a start or reload would, without a running node. Silent: exit
   0 when the files can go live, 1 with the error on stderr. `--full` prints

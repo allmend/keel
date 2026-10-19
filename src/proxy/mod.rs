@@ -996,6 +996,11 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
         for address in next.drained.iter().filter(|a| last.as_ref().is_none_or(|l| !l.drained.contains(*a))) {
             self.pools.drain_by_address(address);
         }
+        if let Some(last) = last.as_ref() {
+            for address in last.drained.difference(&next.drained) {
+                self.pools.activate_by_address(address);
+            }
+        }
         *last = Some(next.clone());
         certs.map_err(|e| format!("TLS certificates not reloaded, previous ones kept: {e:#}"))
     }
