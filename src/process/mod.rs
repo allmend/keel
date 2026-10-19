@@ -30,11 +30,38 @@ const LISTENER_BACKLOG: i32 = 65535;
 /// How often the master looks at signals and dead children.
 const TICK: Duration = Duration::from_millis(100);
 
-/// A control worker that dies sooner than this after starting is restarted
-/// with a growing delay, so a start that keeps failing (a refused join, a
-/// broken store) does not spin.
-const CONTROL_STABLE: Duration = Duration::from_secs(10);
-const CONTROL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A child that dies sooner than this after starting is restarted with a
+/// growing delay, so a start that keeps failing (a backend that does not
+/// resolve, a refused join, a broken store) does not spin. One that ran
+/// longer is restarted at once.
+const STABLE: Duration = Duration::from_secs(10);
+const BACKOFF_FIRST: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The restart delay of one child: the control worker, or one worker index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Backoff {
+    next: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff { next: BACKOFF_FIRST }
+    }
+}
+
+impl Backoff {
+    /// How long to wait before restarting a child that ran for `ran`.
+    fn after_death(&mut self, ran: Duration) -> Duration {
+        if ran >= STABLE {
+            self.next = BACKOFF_FIRST;
+            return Duration::ZERO;
+        }
+        let delay = self.next;
+        self.next = (self.next * 2).min(BACKOFF_MAX);
+        delay
+    }
+}
 
 /// Listening sockets bound by the master before any worker is forked (on
 /// Linux, root or not). Workers inherit them across `fork`: they never bind
@@ -384,20 +411,24 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     let data_fds = bound.as_ref().map(BoundListeners::fds).unwrap_or_default();
 
     let mut control = Some(spawn_control(&cfg, &control_listeners, &data_fds, accounts.as_ref(), force_new_cluster)?);
-    let mut control_delay = Duration::from_secs(1);
+    let mut control_backoff = Backoff::default();
     let mut control_due: Option<Instant> = None;
 
     let worker_cfg = cfg.for_workers();
     let n = cfg.keel.workers;
     info!(workers = n, "master: spawning workers");
-    // (pid, index): a replacement worker keeps the index of the one it
-    // replaces, so it inherits the same UDP socket of the SO_REUSEPORT group.
-    let mut pids: Vec<(Pid, usize)> = Vec::with_capacity(n);
+    // (pid, index, started): a replacement worker keeps the index of the one
+    // it replaces, so it inherits the same UDP socket of the SO_REUSEPORT
+    // group. Each index backs off on its own.
+    let mut pids: Vec<(Pid, usize, Instant)> = Vec::with_capacity(n);
+    let mut backoff = vec![Backoff::default(); n];
+    // Worker indexes waiting for their restart, and when it is due.
+    let mut due: Vec<(usize, Instant)> = Vec::new();
     for i in 0..n {
         let private = private_fds(&control_listeners, control.as_ref());
         let pid = spawn_worker(&worker_cfg, i, bound.as_ref(), accounts.as_ref(), &private)?;
         info!(pid = pid.as_raw(), index = i, "master: worker started");
-        pids.push((pid, i));
+        pids.push((pid, i, Instant::now()));
     }
     crate::metrics::set_workers(pids.len());
 
@@ -408,7 +439,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             info!("master: shutdown signal received, stopping");
             // SIGTERM = Pingora's plain graceful exit (finish in-flight, no
             // upgrade-socket handoff like SIGQUIT).
-            let children: Vec<Pid> = pids.iter().map(|(p, _)| *p).chain(control.as_ref().map(|c| c.pid)).collect();
+            let children: Vec<Pid> = pids.iter().map(|(p, _, _)| *p).chain(control.as_ref().map(|c| c.pid)).collect();
             for pid in &children {
                 let _ = signal::kill(*pid, Signal::SIGTERM);
             }
@@ -444,25 +475,27 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             };
             if control.as_ref().is_some_and(|c| c.pid == dead) {
                 let c = control.take().expect("checked");
-                // Quick deaths back off; a control worker that ran a while
-                // is restarted at once.
-                control_delay = if c.started.elapsed() < CONTROL_STABLE {
-                    (control_delay * 2).min(CONTROL_BACKOFF_MAX)
-                } else {
-                    Duration::from_secs(1)
-                };
-                warn!(pid = dead.as_raw(), how, delay = ?control_delay, "master: control worker died, restarting");
-                control_due = Some(Instant::now() + control_delay);
+                let delay = control_backoff.after_death(c.started.elapsed());
+                warn!(pid = dead.as_raw(), how, delay = ?delay, "master: control worker died, restarting");
+                control_due = Some(Instant::now() + delay);
                 continue;
             }
-            let index = pids.iter().find(|(p, _)| *p == dead).map(|(_, i)| *i).unwrap_or(pids.len());
-            warn!(index, pid = dead.as_raw(), how, "master: worker died, restarting");
-            pids.retain(|(p, _)| *p != dead);
+            let Some(pos) = pids.iter().position(|(p, _, _)| *p == dead) else { continue };
+            let (_, index, started) = pids.remove(pos);
+            let delay = backoff[index].after_death(started.elapsed());
+            warn!(index, pid = dead.as_raw(), how, delay = ?delay, "master: worker died, restarting");
             crate::metrics::set_workers(pids.len());
             crate::metrics::worker_restarted(signaled);
+            due.push((index, Instant::now() + delay));
+        }
+
+        let now = Instant::now();
+        let ready: Vec<usize> = due.iter().filter(|(_, at)| *at <= now).map(|(index, _)| *index).collect();
+        due.retain(|(_, at)| *at > now);
+        for index in ready {
             let private = private_fds(&control_listeners, control.as_ref());
             let pid = spawn_worker(&worker_cfg, index, bound.as_ref(), accounts.as_ref(), &private)?;
-            pids.push((pid, index));
+            pids.push((pid, index, Instant::now()));
             crate::metrics::set_workers(pids.len());
             info!(index, pid = pid.as_raw(), "master: replacement worker started");
             if let Some(c) = &control {
@@ -618,4 +651,17 @@ fn install_signal_handlers() -> Result<()> {
         signal::sigaction(Signal::SIGPIPE, &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn quick_deaths_back_off_and_a_long_run_resets() {
+        let mut b = super::Backoff::default();
+        let quick = std::time::Duration::from_millis(50);
+        let delays: Vec<u64> = (0..7).map(|_| b.after_death(quick).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(b.after_death(super::STABLE), std::time::Duration::ZERO, "ran a while: at once");
+        assert_eq!(b.after_death(quick).as_secs(), 1, "and the next quick death starts over");
+    }
 }

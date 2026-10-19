@@ -143,11 +143,14 @@ fn killed_worker_is_replaced_under_its_index() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no start line for worker 1"))?
         .to_owned();
 
+    // Past the window in which a death counts as dying at start.
+    std::thread::sleep(Duration::from_secs(11));
     // The slim image has no kill(1); the shell builtin does the job.
     let out = stack.exec("keel", &["sh", "-c", &format!("kill -9 {victim}")])?;
     assert!(out.status.success(), "kill failed: {}", String::from_utf8_lossy(&out.stderr));
 
-    wait_until("replacement of worker 1", Duration::from_secs(20), || {
+    // A worker that ran a while is replaced at once.
+    wait_until("replacement of worker 1", Duration::from_secs(3), || {
         let logs = stack.logs("keel")?;
         Ok(logs
             .lines()
@@ -162,6 +165,42 @@ fn killed_worker_is_replaced_under_its_index() -> Result<()> {
     assert!(workers.iter().all(|w| w.pid.to_string() != victim), "killed pid is gone");
     assert!(workers.iter().all(|w| w.uid == NOBODY), "replacement runs as nobody");
     serving(&stack)?;
+    Ok(())
+}
+
+// Every worker fails to build its pools: the backend name does not resolve.
+const FAILING_CONFIG: &str = r#"
+listener "http" "0.0.0.0:80" {}
+
+pool "web" {
+  backend "keel-e2e-nowhere.invalid:80" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
+"#;
+
+#[test]
+#[ignore = "needs Docker"]
+fn workers_that_die_at_start_are_restarted_with_a_growing_delay() -> Result<()> {
+    let stack = Stack::up("worker-backoff", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", FAILING_CONFIG.to_owned())])?;
+    wait_until("the first worker death", Duration::from_secs(30), || {
+        Ok(stack.logs("keel")?.contains("master: worker died").then_some(()))
+    })?;
+    std::thread::sleep(Duration::from_secs(14));
+
+    let logs = stack.logs("keel")?;
+    for index in ["0", "1"] {
+        let delays: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("master: worker died") && log_field(l, "index") == Some(index))
+            .filter_map(|l| log_field(l, "delay"))
+            .collect();
+        // 1s, 2s, 4s, 8s: four or five deaths in 14s, not hundreds.
+        assert!((3..=5).contains(&delays.len()), "worker {index} died {} times: {delays:?}", delays.len());
+        assert_eq!(&delays[..3], ["1s", "2s", "4s"], "worker {index}");
+    }
     Ok(())
 }
 

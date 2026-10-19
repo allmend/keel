@@ -234,8 +234,8 @@ to Keel's own log. See [Access logging](access-logging.md).
 
 | Process | Traffic | What happens |
 |---|---|---|
-| a worker | the other workers keep serving; its listeners stay bound | the master forks a replacement under the same index: same UDP socket, same metrics stripe; it gets the applied config from the control worker |
-| the control worker | unaffected: workers keep the last applied version | the master restarts it, with a growing delay (up to 30s) if it keeps dying; control socket and metrics answer again once it is back |
+| a worker | the other workers keep serving; its listeners stay bound | the master forks a replacement under the same index: same UDP socket, same metrics stripe; it gets the applied config from the control worker. A worker that ran 10s or more is replaced at once; one that died sooner waits 1s, doubling up to 30s per index |
+| the control worker | unaffected: workers keep the last applied version | restarted like a worker: at once after 10s or more, else after 1s doubling up to 30s; control socket and metrics answer again once it is back |
 | the master | stopped with SIGTERM, SIGINT or SIGQUIT, it stops its children first; killed outright, the control worker stops (its link to the master closes) and the workers keep serving on their own until they are stopped | restart Keel (systemd, the container runtime) |
 | a whole node | other nodes keep serving; the cluster keeps a majority or goes read-only | the node rejoins from its stored state when it starts |
 

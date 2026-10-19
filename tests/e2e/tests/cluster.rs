@@ -268,7 +268,9 @@ impl Cluster {
     /// Restart `node` with other start flags.
     fn restart_with(&self, node: &str, args: &str) -> Result<()> {
         self.stack.stop(node)?;
-        self.stack.write_file(&format!("{node}.args"), args)?;
+        // Written from inside Docker: a file written on the host side can
+        // still read as its old content in the container that starts next.
+        self.stack.write_node_file(&format!("{node}.args"), args)?;
         self.stack.start(node)
     }
 

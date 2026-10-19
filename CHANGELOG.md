@@ -47,6 +47,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A worker that dies within 10s of starting is restarted after a delay, 1s
+  doubling up to 30s, per worker index; one that ran longer is restarted at
+  once. Workers that kept dying at start (a backend name that stopped
+  resolving) were restarted in a tight loop. The control worker restarts
+  the same way. The log line gives the `delay`.
 - A config is checked as far as a worker would use it: certificate and key
   files are read and parsed at load (a bad or missing one failed only in
   the workers, which kept the previous certificates or exited at start), as
