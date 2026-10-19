@@ -41,7 +41,7 @@ jobs:
           - name: freebsd_x86_64
             target: x86_64-unknown-freebsd
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -63,7 +63,7 @@ jobs:
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
 
       - name: Upload package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ matrix.name }}
           path: dist/*.tar.gz
@@ -72,7 +72,7 @@ jobs:
       # Raw binaries for the container job (linux targets only)
       - name: Upload binary
         if: startsWith(matrix.name, 'linux')
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/keel
@@ -94,7 +94,7 @@ jobs:
           - { name: macos_x86_64,   os: macos-14,      target: x86_64-apple-darwin,        cross: false }
     continue-on-error: ${{ matrix.name == 'freebsd_x86_64' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -128,7 +128,7 @@ jobs:
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
 
       - name: Upload package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-keelctl-${{ matrix.name }}
           path: dist/*.tar.gz
@@ -139,10 +139,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download linux binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: bin-linux_*
           path: bins
@@ -189,10 +189,10 @@ jobs:
     needs: [build, keelctl, container]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: pkg-*
           path: pkgs
