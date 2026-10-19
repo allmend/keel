@@ -209,13 +209,9 @@ metrics {
 |---|---|---|
 | `address` | string | `127.0.0.1:10790` |
 
-Metrics are exposed at `GET /metrics` on this address (any other method or path returns `404`). Each node exposes its own metrics independently; federation is handled externally. The master binds the address (as root, before dropping privileges) and the values are totals over all workers — see [Metrics](metrics.md#one-endpoint-per-node). Every exposed metric is listed in the [metrics reference](metrics.md).
+Metrics are served at `GET /metrics` on this address; any other method or path gets `404`. The master binds the address, the control worker serves it, and the values are totals over all workers — see [Metrics](metrics.md#one-endpoint-per-node).
 
-> **Security:** metrics expose backend addresses, pool/vhost names, and traffic
-> volumes. The default binds to `127.0.0.1` so they are not world-readable. To
-> scrape from another host, set `address = "0.0.0.0:10790"` and restrict the
-> port with firewall rules, or keep the default and run a local scrape agent
-> that reads `127.0.0.1:10790`.
+Metrics show backend addresses, pool and vhost names and traffic volumes, which is why the default is loopback. Scraping from another host takes `address = "0.0.0.0:10790"`.
 
 ---
 
@@ -344,7 +340,7 @@ vhost "*" {
 | `forwarded_headers.mode` | string | `replace` | `replace`, `append`, or `off` |
 | `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode |
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
-| `cache.ttl` | duration | none | Fallback TTL when origin omits `Cache-Control` |
+| `cache.ttl` | duration | none | Fallback TTL when the origin gives no freshness; see [Caching](caching.md#what-is-stored) |
 | `default_action` | block | none | Answer directly without a pool: `redirect` or `status`/`body` — see [Virtual hosts](virtual-hosts.md#default-action). Excludes `pool` and `route` |
 
 See [Virtual hosts](virtual-hosts.md) for host matching rules, path routing, and TLS hot-swap.
@@ -397,7 +393,7 @@ certificate "db.example.com" {
 | `issuer` | string | `default` | Issuer name from the `acme` block. Ignored when `cert`/`key` are set |
 | `cert`, `key` | string | none | Bring-your-own PEM files instead of ACME issuance, resolved like `tls.cert`; see [TCP proxying](tcp-proxying.md) |
 
-The label is the hostname to issue for (no wildcards).
+The label is the hostname. ACME cannot issue a wildcard; a `certificate` with `cert` and `key` can be one.
 
 ---
 
@@ -483,7 +479,7 @@ Names starting with `.` (editor and temporary files) are skipped. Every file mus
 | relative, e.g. `certs/api.crt` | the config directory | the config directory; in a cluster, every push |
 | absolute, e.g. `/etc/keel/certs/int.crt` | each node's disk | the operator |
 
-A relative path the config directory does not hold is a load error, and in a cluster a refused push. A missing absolute file is a load error. Both errors name the vhost, certificate, listener or issuer. Keys are PEM files, never inline in the config.
+A relative path the config directory does not hold is a load error, and in a cluster a refused push. Certificate and key files (`tls`, `certificate`) are read and parsed at load, absolute ones from the loading node's disk: a missing or unusable one is a load error naming the vhost or certificate. `tls_ca` and `root_ca` given as absolute paths are read when used. Keys are PEM files, never inline in the config.
 
 `access_log.dir`, `cache.disk.path` and `acme.storage` are directories Keel writes to on each node, and must be absolute. `acme.storage` must be outside the config directory, which a push replaces.
 

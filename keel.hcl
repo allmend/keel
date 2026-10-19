@@ -50,8 +50,7 @@ vhost "example.com" {
   pool = "web"
 
   tls {
-    cert = "/etc/keel/certs/example.crt"
-    key  = "/etc/keel/certs/example.key"
+    acme = true # certificate from Let's Encrypt; or cert and key files
   }
 
   # Forward the real client IP to backends. "replace" always overwrites

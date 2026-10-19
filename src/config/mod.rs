@@ -105,6 +105,7 @@ fn build(node_name: &str, node_file: &str, files: &FileSet, dir: Option<&Path>) 
     let mut cfg: Config = from_document(&doc)?;
     cfg.files = files.clone();
     cfg.validate()?;
+    crate::tls::check_files(&cfg)?;
     // The ACME client reads its extra trust root from disk: a relative
     // root_ca is the config directory's file there.
     let config_dir = std::path::PathBuf::from(&cfg.keel.config_dir);
@@ -397,6 +398,10 @@ impl Config {
                     }
                 }
             }
+            for cidr in vhost.forwarded_headers.iter().flat_map(|f| &f.trusted_proxies) {
+                cidr.parse::<ipnet::IpNet>()
+                    .map_err(|e| anyhow::anyhow!("vhost '{}': forwarded_headers.trusted_proxies: invalid CIDR '{cidr}': {e}", vhost.host))?;
+            }
             if vhost.pool.is_some() && !vhost.routes.is_empty() {
                 anyhow::bail!("vhost '{}': pool and route blocks exclude each other; add route \"/\" instead", vhost.host);
             }
@@ -443,6 +448,12 @@ impl Config {
             if c.cert.is_some() != c.key.is_some() {
                 anyhow::bail!("certificates '{}': cert and key must be set together", c.host);
             }
+        }
+        if let Some(memory) = &self.cache.memory {
+            crate::cache::parse_size(memory).map_err(|e| anyhow::anyhow!("cache.memory: {e}"))?;
+        }
+        if let Some(disk) = &self.cache.disk {
+            crate::cache::parse_size(&disk.size).map_err(|e| anyhow::anyhow!("cache.disk.size: {e}"))?;
         }
         self.validate_acme()?;
         self.validate_paths()?;
@@ -1630,11 +1641,15 @@ vhost "a.test" {
 
     #[test]
     fn relative_file_paths_come_from_the_config_directory() {
-        let set = files(&[("keel.hcl", TLS_ROOT), ("certs/a.crt", "CERT"), ("certs/a.key", "KEY")]);
+        let pair = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).unwrap();
+        let (cert, key) = (pair.cert.pem(), pair.signing_key.serialize_pem());
+        let set = files(&[("keel.hcl", TLS_ROOT), ("certs/a.crt", &cert), ("certs/a.key", &key)]);
         let cfg = assemble("", &set).unwrap();
         assert!(cfg.listeners[0].tls());
-        assert_eq!(cfg.read_file("certs/a.crt").unwrap(), b"CERT");
-        assert_eq!(cfg.read_file("./certs/a.key").unwrap(), b"KEY");
+        assert_eq!(cfg.read_file("certs/a.crt").unwrap(), cert.as_bytes());
+        assert_eq!(cfg.read_file("./certs/a.key").unwrap(), key.as_bytes());
+        let e = assemble_err("", &files(&[("keel.hcl", TLS_ROOT), ("certs/a.crt", "CERT"), ("certs/a.key", &key)]));
+        assert!(e.starts_with("vhost 'a.test': tls"), "{e}");
         let abs = std::env::temp_dir().join(format!("keel-abs-{}.crt", std::process::id()));
         std::fs::write(&abs, "DISK").unwrap();
         assert_eq!(cfg.read_file(abs.to_str().unwrap()).unwrap(), b"DISK", "absolute paths read from disk");
@@ -1943,6 +1958,19 @@ vhost "a.test" {
             cfg.pools.get_mut("dns").unwrap().backends[0].weight = weight;
             assert!(err(&cfg).contains("weight must be 1-1000"), "weight {weight}");
         }
+    }
+
+    #[test]
+    fn trusted_proxies_are_cidrs() {
+        let cfg = with_pool("vhost \"a\" {\n  pool = \"dns\"\n  forwarded_headers {\n    mode            = \"append\"\n    trusted_proxies = [\"10.0.0.0/8\", \"nope\"]\n  }\n}\n");
+        assert!(err(&cfg).contains("invalid CIDR 'nope'"));
+    }
+
+    #[test]
+    fn cache_sizes_are_checked_at_load() {
+        assert!(err(&with_pool("cache {\n  memory = \"10X\"\n}\n")).contains("cache.memory: unknown size unit 'X'"));
+        assert!(err(&with_pool("cache {\n  disk {\n    path = \"/c\"\n    size = \"lots\"\n  }\n}\n")).contains("cache.disk.size"));
+        with_pool("cache {\n  memory = \"256M\"\n}\n").validate().unwrap();
     }
 
     #[test]

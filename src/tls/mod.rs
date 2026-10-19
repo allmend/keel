@@ -146,6 +146,24 @@ pub fn acme_cert_paths(storage: &str, host: &str) -> (String, String) {
     (format!("{storage}/{host}.crt"), format!("{storage}/{host}.key"))
 }
 
+/// Every certificate file `cfg` names (vhost `tls` and `certificate` blocks
+/// with `cert`/`key`) reads and parses into a key rustls can use. Part of
+/// loading a config, so a push or `keel config validate` refuses what the
+/// workers could not serve.
+pub fn check_files(cfg: &crate::config::Config) -> anyhow::Result<()> {
+    let vhosts = cfg.vhosts.iter().filter_map(|v| {
+        let tls = v.tls.as_ref().filter(|t| !t.acme.enabled())?;
+        Some((format!("vhost '{}': tls", v.host), tls.cert.as_deref()?, tls.key.as_deref()?))
+    });
+    let blocks = cfg.certificates.iter().filter_map(|c| Some((format!("certificate '{}'", c.host), c.cert.as_deref()?, c.key.as_deref()?)));
+    for (owner, cert, key) in vhosts.chain(blocks) {
+        let cert_bytes = cfg.read_file(cert).with_context(|| format!("{owner}.cert"))?;
+        let key_bytes = cfg.read_file(key).with_context(|| format!("{owner}.key"))?;
+        CertPair::from_pem(&cert_bytes, &key_bytes, cert).with_context(|| owner.clone())?;
+    }
+    Ok(())
+}
+
 /// The certificates `cfg` names, and the hosts whose ACME certificate is not
 /// issued yet.
 fn load_cert_map(cfg: &crate::config::Config, issued: &Issued) -> anyhow::Result<(CertMap, Vec<String>)> {

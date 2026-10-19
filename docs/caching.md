@@ -38,7 +38,7 @@ A `cache` block on a vhost or route decides what is cached.
 vhost "example.com" {
   cache {
     enabled = true
-    ttl     = "1m"
+    ttl     = "1m" # every route without a cache block of its own
   }
 
   route "/static/" {
@@ -56,11 +56,11 @@ vhost "example.com" {
     pool = "api"
 
     cache {
-      enabled = false
+      enabled = false # never cached
     }
   }
 
-  route "/" { pool = "web" }
+  route "/" { pool = "web" } # the vhost's rule
 }
 ```
 
@@ -71,7 +71,7 @@ vhost "example.com" {
 | `statuses` | list of numbers | `[200]` | Status codes to cache |
 | `content_types` | list of strings | all | Content types to cache |
 
-A route's `cache` block replaces the vhost's, with no merging. A route without one uses the vhost's. Above, `/` uses the vhost's rule and `/api/` caches nothing.
+A route's `cache` block replaces the vhost's, with no merging. A route without one uses the vhost's.
 
 ## What is stored
 

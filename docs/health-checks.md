@@ -9,11 +9,11 @@ The block's label is the probe type. Each type takes its own attributes on top o
 ```hcl
 pool "web" {
   health_check "http" {
-    interval            = "10s"
-    timeout             = "2s"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    port                = 9000
+    interval            = "10s" # time between rounds
+    timeout             = "2s"  # per probe
+    healthy_threshold   = 2     # successes to return
+    unhealthy_threshold = 3     # failures to leave
+    port                = 9000  # optional: probe this port instead
   }
 
   backend "10.0.0.1:8080" {}
@@ -35,7 +35,7 @@ Backends start healthy. The first round runs within a second of startup. Every w
 
 ### tcp
 
-A TCP connection succeeds.
+A TCP connection succeeds. Proves that something accepts connections on the port, nothing about the service behind it.
 
 ```hcl
 health_check "tcp" {}
@@ -44,6 +44,8 @@ health_check "tcp" {}
 ### udp
 
 Sends an empty datagram and waits `timeout` for ICMP port-unreachable, which marks the backend down; silence is healthy. It detects a closed port only, and not at all when the host drops or rate-limits ICMP errors.
+
+Use for UDP services without a request/response exchange; `dns` and `ntp` probe the service itself.
 
 ```hcl
 health_check "udp" {
@@ -75,7 +77,7 @@ health_check "http" {
 
 ### dns
 
-One query. Healthy on RCODE `NOERROR` and, with `expect`, that address in the answer section. Any other RCODE, a malformed reply or no reply within `timeout` fails.
+One query. Healthy on RCODE `NOERROR` and, with `expect`, that address in the answer section. Any other RCODE, a malformed reply or no reply within `timeout` fails. The name should be one the server answers for: for an authoritative server, a name in its zones.
 
 ```hcl
 health_check "dns" {
@@ -107,7 +109,9 @@ health_check "ntp" {
 
 ### icmp
 
-One ICMP echo request to the backend's address; healthy on a reply within `timeout`. It checks the host, not the service.
+One ICMP echo request to the backend's address; healthy on a reply within `timeout`. It checks the host, not the service: a machine whose daemon died still answers.
+
+Use where nothing else can be probed, such as one-way UDP services (syslog collectors).
 
 ```hcl
 health_check "icmp" {}
@@ -118,6 +122,8 @@ Keel uses ICMP datagram sockets, not raw sockets. On Linux the master opens one 
 ### tls
 
 A TLS handshake completes. With `min_valid`, the presented certificate must also stay valid at least that long. The chain is not verified.
+
+Use for TLS-on-connect services behind `tcp` listeners (Redis `tls-port`, LDAPS). A certificate about to expire takes the backend out of rotation, with the days left in the reason.
 
 ```hcl
 health_check "tls" {

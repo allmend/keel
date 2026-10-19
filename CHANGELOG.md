@@ -44,6 +44,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
   and `--check` (exit 3 when a file is not formatted). See
   [Checking and formatting](docs/configuration.md#checking-and-formatting).
 
+### Fixed
+
+- A config is checked as far as a worker would use it: certificate and key
+  files are read and parsed at load (a bad or missing one failed only in
+  the workers, which kept the previous certificates or exited at start), as
+  are cache sizes and `trusted_proxies` CIDRs (an invalid CIDR was silently
+  ignored).
+
 ### Removed
 
 - `keel backend add`, which only printed that it is not supported.
