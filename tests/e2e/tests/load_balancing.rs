@@ -184,7 +184,8 @@ fn a_udp_flood_against_a_dead_pool_logs_a_line_per_second() -> Result<()> {
         let out = stack.exec("keel", &["keel", "backend", "list", "--pool", "dead"])?;
         Ok(String::from_utf8_lossy(&out.stdout).contains("unhealthy").then_some(()))
     })?;
-    let flood = "for i in $(seq 2000); do printf x > /dev/udp/127.0.0.1/5353; done";
+    // 100 datagrams every 50 ms: a burst would overflow the socket buffer.
+    let flood = "for i in $(seq 20); do for j in $(seq 100); do printf x > /dev/udp/127.0.0.1/5353; done; sleep 0.05; done";
     let out = stack.exec("keel", &["bash", "-c", flood])?;
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     std::thread::sleep(Duration::from_secs(2));

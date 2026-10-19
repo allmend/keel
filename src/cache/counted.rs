@@ -23,6 +23,17 @@ impl<S: Storage + Sync + Send + 'static> Storage for Counted<S> {
         Ok(hit)
     }
 
+    // The writing request reading back its own partial write: a miss, not a
+    // hit, and only the inner store can match the write tag.
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &SpanHandle,
+    ) -> pingora::Result<Option<(CacheMeta, HitHandler)>> {
+        self.inner.lookup_streaming_write(key, streaming_write_tag, trace).await
+    }
+
     async fn get_miss_handler(&'static self, key: &CacheKey, meta: &CacheMeta, trace: &SpanHandle) -> pingora::Result<MissHandler> {
         self.inner.get_miss_handler(key, meta, trace).await
     }

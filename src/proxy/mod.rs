@@ -204,6 +204,14 @@ impl KProxy {
             return;
         }
         let req = session.req_header();
+        // The access-log fields, only when there is an access log to write.
+        if self.access_logger.enabled() {
+            ctx.method = req.method.to_string();
+            ctx.uri = req.uri.path_and_query().map(|pq| pq.as_str().to_owned()).unwrap_or_else(|| req.uri.path().to_owned());
+            ctx.protocol = format!("{:?}", req.version);
+            ctx.user_agent = session.get_header("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
+            ctx.client_addr_str = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.to_string());
+        }
         let host = requested_host_or(req, "*").to_owned();
         let routing = self.routing.load();
         ctx.vhost = routing.vhost_label(&host).unwrap_or("unmatched").to_owned();
@@ -414,22 +422,6 @@ impl ProxyHttp for KProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Box<HttpPeer>> {
-        let ds = session.as_downstream();
-
-        // Capture the access-log fields before any early return so logging()
-        // always has them — and only when there is an access log to write.
-        if self.access_logger.enabled() {
-            let req = ds.req_header();
-            ctx.method = req.method.to_string();
-            ctx.uri = req
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str().to_owned())
-                .unwrap_or_else(|| req.uri.path().to_owned());
-            ctx.protocol = format!("{:?}", req.version);
-            ctx.user_agent = ds.get_header("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
-            ctx.client_addr_str = ds.client_addr().and_then(|a| a.as_inet()).map(|a| a.to_string());
-        }
         self.bind_route(session, ctx);
         if ctx.series.is_none() {
             crate::metrics::record_lb_error("", &ctx.vhost, "no_route");

@@ -69,9 +69,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Cache hits are counted in `keel_requests_total` and logged under their
-  vhost and pool; they were missing from metrics and logged to
-  `access_unknown.log`.
+- Cache hits are counted in `keel_requests_total` and logged in full
+  under their vhost and pool; they were missing from metrics and logged to
+  `access_unknown.log` without method, URI or client.
 - A drained backend without connections is removed at once; workers
   without connections to it kept it `draining`.
 - A worker that dies within 10s of starting is restarted after 1s,
