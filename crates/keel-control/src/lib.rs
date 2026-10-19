@@ -75,6 +75,10 @@ pub enum ControlRequest {
     ConfigPush { files: FileSet },
     /// Replace the control CA, revoking every operator credential.
     CredentialsRevokeAll,
+    /// The node file and config files the node serves, for
+    /// `keel config validate --diff`. Local socket only: the node file holds
+    /// the cluster secret.
+    ConfigApplied,
 }
 
 impl ControlRequest {
@@ -91,6 +95,7 @@ impl ControlRequest {
             ControlRequest::ClusterRemove { .. } => "cluster_remove",
             ControlRequest::ConfigPush { .. } => "config_push",
             ControlRequest::CredentialsRevokeAll => "credentials_revoke_all",
+            ControlRequest::ConfigApplied => "config_applied",
         }
     }
 }

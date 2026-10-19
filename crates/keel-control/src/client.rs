@@ -171,6 +171,14 @@ pub fn cluster_status<S: Read + Write>(stream: &mut S) -> Result<()> {
     Ok(())
 }
 
+/// The node file and config files the node serves.
+pub fn config_applied<S: Read + Write>(stream: &mut S) -> Result<(String, crate::FileSet)> {
+    let data = one_shot(stream, &ControlRequest::ConfigApplied)?;
+    let node_file = data["node_file"].as_str().unwrap_or_default().to_owned();
+    let files = serde_json::from_value(data["files"].clone())?;
+    Ok((node_file, files))
+}
+
 /// Commands whose response is a single `message` string.
 pub fn message<S: Read + Write>(stream: &mut S, request: &ControlRequest) -> Result<()> {
     let data = one_shot(stream, request)?;

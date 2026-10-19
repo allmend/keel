@@ -130,7 +130,7 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
     let (applied_tx, applied_rx) = watch::channel(Arc::new(cfg.clone()));
     let certs_changed = Arc::new(Notify::new());
     {
-        let acme = crate::acme::AcmeService::new(applied_rx, cluster.clone(), Arc::clone(&certs_changed));
+        let acme = crate::acme::AcmeService::new(applied_rx.clone(), cluster.clone(), Arc::clone(&certs_changed));
         let shutdown = shutdown.clone();
         tokio::spawn(async move { pingora::services::background::BackgroundService::start(&acme, shutdown).await });
     }
@@ -148,7 +148,7 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
     };
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
-    let dispatch = Dispatch::new(WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers), cluster.clone());
+    let dispatch = Dispatch::new(WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers), cluster.clone(), applied_rx);
     {
         let server = ControlServer { listener: inherited.control_socket, dispatch: Arc::clone(&dispatch) };
         let mut shutdown = shutdown.clone();

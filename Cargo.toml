@@ -21,7 +21,7 @@ pingora = { version = "0.9", features = ["lb", "rustls", "cache"] }
 async-trait = "0.1"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Config
 serde = { version = "1", features = ["derive"] }

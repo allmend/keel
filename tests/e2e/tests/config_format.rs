@@ -1,7 +1,8 @@
 //! The configuration language: a node configured in HCL, with locals shared
-//! across the config directory, serves traffic; `keel config validate` names
-//! the file, line and column of a mistake; `keel config fmt` finds files that
-//! are not formatted and leaves them alone when told not to write.
+//! across the config directory, serves traffic. `keel config validate` is
+//! silent on a good config, names the file, line and column of a mistake,
+//! lists files not in canonical format, prints what it loads, and compares
+//! with what the running node serves.
 
 use std::time::Duration;
 
@@ -26,7 +27,11 @@ services:
       - ./node.hcl:/etc/keel/node.hcl:ro
       - ./config:/etc/keel/config:ro
       - ./broken:/broken:ro
+      - ./broken-node.hcl:/broken-node.hcl:ro
       - ./messy:/messy:ro
+      - ./messy-node.hcl:/messy-node.hcl:ro
+      - ./edited:/edited:ro
+      - ./edited-node.hcl:/edited-node.hcl:ro
     ports: ["80"]
     networks: { net: { ipv4_address: 172.29.88.10 } }
 "#;
@@ -76,9 +81,14 @@ listener "http" "0.0.0.0:80" {}
 
 const MESSY: &str = "pool \"web\" {\nalgorithm=\"round_robin\"\n  backend \"172.29.88.21:80\" { weight=2 }\n}\n";
 
+/// A node file for `dir`, otherwise the same as NODE.
+fn node_for(dir: &str) -> String {
+    NODE.replace("  group   = \"nogroup\"\n", &format!("  group   = \"nogroup\"\n\n  config_dir = \"{dir}\"\n"))
+}
+
 #[test]
 #[ignore = "needs Docker"]
-fn a_node_configured_in_hcl_serves_traffic_and_its_tools_check_files() -> Result<()> {
+fn a_node_configured_in_hcl_serves_traffic_and_validate_checks_files() -> Result<()> {
     let stack = Stack::up(
         "config-format",
         COMPOSE,
@@ -86,8 +96,13 @@ fn a_node_configured_in_hcl_serves_traffic_and_its_tools_check_files() -> Result
             ("node.hcl", NODE.to_owned()),
             ("config/keel.hcl", ROOT.to_owned()),
             ("config/pools/web.hcl", POOL.to_owned()),
+            ("broken-node.hcl", node_for("/broken")),
             ("broken/keel.hcl", BROKEN.to_owned()),
+            ("messy-node.hcl", node_for("/messy")),
             ("messy/keel.hcl", MESSY.to_owned()),
+            ("edited-node.hcl", node_for("/edited")),
+            ("edited/keel.hcl", ROOT.to_owned()),
+            ("edited/pools/web.hcl", POOL.replace("  backend \"172.29.88.21:80\" {}\n", "  backend \"172.29.88.21:80\" {}\n  backend \"172.29.88.22:80\" {}\n")),
         ],
     )?;
     let addr = stack.addr("keel", 80)?;
@@ -95,28 +110,41 @@ fn a_node_configured_in_hcl_serves_traffic_and_its_tools_check_files() -> Result
         Ok(http_get(addr, "e2e.test", "/").ok().filter(|(status, _)| *status == 200))
     })?;
     assert!(body.contains("IP: 172.29.88.21"), "{body}");
+    let run = |args: &[&str]| -> Result<(Option<i32>, String, String)> {
+        let mut full = vec!["keel", "config", "validate"];
+        full.extend_from_slice(args);
+        let out = stack.exec("keel", &full)?;
+        Ok((out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned()))
+    };
 
-    // The running config validates.
-    let ok = stack.exec("keel", &["keel", "config", "validate"])?;
-    assert!(ok.status.success(), "validate: {}", String::from_utf8_lossy(&ok.stderr));
+    // The running config: valid, and nothing to say.
+    let (code, out, err) = run(&[])?;
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
 
-    // A mistake is reported where it is.
-    let bad = stack.exec("keel", &["keel", "config", "validate", "/broken"])?;
-    let err = String::from_utf8_lossy(&bad.stderr);
-    assert_eq!(bad.status.code(), Some(1), "{err}");
-    assert!(err.contains("keel.hcl:4:5"), "{err}");
-    assert!(err.contains("algorithmn"), "{err}");
+    // A mistake: exit 1, and where it is on stderr.
+    let (code, out, err) = run(&["/broken-node.hcl"])?;
+    assert_eq!(code, Some(1), "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("/broken/keel.hcl:4:5: unknown attribute `algorithmn`"), "{err}");
 
-    // fmt --check reports the file and a diff, and writes nothing.
-    let check = stack.exec("keel", &["keel", "config", "fmt", "--check", "--diff", "/messy"])?;
-    let out = String::from_utf8_lossy(&check.stdout);
-    assert_ne!(check.status.code(), Some(0), "{out}");
-    assert!(out.contains("keel.hcl"), "{out}");
-    assert!(out.contains("+  algorithm = \"round_robin\""), "{out}");
-    assert!(out.contains("+  backend \"172.29.88.21:80\" { weight = 2 }"), "{out}");
+    // Not formatted: valid, listed, and exit 3 with --check.
+    let (code, out, _) = run(&["/messy-node.hcl"])?;
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    let (code, out, err) = run(&["/messy-node.hcl", "--list", "--check"])?;
+    assert_eq!(code, Some(3), "{err}");
+    assert_eq!(out, "/messy/keel.hcl\n");
 
-    // Formatted files pass.
-    let clean = stack.exec("keel", &["keel", "config", "fmt", "--check"])?;
-    assert!(clean.status.success(), "{}", String::from_utf8_lossy(&clean.stdout));
+    // Every file that is loaded.
+    let (_, out, _) = run(&["--full"])?;
+    assert!(out.contains("# file /etc/keel/node.hcl\n") && out.contains("# file /etc/keel/config/pools/web.hcl\n"), "{out}");
+    assert!(out.find("config/keel.hcl").unwrap() < out.find("pools/web.hcl").unwrap(), "load order: {out}");
+
+    // Against what the node serves: the new backend waits for a restart.
+    let (code, out, err) = run(&["/edited-node.hcl", "--diff"])?;
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("+  backend \"172.29.88.22:80\" {}"), "{out}");
+    assert!(out.contains("restart pool \"web\": backend \"172.29.88.22:80\" added"), "{out}");
+    assert!(out.contains("restart the node file"), "{out}");
+    assert!(!out.contains("\x1b["), "no colors when not on a terminal: {out}");
     Ok(())
 }

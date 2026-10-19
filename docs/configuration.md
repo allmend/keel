@@ -500,32 +500,39 @@ A push is validated before it is committed. Without a reachable majority it fail
 
 ---
 
-## Checking and formatting
+## Checking a configuration
 
 ```bash
-keel config validate                 # the node file and its config directory
-keel config validate /srv/next       # another config directory
-keel config validate --write         # apply the suggested changes first
-
-keel config fmt                      # rewrite the node file and the config directory
-keel config fmt --check --diff       # change nothing; exit 3 if a file is not formatted
-keel config fmt --write=false pools/ # list the files that are not formatted
+keel config validate                       # /etc/keel/node.hcl and its config directory
+keel config validate /srv/next/node.hcl    # another node file and its config directory
+keel config validate --diff                # what changed since the running node's version
 ```
 
-`keel config validate` loads the files as Keel does at start and at push, with the node file from `--config`: syntax, attributes, types, references between blocks, files the config names. It prints each error with file, line and column and exits 1 if the configuration is not valid, 0 if it is. It needs no running node.
+`keel config validate` loads the node file and its config directory as a start or reload does — syntax, attributes, types, references between blocks, the files the config names — like `nginx -t`. It needs no running node. It is silent: exit 0 when the files can go live, 1 when they cannot, with the error on stderr. Flags add output:
 
-It also prints, as a diff, what it suggests changing: the canonical format, and the unit on a bare number given to a duration (`ttl = 30` becomes `ttl = "30s"`). `--write` applies those changes before validating. Nothing else is changed.
+| Flag | |
+|---|---|
+| `--full` | Every file that is loaded, in load order, each under `# file <path>`; like `nginx -T` |
+| `--diff` | A diff against the version the running node serves, then each change marked `reload` or `restart`, by the rules in [Hot reload](#hot-reload) |
+| `--list` | Files not in canonical format |
+| `--write` | Rewrite them in canonical format, with the unit added to a bare number given to a duration (`ttl = 30` becomes `ttl = "30s"`) |
+| `--check` | Exit 3 when a file is not in canonical format |
 
-`keel config fmt` rewrites `*.hcl` files in the canonical HCL format, the same output as the reference formatter (`terraform fmt`, `tofu fmt`): two-space indentation, one space around `=` with the `=` of consecutive attributes aligned, aligned trailing comments. Only whitespace changes. Without paths it formats the node file and the config directory; a directory is read recursively.
+```
+$ keel config validate --diff
+--- applied/pools/web.hcl
++++ /etc/keel/config/pools/web.hcl
+@@ -1,3 +1,4 @@
+ pool "web" {
+   backend "10.0.0.1:8080" {}
++  backend "10.0.0.2:8080" {}
+ }
+restart pool "web": backend "10.0.0.2:8080" added
+```
 
-| Flag | Default | |
-|---|---|---|
-| `--write` | `true` | Write the formatted files. `--write=false` writes nothing |
-| `--list` | `true` | Print the files that are not formatted. `--list=false` prints none |
-| `--diff` | off | Print what would change, as a unified diff |
-| `--check` | off | Write nothing; exit 3 if a file is not formatted |
+The canonical format is the reference formatter's (`terraform fmt`, `tofu fmt`): two-space indentation, one space around `=`, the `=` of consecutive attributes aligned, trailing comments aligned. Only whitespace changes. Formatting never affects the exit status, except with `--check`. Keel does not format on its own.
 
-A file that does not parse is reported with file, line and column, left alone, and makes the exit status 1. Keel never formats on its own: starting and reloading only validate. In CI, run `keel config validate` and `keel config fmt --check --diff` with the same binary or image the nodes run.
+Output is colored on a terminal; `--no-color` or `NO_COLOR` turns it off.
 
 ---
 

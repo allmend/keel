@@ -81,11 +81,17 @@ impl ControlServer {
 pub struct Dispatch {
     pub fanout: WorkerFanout,
     pub cluster: crate::cluster::ClusterHandle,
+    /// The config this node serves.
+    pub applied: tokio::sync::watch::Receiver<Arc<crate::config::Config>>,
 }
 
 impl Dispatch {
-    pub fn new(fanout: WorkerFanout, cluster: crate::cluster::ClusterHandle) -> Arc<Self> {
-        Arc::new(Dispatch { fanout, cluster })
+    pub fn new(
+        fanout: WorkerFanout,
+        cluster: crate::cluster::ClusterHandle,
+        applied: tokio::sync::watch::Receiver<Arc<crate::config::Config>>,
+    ) -> Arc<Self> {
+        Arc::new(Dispatch { fanout, cluster, applied })
     }
 
     /// Drain `address` on this node's workers at once, then commit it so every
@@ -228,6 +234,16 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 
         ControlRequest::ConfigPush { files } => {
             let resp = cmd_config_push(cluster, files).await;
+            write_line(&mut writer, &resp).await?;
+        }
+
+        ControlRequest::ConfigApplied => {
+            let resp = if audit.is_some() {
+                ControlResponse::err("config_applied is answered on the local control socket only")
+            } else {
+                let cfg = dispatch.applied.borrow().clone();
+                ControlResponse::ok(serde_json::json!({ "node_file": cfg.node_file, "files": cfg.files }))
+            };
             write_line(&mut writer, &resp).await?;
         }
 

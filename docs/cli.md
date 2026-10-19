@@ -1,6 +1,6 @@
 # CLI
 
-`keel` without a subcommand runs a node; with one, it is a client of the running node, or a local tool (`config validate`, `config fmt`, `credentials create`). Every client command also runs remotely through [keelctl](keelctl.md), with the same output.
+`keel` without a subcommand runs a node; with one, it is a client of the running node, or a local tool (`config validate`, `credentials create`). Every client command also runs remotely through [keelctl](keelctl.md), with the same output.
 
 ## Server flags
 
@@ -9,6 +9,7 @@
 | `--config <path>` | `/etc/keel/node.hcl` | The node file. Missing at the default path: every node setting at its default |
 | `--socket <path>` | `/var/run/keel/keel.sock` | Control socket, for client commands |
 | `--force-new-cluster` | off | Make this node the only member, keeping its state; see [Forced recovery](cluster.md#forced-recovery) |
+| `--no-color` | off | No colors in any output, logs included. `NO_COLOR` does the same |
 
 ## Control socket
 
@@ -98,22 +99,26 @@ config version 42 committed; every node applies it
 ## keel config validate
 
 ```bash
-keel config validate [dir] [--write]
+keel config validate [node.hcl] [--full] [--diff] [--list] [--write] [--check]
 ```
+
+Loads the node file (default `--config`) and its `keel.config_dir` as a start or reload would, like `nginx -t`. Needs no running node.
+
+Silent by default: exit 0 when the files can go live, 1 when they cannot, with the error on stderr:
 
 ```
 /etc/keel/config/pools/web.hcl:4:3: unknown attribute `algorithmn`
 ```
 
-Loads the node file (`--config`) and the config directory (`dir`, default `keel.config_dir`) as Keel would. Needs no running node. Prints suggested changes as a diff — canonical format, units on bare durations — and applies them with `--write`. Exits 1 if the configuration is not valid. See [Checking and formatting](configuration.md#checking-and-formatting).
+| Flag | |
+|---|---|
+| `--full` | Print every file that is loaded, in load order, each under `# file <path>` |
+| `--diff` | Diff against the version the running node serves, then each change marked `reload` (applies on reload) or `restart` (waits for a restart) |
+| `--list` | List files not in canonical format |
+| `--write` | Rewrite them in canonical format, with units on bare durations |
+| `--check` | Exit 3 when a file is not in canonical format |
 
-## keel config fmt
-
-```bash
-keel config fmt [paths...] [--write=false] [--list=false] [--diff] [--check]
-```
-
-Rewrites `*.hcl` files in canonical format and prints the ones it changed. Without paths: the node file and the config directory; directories are read recursively. `--check` writes nothing and exits 3 when a file is not formatted.
+`--diff` asks the node over the local control socket (`--socket`); without one it says so and compares nothing. See [Checking a configuration](configuration.md#checking-a-configuration).
 
 ## keel cluster status
 
@@ -177,5 +182,5 @@ Replaces the control CA; every keelconfig issued so far stops working. In a clus
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | Error, or `config validate`: not valid |
-| `3` | `config fmt --check`: a file is not formatted |
+| `1` | Error, or `config validate`: the configuration does not load |
+| `3` | `config validate --check`: a file is not in canonical format |

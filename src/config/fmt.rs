@@ -4,12 +4,9 @@
 //! rules, and the `=` of consecutive single-line attributes and trailing
 //! comments are aligned.
 //!
-//! Also the commands built on it: `keel config fmt` and
-//! `keel config validate`.
+//! `keel config validate` uses it to list and fix files.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
@@ -484,181 +481,6 @@ pub fn add_duration_units(text: &str) -> Result<String> {
     Ok(out)
 }
 
-/// A unified diff of two versions of a file, three lines of context.
-pub fn diff(name: &str, old: &str, new: &str) -> String {
-    let a: Vec<&str> = old.split_inclusive('\n').collect();
-    let b: Vec<&str> = new.split_inclusive('\n').collect();
-    // Longest common subsequence, from the end.
-    let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i][j] = if a[i] == b[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
-        }
-    }
-    // (old line, new line, tag) for every line of the edit script.
-    let mut ops: Vec<(usize, usize, char)> = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            ops.push((i, j, ' '));
-            i += 1;
-            j += 1;
-        } else if i < a.len() && (j == b.len() || lcs[i + 1][j] >= lcs[i][j + 1]) {
-            ops.push((i, j, '-'));
-            i += 1;
-        } else {
-            ops.push((i, j, '+'));
-            j += 1;
-        }
-    }
-    let changed: Vec<usize> = ops.iter().enumerate().filter(|(_, o)| o.2 != ' ').map(|(k, _)| k).collect();
-    if changed.is_empty() {
-        return String::new();
-    }
-    let path = name.trim_start_matches('/');
-    let mut out = format!("--- old/{path}\n+++ new/{path}\n");
-    let mut k = 0;
-    while k < changed.len() {
-        let start = changed[k].saturating_sub(3);
-        let mut end = changed[k] + 1;
-        while k < changed.len() && changed[k] <= end + 5 {
-            end = changed[k] + 1;
-            k += 1;
-        }
-        let end = (end + 3).min(ops.len());
-        let hunk = &ops[start..end];
-        let old_len = hunk.iter().filter(|o| o.2 != '+').count();
-        let new_len = hunk.iter().filter(|o| o.2 != '-').count();
-        out.push_str(&format!("@@ -{},{old_len} +{},{new_len} @@\n", hunk[0].0 + 1, hunk[0].1 + 1));
-        for &(i, j, tag) in hunk {
-            let line = if tag == '+' { b[j] } else { a[i] };
-            out.push(tag);
-            out.push_str(line);
-            if !line.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-    }
-    out
-}
-
-/// Every `*.hcl` file below `dir`, sorted.
-fn hcl_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
-        let path = entry?.path();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if name.starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            out.extend(hcl_files(&path)?);
-        } else if name.ends_with(".hcl") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// What `keel config fmt` does with what it finds.
-pub struct FmtOptions {
-    pub write: bool,
-    pub list: bool,
-    pub diff: bool,
-    pub check: bool,
-}
-
-/// Exit status of `keel config fmt --check` when a file is not formatted.
-pub const NOT_FORMATTED: i32 = 3;
-
-/// Format the given files and directories (recursively). Returns the exit
-/// status: 0, [`NOT_FORMATTED`] under `check`, or 1 when a file does not
-/// parse.
-pub fn fmt_command(paths: &[PathBuf], opts: &FmtOptions) -> Result<i32> {
-    let mut files = Vec::new();
-    for p in paths {
-        if p.is_dir() {
-            files.extend(hcl_files(p)?);
-        } else {
-            files.push(p.clone());
-        }
-    }
-    let mut status = 0;
-    for file in files {
-        let name = file.display().to_string();
-        let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {name}"))?;
-        if let Err(e) = super::hcl::parse(&super::hcl::Source { name: name.clone(), text: &text }) {
-            eprintln!("{e:#}");
-            status = 1;
-            continue;
-        }
-        let formatted = format(&text);
-        if formatted == text {
-            continue;
-        }
-        if opts.list {
-            println!("{name}");
-        }
-        if opts.diff {
-            print!("{}", diff(&name, &text, &formatted));
-        }
-        if opts.check {
-            status = status.max(NOT_FORMATTED);
-        } else if opts.write {
-            std::fs::write(&file, &formatted).with_context(|| format!("cannot write {name}"))?;
-        }
-    }
-    Ok(status)
-}
-
-/// Validate the node file and a config directory. Suggested changes —
-/// formatting, units on bare durations — are printed as diffs, or applied
-/// first with `write`. Returns the exit status: 0 valid, 1 not.
-pub fn validate_command(node_path: &str, dir: Option<&Path>, write: bool) -> Result<i32> {
-    let node_file = super::read_node_file(node_path)?;
-    let dir = match dir {
-        Some(d) => d.to_path_buf(),
-        None => match super::config_dir(node_path, &node_file) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("{e:#}");
-                return Ok(1);
-            }
-        },
-    };
-    let mut targets: Vec<PathBuf> = hcl_files(&dir)?;
-    if Path::new(node_path).exists() {
-        targets.insert(0, PathBuf::from(node_path));
-    }
-    for file in &targets {
-        let name = file.display().to_string();
-        let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {name}"))?;
-        let Ok(fixed) = add_duration_units(&text).map(|t| format(&t)) else { continue };
-        if fixed == text {
-            continue;
-        }
-        if write {
-            std::fs::write(file, &fixed).with_context(|| format!("cannot write {name}"))?;
-            println!("{name}: rewritten");
-        } else {
-            print!("{}", diff(&name, &text, &fixed));
-        }
-    }
-    let node_file = super::read_node_file(node_path)?;
-    let files = super::read_config_dir(&dir)?;
-    match super::build(node_path, &node_file, &files, Some(&dir)) {
-        Ok(_) => {
-            println!("{}: the configuration is valid", dir.display());
-            Ok(0)
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            Ok(1)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,12 +526,5 @@ mod tests {
         let src = "pool \"p\" {\n  passive {\n    eject_for = 30\n    failures  = 3\n  }\n}\nvhost \"*\" {\n  cache {\n    ttl = 60\n  }\n}\n";
         let fixed = add_duration_units(src).unwrap();
         assert!(fixed.contains("eject_for = \"30s\"") && fixed.contains("failures  = 3") && fixed.contains("ttl = \"60s\""), "{fixed}");
-    }
-
-    #[test]
-    fn unified_diff() {
-        let d = diff("a.hcl", "x {\nb=1\n}\n", "x {\n  b = 1\n}\n");
-        assert_eq!(d, "--- old/a.hcl\n+++ new/a.hcl\n@@ -1,3 +1,3 @@\n x {\n-b=1\n+  b = 1\n }\n");
-        assert_eq!(diff("a.hcl", "same\n", "same\n"), "");
     }
 }

@@ -6,8 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub mod fmt;
+mod fmt;
 mod hcl;
+pub mod validate;
 
 /// Default location of the node-local file. A node without one runs on the
 /// defaults of every node setting.

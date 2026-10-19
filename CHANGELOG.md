@@ -35,14 +35,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `keel config validate [dir]`: load a node file and config directory as
-  Keel would, without a running node; prints suggested changes and exits 1
-  when the configuration is not valid. `--write` applies the suggestions:
-  canonical formatting and units on bare durations.
-- `keel config fmt`: rewrite `*.hcl` files in canonical HCL format (the
-  output of `terraform fmt`), with `--write=false`, `--list=false`, `--diff`
-  and `--check` (exit 3 when a file is not formatted). See
-  [Checking and formatting](docs/configuration.md#checking-and-formatting).
+- `keel config validate [node.hcl]`: load a node file and its config
+  directory as a start or reload would, without a running node. Silent: exit
+  0 when the files can go live, 1 with the error on stderr. `--full` prints
+  every file loaded, `--diff` what changed since the running node's version
+  with each change marked reload or restart, `--list` files not in canonical
+  HCL format (the output of `terraform fmt`), `--write` fixes them, `--check`
+  exits 3 for them. See
+  [Checking a configuration](docs/configuration.md#checking-a-configuration).
+- `--no-color` (or `NO_COLOR`) for every command.
 
 ### Fixed
 

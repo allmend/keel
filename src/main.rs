@@ -33,13 +33,17 @@ struct Cli {
     config: String,
 
     /// Control socket path (for CLI commands)
-    #[arg(long, default_value = DEFAULT_SOCKET)]
+    #[arg(long, global = true, default_value = DEFAULT_SOCKET)]
     socket: String,
 
     /// Forced recovery after a permanently lost majority: keep this node's
     /// stored state and make it the only member of the cluster
     #[arg(long)]
     force_new_cluster: bool,
+
+    /// No colors in output (also NO_COLOR)
+    #[arg(long, global = true, env = "NO_COLOR", value_parser = clap::builder::FalseyValueParser::new())]
+    no_color: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -135,45 +139,43 @@ enum ConfigCommand {
     Push {
         file: String,
     },
-    /// Rewrite HCL files in the canonical format and list the ones changed
-    /// (default: the node file and the config directory)
-    Fmt {
-        /// Files or directories (read recursively)
-        paths: Vec<std::path::PathBuf>,
-        /// Write the formatted files
-        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
-        write: bool,
-        /// List the files that are not formatted
-        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
-        list: bool,
-        /// Show what would change, as a diff
+    /// Check that the node file and its config directory load as a start or
+    /// reload would. Silent: exit 0 when they can go live, 1 (error on stderr)
+    /// when not
+    Validate {
+        /// Node file (default: --config); its keel.config_dir is loaded
+        node: Option<String>,
+        /// Print every file that is loaded
+        #[arg(long)]
+        full: bool,
+        /// Show what changed since the version the running node serves, and
+        /// whether it applies on reload or needs a restart
         #[arg(long)]
         diff: bool,
-        /// Change nothing; exit 3 when a file is not formatted
+        /// List files not in canonical format
         #[arg(long)]
-        check: bool,
-    },
-    /// Load the node file and a config directory (default: the node's) as
-    /// Keel would, print suggested changes, and exit 1 if it is not valid
-    Validate {
-        dir: Option<std::path::PathBuf>,
-        /// Apply the suggested changes: formatting, and units on bare durations
+        list: bool,
+        /// Rewrite files in canonical format, with units on bare durations
         #[arg(long)]
         write: bool,
+        /// Exit 3 when a file is not in canonical format
+        #[arg(long)]
+        check: bool,
     },
 }
 
 fn main() -> Result<()> {
     // RUST_LOG governs when set. Appending a keel directive instead would
     // override it, which silently made every debug! in keel unreachable.
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("keel=info,pingora_core::listeners=warn")),
         )
+        .with_ansi(!cli.no_color)
         .init();
 
-    let cli = Cli::parse();
     match &cli.command {
         Some(cmd) => run_cli(cmd, &cli),
         None => run_server(&cli),
@@ -198,20 +200,18 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
         Command::Credentials { command: CredentialsCommand::Create { name, endpoint } } => {
             return cli_credentials_create(cli, name, endpoint);
         }
-        Command::Config { command: ConfigCommand::Fmt { paths, write, list, diff, check } } => {
-            let mut paths = paths.clone();
-            if paths.is_empty() {
-                let node_file = config::read_node_file(&cli.config)?;
-                if std::path::Path::new(&cli.config).exists() {
-                    paths.push(cli.config.clone().into());
-                }
-                paths.push(config::config_dir(&cli.config, &node_file)?);
-            }
-            let opts = config::fmt::FmtOptions { write: *write, list: *list, diff: *diff, check: *check };
-            std::process::exit(config::fmt::fmt_command(&paths, &opts)?);
-        }
-        Command::Config { command: ConfigCommand::Validate { dir, write } } => {
-            std::process::exit(config::fmt::validate_command(&cli.config, dir.as_deref(), *write)?);
+        Command::Config { command: ConfigCommand::Validate { node, full, diff, list, write, check } } => {
+            let opts = config::validate::Options {
+                node: node.clone().unwrap_or_else(|| cli.config.clone()),
+                socket: cli.socket.clone(),
+                full: *full,
+                diff: *diff,
+                list: *list,
+                write: *write,
+                check: *check,
+                color: !cli.no_color,
+            };
+            std::process::exit(config::validate::run(&opts)?);
         }
         _ => {}
     }
@@ -231,7 +231,7 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
                 let files = keel_control::push_file_set(std::path::Path::new(file))?;
                 client::message(&mut stream, &ControlRequest::ConfigPush { files })
             }
-            ConfigCommand::Fmt { .. } | ConfigCommand::Validate { .. } => unreachable!(),
+            ConfigCommand::Validate { .. } => unreachable!(),
         },
         Command::Cluster { command: ClusterCommand::Status } => client::cluster_status(&mut stream),
         Command::Cluster { command: ClusterCommand::Demote } => {

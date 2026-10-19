@@ -113,8 +113,8 @@ vhost "example.com" {
 ```
 
 ```bash
-keel config validate
-keel config fmt
+keel config validate          # exit 0: the files can go live
+keel config validate --diff   # what changes, and whether it needs a restart
 ```
 
 See [Configuration](docs/configuration.md).
