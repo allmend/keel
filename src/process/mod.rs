@@ -73,11 +73,12 @@ pub struct BoundListeners {
     /// One socket per worker per UDP listener, all in one SO_REUSEPORT group,
     /// so the kernel's client→socket hash keeps every flow on one worker.
     pub udp: Vec<(String, Vec<std::net::UdpSocket>)>,
-    /// One ICMP datagram socket per worker and family, when any pool uses an
-    /// `icmp` health check. Needs CAP_NET_RAW or `ping_group_range`: a root
-    /// master has it, a non-root one may not (checks then pass).
-    pub icmp4: Vec<std::net::UdpSocket>,
-    pub icmp6: Vec<std::net::UdpSocket>,
+    /// One ICMP datagram socket per family for the control worker, which
+    /// runs the health checks, when any pool uses an `icmp` check. Needs
+    /// CAP_NET_RAW or `ping_group_range`: a root master has it, a non-root
+    /// one may not (checks then pass).
+    pub icmp4: Option<std::net::UdpSocket>,
+    pub icmp6: Option<std::net::UdpSocket>,
 }
 
 impl BoundListeners {
@@ -96,16 +97,27 @@ impl BoundListeners {
             .join(format!("upgrade-{index}.sock"))
             .to_string_lossy()
             .into_owned();
-        let icmp4 = self.icmp4.get(index).map(|s| s.try_clone()).transpose()?;
-        let icmp6 = self.icmp6.get(index).map(|s| s.try_clone()).transpose()?;
-        Ok(proxy::WorkerSockets { tcp, udp, icmp4, icmp6, upgrade_sock })
+        Ok(proxy::WorkerSockets { tcp, udp, upgrade_sock })
     }
 
+    /// The data plane's sockets, which the control worker closes.
     fn fds(&self) -> Vec<RawFd> {
         let tcp = self.tcp.iter().map(|(_, l)| l.as_raw_fd());
         let udp = self.udp.iter().flat_map(|(_, s)| s.iter().map(AsRawFd::as_raw_fd));
-        let icmp = self.icmp4.iter().chain(&self.icmp6).map(AsRawFd::as_raw_fd);
-        tcp.chain(udp).chain(icmp).collect()
+        tcp.chain(udp).collect()
+    }
+
+    /// The control worker's ICMP sockets, which a worker closes.
+    fn icmp_fds(&self) -> Vec<RawFd> {
+        self.icmp4.iter().chain(&self.icmp6).map(AsRawFd::as_raw_fd).collect()
+    }
+
+    /// The ICMP sockets, for the control worker.
+    fn icmp(&self) -> std::io::Result<crate::health::icmp::IcmpSockets> {
+        Ok(crate::health::icmp::IcmpSockets {
+            v4: self.icmp4.as_ref().map(|s| s.try_clone()).transpose()?,
+            v6: self.icmp6.as_ref().map(|s| s.try_clone()).transpose()?,
+        })
     }
 }
 
@@ -244,34 +256,29 @@ fn take_tree(path: &std::path::Path, uid: Uid, gid: Gid) -> Result<()> {
 }
 
 /// Bind every configured listener before forking (as root, before the
-/// privilege drop). `per_listener` UDP and ICMP sockets are opened per
-/// listener — one per worker (an unread SO_REUSEPORT socket would swallow
-/// its share of datagrams).
+/// privilege drop). `per_listener` UDP sockets are opened per listener —
+/// one per worker (an unread SO_REUSEPORT socket would swallow its share of
+/// datagrams).
 fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<BoundListeners> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::ToSocketAddrs;
 
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
-    let (mut icmp4, mut icmp6) = (Vec::new(), Vec::new());
+    let (mut icmp4, mut icmp6) = (None, None);
     if crate::health::icmp::needed(cfg) {
-        for _ in 0..per_listener {
-            match crate::health::icmp::open_socket(false) {
-                Ok(s) => icmp4.push(s),
-                Err(e) if root => return Err(e).context("master: cannot open ICMPv4 socket"),
-                // Without root it takes `net.ipv4.ping_group_range`.
-                Err(e) => {
-                    warn!(error = %e, "master: cannot open ICMPv4 socket — icmp checks of IPv4 backends pass unconditionally");
-                    break;
-                }
-            }
-            match crate::health::icmp::open_socket(true) {
-                Ok(s) => icmp6.push(s),
-                // IPv6 may be disabled on the host; v6 backends then pass unchecked.
-                Err(e) => warn!(error = %e, "master: cannot open ICMPv6 socket — icmp checks of IPv6 backends pass unconditionally"),
-            }
+        match crate::health::icmp::open_socket(false) {
+            Ok(s) => icmp4 = Some(s),
+            Err(e) if root => return Err(e).context("master: cannot open ICMPv4 socket"),
+            // Without root it takes `net.ipv4.ping_group_range`.
+            Err(e) => warn!(error = %e, "master: cannot open ICMPv4 socket — icmp checks of IPv4 backends pass unconditionally"),
         }
-        info!(sockets = icmp4.len(), "master: opened ICMP sockets for health checks");
+        match crate::health::icmp::open_socket(true) {
+            Ok(s) => icmp6 = Some(s),
+            // IPv6 may be disabled on the host; v6 backends then pass unchecked.
+            Err(e) => warn!(error = %e, "master: cannot open ICMPv6 socket — icmp checks of IPv6 backends pass unconditionally"),
+        }
+        info!(v4 = icmp4.is_some(), v6 = icmp6.is_some(), "master: opened ICMP sockets for health checks");
     }
     for l in &cfg.listeners {
         if l.protocol == crate::config::Protocol::Udp {
@@ -408,9 +415,8 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     };
     let control_listeners = bind_control(&cfg, accounts.as_ref())?;
     crate::metrics::create_region(&cfg)?;
-    let data_fds = bound.as_ref().map(BoundListeners::fds).unwrap_or_default();
 
-    let mut control = Some(spawn_control(&cfg, &control_listeners, &data_fds, accounts.as_ref(), force_new_cluster)?);
+    let mut control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
     let mut control_backoff = Backoff::default();
     let mut control_due: Option<Instant> = None;
 
@@ -425,7 +431,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     // Worker indexes waiting for their restart, and when it is due.
     let mut due: Vec<(usize, Instant)> = Vec::new();
     for i in 0..n {
-        let private = private_fds(&control_listeners, control.as_ref());
+        let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
         let pid = spawn_worker(&worker_cfg, i, bound.as_ref(), accounts.as_ref(), &private)?;
         info!(pid = pid.as_raw(), index = i, "master: worker started");
         pids.push((pid, i, Instant::now()));
@@ -493,7 +499,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         let ready: Vec<usize> = due.iter().filter(|(_, at)| *at <= now).map(|(index, _)| *index).collect();
         due.retain(|(_, at)| *at > now);
         for index in ready {
-            let private = private_fds(&control_listeners, control.as_ref());
+            let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
             let pid = spawn_worker(&worker_cfg, index, bound.as_ref(), accounts.as_ref(), &private)?;
             pids.push((pid, index, Instant::now()));
             crate::metrics::set_workers(pids.len());
@@ -505,15 +511,16 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
 
         if control.is_none() && control_due.is_some_and(|due| Instant::now() >= due) {
             control_due = None;
-            control = Some(spawn_control(&cfg, &control_listeners, &data_fds, accounts.as_ref(), force_new_cluster)?);
+            control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
         }
     }
 }
 
-/// Descriptors a worker must not keep: the control listeners and the link
-/// to the control worker.
-fn private_fds(control_listeners: &ControlListeners, control: Option<&Control>) -> Vec<RawFd> {
-    control_listeners.fds().into_iter().chain(control.map(|c| c.link.as_raw_fd())).collect()
+/// Descriptors a worker must not keep: the control listeners, the link to
+/// the control worker, and its ICMP sockets.
+fn private_fds(control_listeners: &ControlListeners, control: Option<&Control>, bound: Option<&BoundListeners>) -> Vec<RawFd> {
+    let icmp = bound.map(BoundListeners::icmp_fds).unwrap_or_default();
+    control_listeners.fds().into_iter().chain(control.map(|c| c.link.as_raw_fd())).chain(icmp).collect()
 }
 
 /// Fork the control worker. It keeps the control listeners and its end of
@@ -521,7 +528,7 @@ fn private_fds(control_listeners: &ControlListeners, control: Option<&Control>) 
 fn spawn_control(
     cfg: &Config,
     listeners: &ControlListeners,
-    data_fds: &[RawFd],
+    bound: Option<&BoundListeners>,
     accounts: Option<&Accounts>,
     force_new_cluster: bool,
 ) -> Result<Control> {
@@ -536,18 +543,23 @@ fn spawn_control(
             Ok(Control { pid: child, link, started: Instant::now() })
         }
         ForkResult::Child => {
-            close_fds(data_fds);
+            close_fds(&bound.map(BoundListeners::fds).unwrap_or_default());
             close_fds(&[link.as_raw_fd()]);
             become_account(accounts.map(|a| &a.control), "control");
             let inherited = match (
                 listeners.socket.try_clone(),
                 listeners.remote.as_ref().map(|r| r.try_clone()).transpose(),
                 listeners.metrics.try_clone(),
+                bound.map(BoundListeners::icmp).transpose(),
             ) {
-                (Ok(control_socket), Ok(remote), Ok(metrics)) => {
-                    control_worker::Inherited { control_socket, remote, metrics, master: child_end }
-                }
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                (Ok(control_socket), Ok(remote), Ok(metrics), Ok(icmp)) => control_worker::Inherited {
+                    control_socket,
+                    remote,
+                    metrics,
+                    master: child_end,
+                    icmp: icmp.unwrap_or_default(),
+                },
+                (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
                     error!(error = %e, "control: cannot take over the control listeners");
                     std::process::exit(1);
                 }

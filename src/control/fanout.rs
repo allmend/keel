@@ -92,6 +92,8 @@ pub struct DrainOutcome {
 pub struct WorkerFanout {
     sockets: Vec<String>,
     started_at: Instant,
+    /// The node's health checks, for the reasons in `status`.
+    health: Option<std::sync::Arc<crate::health::HealthTable>>,
 }
 
 impl WorkerFanout {
@@ -99,6 +101,25 @@ impl WorkerFanout {
         WorkerFanout {
             sockets: (0..workers).map(|i| worker_socket_path(control_socket, i)).collect(),
             started_at: Instant::now(),
+            health: None,
+        }
+    }
+
+    /// Answer `status` with the health checks' failure reasons.
+    pub fn with_health(mut self, health: std::sync::Arc<crate::health::HealthTable>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    /// Add the last probe failure to each checked, not ejected backend.
+    fn add_reasons(&self, pool: &str, backends: &mut [Value]) {
+        let Some(health) = &self.health else { return };
+        for b in backends {
+            if !matches!(b.get("health").and_then(Value::as_str), Some("healthy" | "unhealthy")) {
+                continue;
+            }
+            let Some(address) = b.get("address").and_then(Value::as_str) else { continue };
+            b["health_reason"] = json!(health.reason(pool, address));
         }
     }
 
@@ -144,9 +165,16 @@ impl WorkerFanout {
         // Uptime is the control worker's: workers come and go under it, and
         // an operator asking how long the instance has been up means the
         // instance, not the youngest worker.
+        let mut pools = merge_pools(&responses);
+        for pool in &mut pools {
+            let name = pool["name"].as_str().unwrap_or_default().to_owned();
+            if let Some(backends) = pool["backends"].as_array_mut() {
+                self.add_reasons(&name, backends);
+            }
+        }
         ControlResponse::ok(json!({
             "uptime_secs": self.started_at.elapsed().as_secs(),
-            "pools": merge_pools(&responses),
+            "pools": pools,
         }))
     }
 
@@ -164,7 +192,7 @@ impl WorkerFanout {
                 first_error(&responses).unwrap_or_else(|| format!("pool '{pool}' not found")),
             );
         }
-        let backends = merge_backends(
+        let mut backends = merge_backends(
             responses
                 .iter()
                 .filter(|r| r.ok)
@@ -173,6 +201,7 @@ impl WorkerFanout {
                 })
                 .map(Vec::as_slice),
         );
+        self.add_reasons(pool, &mut backends);
         ControlResponse::ok(json!({ "pool": pool, "backends": backends }))
     }
 
@@ -388,9 +417,9 @@ fn fold_backend(into: &mut Value, other: &Value) {
         into["state"] = json!(other_state);
     }
 
-    // Health: the worst view wins, with its reason. Each worker probes
-    // independently, and a backend that one worker will not route to is
-    // degraded from the operator's point of view.
+    // Health: the worst view wins, with its reason. Every worker reads the
+    // same verdict; they differ only in passive ejection, and a backend one
+    // worker has ejected is degraded from the operator's point of view.
     let other_health = other.get("health").and_then(Value::as_str).unwrap_or("unchecked");
     if health_rank(other_health) < health_rank(into.get("health").and_then(Value::as_str).unwrap_or("unchecked")) {
         into["health"] = json!(other_health);
@@ -537,6 +566,7 @@ mod tests {
                 .map(|i| dir.join(format!("w{i}.sock")).to_string_lossy().into_owned())
                 .collect(),
             started_at: Instant::now(),
+            health: None,
         }
     }
 

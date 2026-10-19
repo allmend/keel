@@ -29,7 +29,9 @@ pool "web" {
 | `unhealthy_threshold` | `3` | Consecutive failures to leave service |
 | `port` | traffic port | Probe another port on the same address |
 
-Backends start healthy. The first round runs within a second of startup. Every worker runs its own checks: a backend gets one probe per worker per interval.
+The control worker runs the checks, once per node: a backend gets one probe per interval, whatever the number of workers. Every worker acts on the same verdict, read from shared memory, and a worker started later reads the current one. While the control worker is down, the workers keep the last verdicts; a restarted control worker continues from them.
+
+Backends start healthy. The first round runs within a second of startup.
 
 ## Probe types
 
@@ -117,7 +119,7 @@ Use where nothing else can be probed, such as one-way UDP services (syslog colle
 health_check "icmp" {}
 ```
 
-Keel uses ICMP datagram sockets, not raw sockets. On Linux the master opens one IPv4 and one IPv6 socket per worker before forking and dropping privileges; without root, the user's group must be inside `net.ipv4.ping_group_range`. On other platforms each worker opens its own. If no socket can be opened, Keel logs an error once and `icmp` probes of that address family pass. Reasons: `no echo reply within 1000ms`, `unreachable`.
+Keel uses ICMP datagram sockets, not raw sockets. On Linux the master opens one IPv4 and one IPv6 socket for the control worker before forking and dropping privileges; without root, the user's group must be inside `net.ipv4.ping_group_range`. On other platforms the control worker opens them. If no socket can be opened, Keel logs an error once and `icmp` probes of that address family pass. Reasons: `no echo reply within 1000ms`, `unreachable`.
 
 ### tls
 
@@ -163,7 +165,7 @@ Ejections show in `keel status` as `ejected` with the streak, in the log at `war
 
 ## Status
 
-`keel status` and `keel backend list` show health and, for an unhealthy backend, the reason of its last failed probe:
+`keel status` and `keel backend list` show health and, for a checked backend, the reason of its last failed probe, kept by the control worker:
 
 ```
   web (2 backends)

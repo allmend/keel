@@ -319,7 +319,9 @@ fn backend_json(b: &BackendStatus) -> serde_json::Value {
         (false, Some(true)) => "healthy",
         (false, Some(false)) => "unhealthy",
     };
-    let reason = if b.ejected { &b.eject_reason } else { &b.health_reason };
+    // A health reason is the control worker's to add; workers only know why
+    // they ejected a backend.
+    let reason = if b.ejected { b.eject_reason.as_deref() } else { None };
     serde_json::json!({
         "address": b.address,
         "state": state,

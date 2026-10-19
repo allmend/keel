@@ -33,6 +33,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
   listeners on one address, and an HTTP listener with a pool. Load errors
   name the file, line and column.
 
+- Health checks run once per node, in the control worker: a backend gets
+  one probe per interval, not one per worker. The verdict goes to the
+  workers through shared memory; all of them act on it at once, a worker
+  started later reads the current verdict instead of starting with every
+  backend healthy, and the verdicts stay while the control worker is down.
+  `icmp` checks use one socket pair, held by the control worker.
+
 ### Added
 
 - `keel config validate [node.hcl]`: load a node file and its config

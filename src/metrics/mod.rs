@@ -149,7 +149,8 @@ fn estimate(cfg: &Config) -> usize {
 
 /// Master, before forking: map the region every child inherits.
 pub fn create_region(cfg: &Config) -> anyhow::Result<()> {
-    let layout = layout_for(cfg.keel.workers.max(1), estimate(cfg));
+    // One stripe per worker, and the last one for the control worker.
+    let layout = layout_for(cfg.keel.workers.max(1) + 1, estimate(cfg));
     let region = Region::create(layout).map_err(|e| anyhow::anyhow!("master: cannot map the metrics region: {e}"))?;
     region.global(G_WORKERS_CONFIGURED).store(cfg.keel.workers as u64, Ordering::Relaxed);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -177,6 +178,17 @@ pub fn set_unresponsive(n: usize) {
 pub fn init_worker(index: usize) {
     STRIPE.store(index, Ordering::Relaxed);
     reset_gauges(region(), index);
+}
+
+/// Control worker, first thing: write the last stripe. Its health verdicts
+/// survive a restart of the control worker, so nothing is reset.
+pub fn init_prober() {
+    STRIPE.store(prober_stripe(), Ordering::Relaxed);
+}
+
+/// The stripe the control worker writes.
+fn prober_stripe() -> usize {
+    region().layout().stripes - 1
 }
 
 fn reset_gauges(region: &Region, stripe: usize) {
@@ -220,10 +232,14 @@ fn first_cell(family: F, labels: &[&str]) -> Option<u32> {
 
 /// This process's cells of a series.
 fn cells(family: F, labels: &[&str]) -> &'static [AtomicU64] {
+    cells_in(STRIPE.load(Ordering::Relaxed), family, labels)
+}
+
+/// The cells of a series in `stripe`.
+fn cells_in(stripe: usize, family: F, labels: &[&str]) -> &'static [AtomicU64] {
     let n = FAMILIES[family as usize].kind.cells() as usize;
     match first_cell(family, labels) {
         Some(first) => {
-            let stripe = STRIPE.load(Ordering::Relaxed);
             let region: &'static Region = region();
             // Consecutive cells of one stripe.
             let first = region.cell(stripe, first) as *const AtomicU64;
@@ -350,6 +366,8 @@ pub struct BackendSeries {
     connection_errors: Counter,
     active: Gauge,
     healthy: State,
+    /// The control worker's health verdict, read by the workers.
+    verdict: &'static AtomicU64,
     drain: State,
     ejected: State,
     ejections: Counter,
@@ -368,6 +386,7 @@ impl BackendSeries {
             connection_errors: Counter::of(F::BACKEND_CONNECTION_ERRORS, &labels),
             active: Gauge(&cells(F::ACTIVE_CONNECTIONS, &labels)[0]),
             healthy: State(&cells(F::BACKEND_HEALTHY, &labels)[0]),
+            verdict: &cells_in(prober_stripe(), F::BACKEND_HEALTHY, &labels)[0],
             drain: State(&cells(F::BACKEND_DRAIN_STATE, &labels)[0]),
             ejected: State(&cells(F::BACKEND_EJECTED, &labels)[0]),
             ejections: Counter::of(F::BACKEND_EJECTIONS, &labels),
@@ -393,8 +412,17 @@ impl BackendSeries {
         self.active.add(-1);
     }
 
+    /// Control worker: the backend's health verdict.
     pub fn set_healthy(&self, healthy: bool) {
         self.healthy.set(healthy as u64);
+    }
+
+    /// The control worker's health verdict; `None` before its first.
+    pub fn verdict(&self) -> Option<bool> {
+        match self.verdict.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v == 2),
+        }
     }
 
     pub fn set_drain_state(&self, state: u8) {

@@ -22,14 +22,9 @@ pub const DRAIN_REMOVED: u8 = 2;
 /// and write the same thing.
 pub struct HealthState {
     /// A health check is configured for this pool; without one the backend
-    /// is unconditionally healthy and `reason` stays empty.
+    /// is unconditionally healthy. The verdict is the control worker's, read
+    /// from the shared memory region.
     pub checked: AtomicBool,
-    pub healthy: AtomicBool,
-    consecutive_ok: AtomicU32,
-    consecutive_fail: AtomicU32,
-    /// Why the last probe failed (kept while healthy too, until the next
-    /// success clears it), for `keel status`.
-    reason: Mutex<Option<String>>,
     /// Passive detection: consecutive real-traffic failures since the last
     /// success, and the ejection deadline in ms since the registry epoch
     /// (0 = not ejected).
@@ -42,47 +37,15 @@ impl HealthState {
     fn new() -> Self {
         HealthState {
             checked: AtomicBool::new(false),
-            healthy: AtomicBool::new(true),
-            consecutive_ok: AtomicU32::new(0),
-            consecutive_fail: AtomicU32::new(0),
-            reason: Mutex::new(None),
             passive_failures: AtomicU32::new(0),
             ejected_until_ms: AtomicU64::new(0),
             eject_reason: Mutex::new(None),
         }
     }
 
-    pub fn reason(&self) -> Option<String> {
-        self.reason.lock().unwrap().clone()
-    }
-
     fn ejected_at(&self, now_ms: u64) -> bool {
         let until = self.ejected_until_ms.load(Ordering::Relaxed);
         until != 0 && now_ms < until
-    }
-
-    /// Apply one probe result with the pool's flip thresholds. Returns
-    /// `Some(new_state)` when the backend flipped.
-    pub fn observe(&self, ok: bool, reason: Option<&str>, healthy_after: u32, unhealthy_after: u32) -> Option<bool> {
-        self.checked.store(true, Ordering::Relaxed);
-        if ok {
-            self.consecutive_fail.store(0, Ordering::Relaxed);
-            *self.reason.lock().unwrap() = None;
-            let n = self.consecutive_ok.fetch_add(1, Ordering::Relaxed) + 1;
-            if !self.healthy.load(Ordering::Relaxed) && n >= healthy_after.max(1) {
-                self.healthy.store(true, Ordering::Release);
-                return Some(true);
-            }
-        } else {
-            self.consecutive_ok.store(0, Ordering::Relaxed);
-            *self.reason.lock().unwrap() = reason.map(str::to_owned);
-            let n = self.consecutive_fail.fetch_add(1, Ordering::Relaxed) + 1;
-            if self.healthy.load(Ordering::Relaxed) && n >= unhealthy_after.max(1) {
-                self.healthy.store(false, Ordering::Release);
-                return Some(false);
-            }
-        }
-        None
     }
 }
 
@@ -128,9 +91,13 @@ impl BackendEntry {
     /// Eligible for new traffic: not draining, not failing its check, and
     /// not passively ejected.
     fn available(&self, now_ms: u64) -> bool {
-        self.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE
-            && self.health.healthy.load(Ordering::Relaxed)
-            && !self.health.ejected_at(now_ms)
+        self.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE && self.healthy() && !self.health.ejected_at(now_ms)
+    }
+
+    /// The control worker's verdict for a checked pool; healthy until it has
+    /// one, and without a check.
+    fn healthy(&self) -> bool {
+        !self.health.checked.load(Ordering::Relaxed) || self.series.verdict().unwrap_or(true)
     }
 }
 
@@ -150,7 +117,6 @@ pub struct BackendStatus {
     pub connections: i64,
     /// `None` when no health check is configured for the pool.
     pub healthy: Option<bool>,
-    pub health_reason: Option<String>,
     /// Passively ejected right now; the reason says what traffic failed.
     pub ejected: bool,
     pub eject_reason: Option<String>,
@@ -348,40 +314,11 @@ impl PoolRegistry {
 
     /// Record an active-check result. Flips the backend when the pool's
     /// threshold is reached; logs and updates `keel_backend_healthy` on flips.
-    pub fn observe_health(
-        &self,
-        pool_name: &str,
-        addr: SocketAddr,
-        ok: bool,
-        reason: Option<&str>,
-        healthy_after: u32,
-        unhealthy_after: u32,
-    ) {
-        let Some(entry) = self.entry(pool_name, addr) else { return };
-        match entry.health.observe(ok, reason, healthy_after, unhealthy_after) {
-            Some(true) => {
-                entry.series.set_healthy(true);
-                tracing::info!(pool = pool_name, backend = %addr, "health: backend healthy");
-            }
-            Some(false) => {
-                entry.series.set_healthy(false);
-                tracing::warn!(
-                    pool = pool_name,
-                    backend = %addr,
-                    reason = reason.unwrap_or("unknown"),
-                    "health: backend unhealthy"
-                );
-            }
-            None => {}
-        }
-    }
-
-    /// Mark every backend of a pool as covered by an active check, so status
-    /// output distinguishes "healthy" from "not checked".
+    /// Mark every backend of a pool as covered by an active check: its
+    /// health is the control worker's verdict, and status says so.
     pub fn mark_checked(&self, pool_name: &str) {
         for entry in self.drain.get(pool_name).into_iter().flat_map(HashMap::values) {
             entry.health.checked.store(true, Ordering::Relaxed);
-            entry.series.set_healthy(true);
         }
     }
 
@@ -513,8 +450,7 @@ fn status_of(pool: &str, entry: &BackendEntry, now_ms: u64) -> BackendStatus {
         address: entry.label.clone(),
         drain_state: entry.drain_state.load(Ordering::Relaxed),
         connections: entry.connections.load(Ordering::Relaxed).max(0),
-        healthy: checked.then(|| entry.health.healthy.load(Ordering::Relaxed)),
-        health_reason: if checked { entry.health.reason() } else { None },
+        healthy: checked.then(|| entry.healthy()),
         ejected,
         eject_reason: if ejected { entry.health.eject_reason.lock().unwrap().clone() } else { None },
     }
@@ -610,7 +546,12 @@ mod tests {
     use super::*;
 
     fn registry(eject_for: Duration) -> PoolRegistry {
-        let addrs = ["127.0.0.1:1", "127.0.0.1:2"];
+        registry_of(["127.0.0.1:1", "127.0.0.1:2"], eject_for)
+    }
+
+    /// Distinct addresses keep a test's metric series, the health verdict
+    /// among them, apart from other tests'.
+    fn registry_of(addrs: [&str; 2], eject_for: Duration) -> PoolRegistry {
         let mut drain = HashMap::new();
         let pairs: Vec<(&str, &str)> = addrs.iter().map(|a| (*a, *a)).collect();
         build_drain_entries("p", &pairs, &mut drain).unwrap();
@@ -700,23 +641,17 @@ mod tests {
     }
 
     #[test]
-    fn active_check_flips_on_thresholds() {
-        let reg = registry(Duration::from_secs(60));
-        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    fn a_checked_pool_follows_the_control_workers_verdict() {
+        let reg = registry_of(["127.0.0.9:1", "127.0.0.9:2"], Duration::from_secs(60));
+        let a: SocketAddr = "127.0.0.9:1".parse().unwrap();
+        let verdict = crate::metrics::BackendSeries::new("p", "127.0.0.9:1");
+        verdict.set_healthy(false);
+        assert_eq!(selections(&reg, 6).len(), 2, "an unchecked pool ignores verdicts");
         reg.mark_checked("p");
-        reg.observe_health("p", a, false, Some("refused"), 2, 3);
-        reg.observe_health("p", a, false, Some("refused"), 2, 3);
-        assert!(reg.backends_for_pool("p")[0].healthy.unwrap(), "below threshold");
-        reg.observe_health("p", a, false, Some("refused"), 2, 3);
-        let st = &reg.backends_for_pool("p")[0];
-        assert_eq!(st.healthy, Some(false));
-        assert_eq!(st.health_reason.as_deref(), Some("refused"));
-        assert_eq!(selections(&reg, 6).len(), 1, "only :2 is selectable");
-        reg.observe_health("p", a, true, None, 2, 3);
-        assert_eq!(reg.backends_for_pool("p")[0].healthy, Some(false));
-        reg.observe_health("p", a, true, None, 2, 3);
-        assert_eq!(reg.backends_for_pool("p")[0].healthy, Some(true));
-        assert_eq!(reg.backends_for_pool("p")[0].health_reason, None);
+        assert_eq!(selections(&reg, 6), ["127.0.0.9:2".parse().unwrap()].into_iter().collect());
+        assert_eq!(reg.backends_for_pool("p").iter().find(|b| b.address == a.to_string()).unwrap().healthy, Some(false));
+        verdict.set_healthy(true);
+        assert_eq!(selections(&reg, 6).len(), 2);
     }
 
     #[test]

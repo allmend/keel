@@ -16,7 +16,7 @@
 Client commands talk to the node over a Unix socket (`--socket`). The master binds it and the control worker serves it, owned by `keel.control_user` and its group (0660); workers cannot open it. The control worker asks every worker over its own socket (`workers/worker-<index>.sock` beside it) and merges the answers:
 
 - Connection counts are summed.
-- Health is the worst any worker reports.
+- Health is the control worker's verdict, with its reason; `ejected` when any worker ejected the backend.
 - Drain state is the least drained any worker reports.
 
 A worker that does not answer within five seconds is left out and logged. Without a running node:

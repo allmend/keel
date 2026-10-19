@@ -14,8 +14,7 @@ endpoint adds them up: every value is a node total, and no metric has a
 - Counters count from the master's start (`keel_start_time_seconds`). A
   replaced worker's successor keeps counting where it left off.
 - Gauges are merged across the workers: `keel_active_connections` is
-  the sum, `keel_backend_healthy` is `0` if any worker sees the backend
-  unhealthy, `keel_backend_ejected` is `1` if any worker ejected it, and
+  the sum, `keel_backend_ejected` is `1` if any worker ejected it, and
   `keel_backend_drain_state` is the least drained state of any worker.
 - Series stay until the master restarts, including those of vhosts, routes
   and pools removed by a reload (with their last value).
@@ -59,7 +58,7 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 | `keel_backend_response_duration_seconds` | histogram | `pool`, `backend` | Backend selected to response complete |
 | `keel_backend_connection_errors_total` | counter | `pool`, `backend` | Failed upstream connections |
 | `keel_active_connections` | gauge | `pool`, `backend` | Current active connections — HTTP and TCP combined; the same counter drain waits on |
-| `keel_backend_healthy` | gauge | `pool`, `backend` | `1` healthy, `0` unhealthy. Set on health-check transitions; pools without a `health_check` never emit it |
+| `keel_backend_healthy` | gauge | `pool`, `backend` | `1` healthy, `0` unhealthy: the control worker's verdict, which every worker follows. Pools without a `health_check` never emit it |
 | `keel_backend_drain_state` | gauge | `pool`, `backend` | `0` active, `1` draining, `2` removed |
 | `keel_backend_ejected` | gauge | `pool`, `backend` | `1` while passively ejected after consecutive traffic failures |
 | `keel_backend_ejections_total` | counter | `pool`, `backend` | Passive ejections |

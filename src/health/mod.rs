@@ -1,33 +1,34 @@
-//! Active health checks.
+//! Active health checks, run once per node by the control worker.
 //!
 //! One `HealthService` per pool with a `health_check` block probes every
-//! backend on an interval and feeds the results into the pool registry's
-//! health state (`PoolRegistry::observe_health`), which is what backend
-//! selection, `keel status`, and `keel_backend_healthy` read. Pingora's own
-//! health table is not used: it is private, so the passive detector and the
-//! least-connections pool could not share it.
+//! backend on an interval. The `HealthTable` applies the thresholds and
+//! writes each backend's verdict into the shared memory region, where every
+//! worker reads it at selection and `keel_backend_healthy` is rendered from
+//! it. A worker started later reads the current verdict; the verdicts stay
+//! while the control worker is down, and a restarted one continues from
+//! them. The table keeps the failure reasons for `keel status`.
 //!
 //! Probes are protocol checks behind one small trait. `tcp` and `udp` prove
 //! the port answers (or, for UDP, that it does not refuse); `http`, `dns`,
 //! and `ntp` talk to the service itself; `tls` completes a handshake and
 //! can watch certificate expiry; `icmp` only reaches the host.
 //!
-//! Every worker process runs its own checks, so a backend receives one probe
-//! per worker per interval. The first round starts within a second of
-//! startup and every round is jittered by ±10% so workers drift apart.
+//! The first round starts within a second of startup and every round is
+//! jittered by ±10%, so pools drift apart.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::net::{TcpStream, UdpSocket};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::backend::PoolRegistry;
-use crate::config::{HealthCheck, ProbeConfig};
+use crate::config::{Config, HealthCheck, ProbeConfig};
 
 mod dns;
 pub mod icmp;
@@ -57,17 +58,119 @@ pub struct HealthService {
     timeout: Duration,
     healthy_after: u32,
     unhealthy_after: u32,
-    pools: Arc<PoolRegistry>,
+    table: Arc<HealthTable>,
+}
+
+/// The health of every checked backend on this node.
+#[derive(Default)]
+pub struct HealthTable {
+    backends: HashMap<(String, SocketAddr), Checked>,
+}
+
+/// One backend's probe results and verdict.
+struct Checked {
+    series: crate::metrics::BackendSeries,
+    healthy: AtomicBool,
+    consecutive_ok: AtomicU32,
+    consecutive_fail: AtomicU32,
+    /// Why the last probe failed, until the next success.
+    reason: Mutex<Option<String>>,
+}
+
+impl Checked {
+    fn new(pool: &str, addr: SocketAddr) -> Self {
+        let series = crate::metrics::BackendSeries::new(pool, &addr.to_string());
+        // A restarted control worker continues from the verdict it left.
+        let healthy = series.verdict().unwrap_or(true);
+        series.set_healthy(healthy);
+        Checked {
+            series,
+            healthy: AtomicBool::new(healthy),
+            consecutive_ok: AtomicU32::new(0),
+            consecutive_fail: AtomicU32::new(0),
+            reason: Mutex::new(None),
+        }
+    }
+
+    /// Apply one probe result with the pool's thresholds. Returns
+    /// `Some(new_state)` when the backend flipped.
+    fn observe(&self, ok: bool, reason: Option<&str>, healthy_after: u32, unhealthy_after: u32) -> Option<bool> {
+        if ok {
+            self.consecutive_fail.store(0, Ordering::Relaxed);
+            *self.reason.lock().unwrap() = None;
+            let n = self.consecutive_ok.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.healthy.load(Ordering::Relaxed) && n >= healthy_after.max(1) {
+                self.healthy.store(true, Ordering::Relaxed);
+                return Some(true);
+            }
+        } else {
+            self.consecutive_ok.store(0, Ordering::Relaxed);
+            *self.reason.lock().unwrap() = reason.map(str::to_owned);
+            let n = self.consecutive_fail.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.healthy.load(Ordering::Relaxed) && n >= unhealthy_after.max(1) {
+                self.healthy.store(false, Ordering::Relaxed);
+                return Some(false);
+            }
+        }
+        None
+    }
+}
+
+impl HealthTable {
+    /// Record one probe result; a flip is published to the workers and logged.
+    fn observe(&self, pool: &str, addr: SocketAddr, result: &ProbeResult, healthy_after: u32, unhealthy_after: u32) {
+        let Some(c) = self.backends.get(&(pool.to_owned(), addr)) else { return };
+        let reason = result.as_ref().err().map(String::as_str);
+        match c.observe(result.is_ok(), reason, healthy_after, unhealthy_after) {
+            Some(true) => {
+                c.series.set_healthy(true);
+                info!(pool, backend = %addr, "health: backend healthy");
+            }
+            Some(false) => {
+                c.series.set_healthy(false);
+                warn!(pool, backend = %addr, reason = reason.unwrap_or("unknown"), "health: backend unhealthy");
+            }
+            None => {}
+        }
+    }
+
+    /// Why the last probe of a backend failed, for `keel status`.
+    pub fn reason(&self, pool: &str, address: &str) -> Option<String> {
+        let addr: SocketAddr = address.parse().ok()?;
+        self.backends.get(&(pool.to_owned(), addr))?.reason.lock().unwrap().clone()
+    }
+}
+
+/// The node's health table and one prober per pool with a health check.
+/// Backend names resolve here as in the workers; one that does not is left
+/// unchecked and logged.
+pub fn probers(cfg: &Config) -> (Arc<HealthTable>, Vec<HealthService>) {
+    let mut table = HealthTable::default();
+    let mut plans = Vec::new();
+    for (name, pool) in &cfg.pools {
+        let Some(hc) = &pool.health_check else { continue };
+        let mut addrs = Vec::new();
+        for b in &pool.backends {
+            match crate::proxy::resolve_addr(&b.address).and_then(|a| Ok(a.parse::<SocketAddr>()?)) {
+                Ok(addr) => {
+                    table.backends.insert((name.clone(), addr), Checked::new(name, addr));
+                    addrs.push(addr);
+                }
+                Err(e) => warn!(pool = name, backend = b.address, error = %format!("{e:#}"), "health: backend not checked"),
+            }
+        }
+        plans.push((name.clone(), hc.clone(), addrs));
+    }
+    let table = Arc::new(table);
+    let services = plans
+        .into_iter()
+        .map(|(pool, hc, addrs)| HealthService::build(&hc, &pool, &addrs, Arc::clone(&table)))
+        .collect();
+    (table, services)
 }
 
 impl HealthService {
-    /// `addrs` are the pool's resolved backend addresses (the drain keys).
-    pub fn build(
-        cfg: &HealthCheck,
-        pool: &str,
-        addrs: &[String],
-        pools: Arc<PoolRegistry>,
-    ) -> anyhow::Result<Self> {
+    fn build(cfg: &HealthCheck, pool: &str, addrs: &[SocketAddr], table: Arc<HealthTable>) -> Self {
         let timeout = cfg.timeout;
         let probe: Arc<dyn Probe> = match &cfg.probe {
             ProbeConfig::Tcp => Arc::new(TcpProbe),
@@ -94,16 +197,15 @@ impl HealthService {
         };
         let targets = addrs
             .iter()
-            .map(|a| {
-                let traffic: SocketAddr = a.parse()?;
+            .map(|&traffic| {
                 let mut probed = traffic;
                 if let Some(port) = cfg.port {
                     probed.set_port(port);
                 }
-                Ok((traffic, probed))
+                (traffic, probed)
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(HealthService {
+            .collect();
+        HealthService {
             pool: pool.to_owned(),
             targets,
             probe,
@@ -111,8 +213,8 @@ impl HealthService {
             timeout,
             healthy_after: cfg.healthy_threshold,
             unhealthy_after: cfg.unhealthy_threshold,
-            pools,
-        })
+            table,
+        }
     }
 
     /// Probe every backend concurrently and record the results.
@@ -139,14 +241,7 @@ impl HealthService {
         for h in handles {
             let Ok((addr, result)) = h.await else { continue };
             debug!(pool = self.pool, backend = %addr, ok = result.is_ok(), "health: probe");
-            self.pools.observe_health(
-                &self.pool,
-                addr,
-                result.is_ok(),
-                result.as_ref().err().map(String::as_str),
-                self.healthy_after,
-                self.unhealthy_after,
-            );
+            self.table.observe(&self.pool, addr, &result, self.healthy_after, self.unhealthy_after);
         }
     }
 }
@@ -154,7 +249,6 @@ impl HealthService {
 #[async_trait]
 impl BackgroundService for HealthService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        self.pools.mark_checked(&self.pool);
         info!(
             pool = self.pool,
             backends = self.targets.len(),
@@ -163,7 +257,7 @@ impl BackgroundService for HealthService {
         );
         let mut rng = Rng::seeded(&self.pool);
         // First round within a second so dead backends are found quickly;
-        // the random offset keeps workers from probing in lockstep.
+        // the random offset keeps pools from probing in lockstep.
         let mut delay = Duration::from_millis(rng.below(1000));
         loop {
             tokio::select! {
@@ -362,6 +456,30 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verdicts_flip_on_thresholds_and_are_published() {
+        let addr: SocketAddr = "127.0.0.7:1".parse().unwrap();
+        let mut table = HealthTable::default();
+        table.backends.insert(("hc".to_owned(), addr), Checked::new("hc", addr));
+        let worker_view = crate::metrics::BackendSeries::new("hc", "127.0.0.7:1");
+        assert_eq!(worker_view.verdict(), Some(true), "healthy from the start");
+        let fail: ProbeResult = Err("refused".into());
+        table.observe("hc", addr, &fail, 2, 3);
+        table.observe("hc", addr, &fail, 2, 3);
+        assert_eq!(worker_view.verdict(), Some(true), "below threshold");
+        table.observe("hc", addr, &fail, 2, 3);
+        assert_eq!(worker_view.verdict(), Some(false));
+        assert_eq!(table.reason("hc", "127.0.0.7:1").as_deref(), Some("refused"));
+        table.observe("hc", addr, &Ok(()), 2, 3);
+        assert_eq!(worker_view.verdict(), Some(false));
+        table.observe("hc", addr, &Ok(()), 2, 3);
+        assert_eq!(worker_view.verdict(), Some(true));
+        assert_eq!(table.reason("hc", "127.0.0.7:1"), None);
+        // A restarted prober continues from the verdict it left.
+        worker_view.set_healthy(false);
+        assert!(!Checked::new("hc", addr).healthy.load(Ordering::Relaxed));
+    }
 
 
     #[test]

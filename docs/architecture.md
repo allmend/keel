@@ -28,9 +28,10 @@ node without a `cluster` block is a cluster of one.
 | Raft (config,     |  | Pingora data      |  | same as worker 0  |
 |  drains, certs)   |  |  plane: HTTP,     |  |                   |
 | control socket,   |  |  TCP, UDP         |  |                   |
-|  control.remote   |  | health checks,    |  |                   |
-| /metrics          |  |  passive ejection |  |                   |
-| ACME              |  | access logs       |  |                   |
+|  control.remote   |  | passive ejection  |  |                   |
+| /metrics          |  | access logs       |  |                   |
+| health checks     |  |                   |  |                   |
+| ACME              |  |                   |  |                   |
 | applies config    |  |                   |  |                   |
 |  to the workers   |  |                   |  |                   |
 +-------------------+  +-------------------+  +-------------------+
@@ -63,7 +64,7 @@ unbound. The children inherit the sockets they serve.
  control socket         ---------->  control worker
  control.remote         ---------->  control worker
  metrics.address        ---------->  control worker
- ICMP sockets           ---------->  one per worker, for icmp health checks
+ ICMP sockets           ---------->  control worker, for icmp health checks
 ```
 
 On Linux this holds whether or not Keel started as root. On other platforms
@@ -189,11 +190,14 @@ See [Clustering](cluster.md).
 | State | Decided by | Seen by |
 |---|---|---|
 | Drain | an operator command, committed through Raft | every worker of every node |
-| Active health | health checks, run by every worker for itself | that worker |
+| Active health | health checks, run by the control worker | every worker of the node |
 | Passive ejection | real traffic failing to connect, per worker | that worker |
 
-Every worker probes every backend, so a backend receives one probe per
-worker per interval.
+The control worker probes each backend once per interval and writes the
+verdict into the shared memory region; workers read it when they pick a
+backend. A worker started later reads the current verdict. While the
+control worker is down the verdicts stay as they are, and a restarted one
+continues from them.
 
 ---
 

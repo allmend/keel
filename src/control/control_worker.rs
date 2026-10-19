@@ -45,6 +45,8 @@ pub struct Inherited {
     pub remote: Option<std::net::TcpListener>,
     pub metrics: std::net::TcpListener,
     pub master: std::os::unix::net::UnixStream,
+    /// ICMP sockets for `icmp` health checks, opened by the master.
+    pub icmp: crate::health::icmp::IcmpSockets,
 }
 
 /// How often the workers are pinged for `keel_workers_unresponsive`.
@@ -72,7 +74,13 @@ pub fn run(cfg: Config, inherited: Inherited, force_new_cluster: bool) -> ! {
     std::process::exit(code)
 }
 
-async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: bool) -> Result<()> {
+async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluster: bool) -> Result<()> {
+    // The node's only prober. Its pools are the master's copy, the config the
+    // workers run; health checks change with a restart.
+    crate::metrics::init_prober();
+    crate::health::icmp::init(std::mem::take(&mut inherited.icmp));
+    let (health, probers) = crate::health::probers(&inherited_cfg);
+
     // Read afresh: a control worker the master restarts must start from the
     // files as they are now, not as they were when the master forked it.
     let cfg = match crate::config::load(&inherited_cfg.path) {
@@ -98,6 +106,11 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
             }
             let _ = tx.send(true);
         });
+    }
+
+    for prober in probers {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { pingora::services::background::BackgroundService::start(&prober, shutdown).await });
     }
 
     let state_dir = PathBuf::from(&cfg.keel.state_dir);
@@ -148,7 +161,8 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
     };
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
-    let dispatch = Dispatch::new(WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers), cluster.clone(), applied_rx);
+    let fanout = WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers).with_health(health);
+    let dispatch = Dispatch::new(fanout, cluster.clone(), applied_rx);
     {
         let server = ControlServer { listener: inherited.control_socket, dispatch: Arc::clone(&dispatch) };
         let mut shutdown = shutdown.clone();

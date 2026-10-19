@@ -3,7 +3,6 @@ use crate::{
     backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
     cache::CacheHandle,
     config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, Protocol, VhostCacheConfig},
-    health,
     tls::CertStore,
     vhost::RoutingTable,
 };
@@ -735,15 +734,12 @@ pub struct WorkerSockets {
     pub tcp: Vec<(String, std::os::fd::RawFd)>,
     /// config address → this worker's socket of the SO_REUSEPORT group.
     pub udp: HashMap<String, std::net::UdpSocket>,
-    /// ICMP datagram sockets for `icmp` health checks (master-opened).
-    pub icmp4: Option<std::net::UdpSocket>,
-    pub icmp6: Option<std::net::UdpSocket>,
     /// Private unix socket path used to pass the TCP fds to Pingora.
     pub upgrade_sock: String,
 }
 
 // Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
-fn resolve_addr(addr: &str) -> anyhow::Result<String> {
+pub(crate) fn resolve_addr(addr: &str) -> anyhow::Result<String> {
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Ok(addr.to_owned());
     }
@@ -854,24 +850,15 @@ impl pingora::services::background::BackgroundService for EjectionSweeper {
     }
 }
 
-/// Register one health-check service per pool that configures one, plus the
-/// passive-ejection sweeper.
+/// Pools with a health check follow the control worker's verdicts; the
+/// passive-ejection sweeper runs in every worker.
 fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
     if cfg.pools.values().any(|p| p.passive.enabled) {
         server.add_service(background_service("passive-sweep", EjectionSweeper { pools: Arc::clone(pools) }));
     }
     for (name, pool_cfg) in &cfg.pools {
-        let Some(hc) = &pool_cfg.health_check else { continue };
-        let addrs: Vec<String> =
-            pools.backends_for_pool(name).into_iter().map(|b| b.address).collect();
-        match health::HealthService::build(hc, name, &addrs, Arc::clone(pools)) {
-            Ok(svc) => {
-                server.add_service(background_service(&format!("hc:{name}"), svc));
-            }
-            Err(e) => {
-                error!(pool = name, error = %e, "health: cannot build check");
-                std::process::exit(1);
-            }
+        if pool_cfg.health_check.is_some() {
+            pools.mark_checked(name);
         }
     }
 }
@@ -1021,9 +1008,6 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     let mut server = new_server(cfg, inherited.as_ref());
     send_inherited_fds(inherited.as_ref());
     server.bootstrap();
-    if let Some(w) = inherited.as_mut() {
-        crate::health::icmp::init(crate::health::icmp::IcmpSockets { v4: w.icmp4.take(), v6: w.icmp6.take() });
-    }
 
     let pools = match build_pools(cfg) {
         Ok(p) => Arc::new(p),
