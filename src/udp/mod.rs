@@ -136,6 +136,28 @@ impl FlowStats {
     }
 }
 
+/// Datagrams dropped without a flow (no backend, flow limit), per reason,
+/// since the last flush. Logged as one entry per reason per second: a flood
+/// against a dead pool would otherwise write one line per datagram.
+#[derive(Default)]
+struct Drops(HashMap<&'static str, Dropped>);
+
+struct Dropped {
+    datagrams: u64,
+    bytes: u64,
+    last_client: SocketAddr,
+    since: Instant,
+}
+
+impl Drops {
+    fn add(&mut self, reason: &'static str, client: SocketAddr, bytes: usize, now: Instant) {
+        let d = self.0.entry(reason).or_insert(Dropped { datagrams: 0, bytes: 0, last_client: client, since: now });
+        d.datagrams += 1;
+        d.bytes += bytes as u64;
+        d.last_client = client;
+    }
+}
+
 /// One client `ip:port` pinned to one backend. Dropped (with the reply task
 /// aborted) when the flow ends.
 struct Flow {
@@ -148,15 +170,16 @@ struct Flow {
 
 impl UdpProxyService {
     /// Open a flow for `client`: select a backend, connect an upstream socket,
-    /// and start the reply task. `None` means the datagram is dropped; the
-    /// reason is logged and counted.
+    /// and start the reply task. `Err` means the datagram is dropped:
+    /// `Some(reason)` for the caller to log with the other drops, `None` when
+    /// it is logged already.
     async fn open_flow(
         &self,
         downstream: &Arc<UdpSocket>,
         client: SocketAddr,
         reply_to: SocketAddr,
         now: Instant,
-    ) -> Option<Flow> {
+    ) -> Result<Flow, Option<&'static str>> {
         // The client address doubles as the consistent-hash key, as for TCP.
         let key = client.to_string();
         let Some(backend) = self.pools.select(&self.pool, key.as_bytes()) else {
@@ -164,8 +187,7 @@ impl UdpProxyService {
             // access log and keel_udp_errors_total carry the signal.
             debug!(pool = self.pool, listener = self.listener, "udp: no healthy backend");
             crate::metrics::record_udp_error(&self.pool, "no_backend");
-            self.log(client, None, &FlowStats::new(now), Some("no_backend"));
-            return None;
+            return Err(Some("no_backend"));
         };
 
         let upstream = async {
@@ -181,12 +203,12 @@ impl UdpProxyService {
                 self.pools.release(&self.pool, backend);
                 crate::metrics::record_udp_error(&self.pool, "upstream_bind");
                 self.log(client, Some(backend), &FlowStats::new(now), Some("upstream_bind"));
-                return None;
+                return Err(None);
             }
         };
 
         // A selected backend is always in the registry.
-        let counters = *self.pools.series(&self.pool, backend)?.udp();
+        let counters = *self.pools.series(&self.pool, backend).ok_or(None)?.udp();
         counters.flow();
         let stats = Arc::new(FlowStats::new(now));
         let reply_task = tokio::spawn(reply_loop(
@@ -200,7 +222,7 @@ impl UdpProxyService {
             Arc::clone(&self.pools),
         ));
         debug!(pool = self.pool, client = %client, backend = %backend, "udp: flow opened");
-        Some(Flow { backend, upstream, stats, counters, reply_task })
+        Ok(Flow { backend, upstream, stats, counters, reply_task })
     }
 
     /// Forward one datagram, opening a flow for an unknown client first.
@@ -212,6 +234,7 @@ impl UdpProxyService {
         &self,
         downstream: &Arc<UdpSocket>,
         flows: &mut HashMap<SocketAddr, Flow>,
+        drops: &mut Drops,
         client: SocketAddr,
         reply_to: SocketAddr,
         data: &[u8],
@@ -238,13 +261,18 @@ impl UdpProxyService {
                     // working.
                     debug!(pool = self.pool, listener = self.listener, client = %client, flows = open, "udp: flow limit reached, datagram dropped");
                     crate::metrics::record_udp_error(&self.pool, "flow_limit");
-                    // The other three drop paths log; an operator investigating
-                    // dropped traffic reads the access log, not just Prometheus.
-                    self.log(client, None, &FlowStats::new(now), Some("flow_limit"));
+                    drops.add("flow_limit", client, data.len(), now);
                     return;
                 }
-                let Some(flow) = self.open_flow(downstream, client, reply_to, now).await else { return };
-                e.insert(flow)
+                match self.open_flow(downstream, client, reply_to, now).await {
+                    Ok(flow) => e.insert(flow),
+                    Err(reason) => {
+                        if let Some(reason) = reason {
+                            drops.add(reason, client, data.len(), now);
+                        }
+                        return;
+                    }
+                }
             }
         };
         match flow.upstream.send(data).await {
@@ -277,6 +305,28 @@ impl UdpProxyService {
             error = error.unwrap_or("none"),
             "udp: flow closed"
         );
+    }
+
+    /// One entry per drop reason: `packets_in` and `bytes_in` are what was
+    /// dropped since the last one, `client_addr` the last client.
+    fn log_drops(&self, drops: &mut Drops) {
+        let now = Instant::now();
+        for (reason, d) in drops.0.drain() {
+            self.access_logger.log_udp(&UdpLogEntry {
+                timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                r#type: "udp",
+                client_addr: d.last_client.to_string(),
+                listener: self.listener.clone(),
+                pool: self.pool.clone(),
+                backend_addr: None,
+                bytes_in: d.bytes,
+                bytes_out: 0,
+                packets_in: d.datagrams,
+                packets_out: 0,
+                duration_ms: now.saturating_duration_since(d.since).as_secs_f64() * 1000.0,
+                error: Some(reason.to_owned()),
+            });
+        }
     }
 
     fn log(&self, client: SocketAddr, backend: Option<SocketAddr>, stats: &FlowStats, error: Option<&str>) {
@@ -319,6 +369,7 @@ impl BackgroundService for UdpProxyService {
         );
 
         let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
+        let mut drops = Drops::default();
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut reaper = tokio::time::interval(REAPER_INTERVAL);
         reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -332,11 +383,13 @@ impl BackgroundService for UdpProxyService {
                         for (client, flow) in flows.drain() {
                             self.close_flow(client, flow, Some("shutdown"));
                         }
+                        self.log_drops(&mut drops);
                         info!(address = self.listener, pool = self.pool, "udp: listener stopped");
                         return;
                     }
                 }
                 _ = reaper.tick() => {
+                    self.log_drops(&mut drops);
                     let now = Instant::now();
                     let ended: Vec<SocketAddr> = flows
                         .iter()
@@ -366,7 +419,7 @@ impl BackgroundService for UdpProxyService {
                             } else {
                                 (client, &buf[..n])
                             };
-                            self.handle_datagram(&downstream, &mut flows, client, peer, data).await
+                            self.handle_datagram(&downstream, &mut flows, &mut drops, client, peer, data).await
                         }
                         // Transient (e.g. ICMP surfaced on some platforms); the
                         // listener socket itself is not affected.

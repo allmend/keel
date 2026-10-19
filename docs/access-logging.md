@@ -139,7 +139,9 @@ One entry per flow, written when it ends:
 
 | Field | Notes |
 |---|---|
-| `backend_addr` | `null` with `no_backend` |
+| `backend_addr` | `null` with `no_backend` and `flow_limit` |
 | `packets_in`, `packets_out` | Datagrams from and to the client |
 | `duration_ms` | First datagram to expiry, so it includes `keel.udp_flow_timeout` |
-| `error` | `null` (expired), `no_backend` (one entry per dropped datagram), `upstream_bind`, `upstream_send`, `upstream_recv` (ICMP port-unreachable from the backend), `downstream_send`, `shutdown` |
+| `error` | `null` (expired), `no_backend`, `flow_limit`, `upstream_bind`, `upstream_send`, `upstream_recv` (ICMP port-unreachable from the backend), `downstream_send`, `shutdown` |
+
+Datagrams dropped without a flow, `no_backend` and `flow_limit`, are logged once a second per listener and reason: `packets_in` and `bytes_in` are the datagrams and bytes dropped in that time, `client_addr` the last client, and `duration_ms` the time since the first drop.

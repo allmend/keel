@@ -48,6 +48,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - An `http` health check counts any status from 200 to 399 as healthy, so
   a redirecting `path` passes; `expect_status = ["200-299"]` keeps the
   old rule. `expect_status` takes ranges: `[200, "204", "300-308"]`.
+- UDP datagrams dropped without a flow (`no_backend`, `flow_limit`) are
+  logged once a second per listener and reason, with the dropped
+  datagrams and bytes in `packets_in` and `bytes_in`: a flood against a
+  dead pool wrote one line per datagram.
 
 ### Added
 

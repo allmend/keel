@@ -144,3 +144,58 @@ fn a_pool_without_available_backends_answers_503_and_a_failed_upstream_502() -> 
     }
     Ok(())
 }
+
+// Nothing listens on port 9: the pool's only backend fails its check.
+const DEAD_UDP_CONFIG: &str = r#"
+listener "http" "0.0.0.0:80" {}
+
+listener "udp" "0.0.0.0:5353" {
+  pool = "dead"
+}
+
+access_log {
+  dir = "-"
+}
+
+pool "web" {
+  backend "172.29.86.21:80" {}
+}
+
+pool "dead" {
+  health_check "tcp" {
+    port                = 9
+    interval            = "1s"
+    unhealthy_threshold = 1
+  }
+
+  backend "172.29.86.21:53" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
+"#;
+
+#[test]
+#[ignore = "needs Docker"]
+fn a_udp_flood_against_a_dead_pool_logs_a_line_per_second() -> Result<()> {
+    let stack = Stack::up("udp-dead", EMPTY_COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", DEAD_UDP_CONFIG.to_owned())])?;
+    wait_until("the dead pool unhealthy", Duration::from_secs(60), || {
+        let out = stack.exec("keel", &["keel", "backend", "list", "--pool", "dead"])?;
+        Ok(String::from_utf8_lossy(&out.stdout).contains("unhealthy").then_some(()))
+    })?;
+    let flood = "for i in $(seq 2000); do printf x > /dev/udp/127.0.0.1/5353; done";
+    let out = stack.exec("keel", &["bash", "-c", flood])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    std::thread::sleep(Duration::from_secs(2));
+
+    let logs = stack.logs("keel")?;
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains(r#""error":"no_backend""#) && l.contains(r#""type":"udp""#)).collect();
+    let dropped: u64 = lines
+        .iter()
+        .map(|l| l.split(r#""packets_in":"#).nth(1).and_then(|r| r.split(',').next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0))
+        .sum();
+    assert_eq!(dropped, 2000, "every dropped datagram is in the log");
+    assert!(lines.len() <= 20, "{} lines for 2000 datagrams", lines.len());
+    Ok(())
+}

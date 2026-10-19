@@ -88,7 +88,7 @@ Every datagram of a flow reaches the flow's backend. Across flows, `consistent_h
 ## Behavior
 
 - A drained backend gets no new flows; open flows run until they expire, so a client that keeps sending keeps the drain open.
-- No available backend: the datagram is dropped, one `no_backend` log entry per datagram.
+- No available backend: the datagram is dropped. Drops are logged once a second per listener and reason (`no_backend`, `flow_limit`), however many datagrams a flood sends.
 - Shutdown ends every flow as `shutdown`.
 - Each flow holds its own upstream socket and local port. The ephemeral port range and the descriptor limit bound the flows to one backend; running out shows as `upstream_bind`.
 - On Linux the master binds one `SO_REUSEPORT` socket per worker; the kernel sends each client `ip:port` to one socket, so a flow stays on one worker. A replacement worker takes over its predecessor's socket. Elsewhere each worker binds its own.
