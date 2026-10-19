@@ -51,9 +51,16 @@ Versioning: [Semantic Versioning](https://semver.org/).
   exits 3 for them. See
   [Checking a configuration](docs/configuration.md#checking-a-configuration).
 - `--no-color` (or `NO_COLOR`) for every command.
+- `keel_pool_backends{pool, state}`: backends per pool that are available,
+  unhealthy, ejected or draining, counted at each scrape from the node's
+  view; the `KeelPoolNoAvailableBackend` alert rule in `contrib/` uses it.
 
 ### Fixed
 
+- A drained backend no worker holds a connection to is removed at once.
+  A worker without connections to it never marked it removed, so
+  `keel status` and `keel_backend_drain_state` showed a finished drain as
+  draining.
 - A worker that dies within 10s of starting is restarted after a delay, 1s
   doubling up to 30s, per worker index; one that ran longer is restarted at
   once. Workers that kept dying at start (a backend name that stopped

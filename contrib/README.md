@@ -28,7 +28,7 @@ dashboards link to each other and keep the selection.
 | `KeelWorkersMissing` | critical | Fewer workers run than configured for 2m |
 | `KeelWorkerRestarted` | warning | A worker was replaced in the last 10m |
 | `KeelMetricsSeriesDropped` | warning | The metrics region is full |
-| `KeelPoolNoAvailableBackend` | critical | Every active backend of a pool is unhealthy or ejected for 1m |
+| `KeelPoolNoAvailableBackend` | critical | No backend of a pool is available for 1m, unless the pool is being drained |
 | `KeelBackendUnhealthy` | warning | A backend fails its health check for 5m |
 | `KeelBackendEjectedRepeatedly` | warning | A backend is ejected 3 times in 15m |
 | `KeelBackendDrainStuck` | info | A drain still has connections after 30m |

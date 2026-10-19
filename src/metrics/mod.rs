@@ -594,8 +594,51 @@ fn render_from(region: &Region) -> String {
             }
         }
     }
+    render_pool_backends(&mut out, &merged);
     render_globals(&mut out, region);
     out
+}
+
+/// States a backend counts in, by precedence.
+const POOL_STATES: [&str; 4] = ["available", "unhealthy", "ejected", "draining"];
+
+/// `keel_pool_backends{pool, state}`, from the merged per-backend states:
+/// every backend not removed counts in exactly one state, `draining` before
+/// `unhealthy` before `ejected`. A backend any worker ejected counts as
+/// ejected, as `keel_backend_ejected` reads.
+fn render_pool_backends(out: &mut String, merged: &BTreeMap<u8, BTreeMap<Vec<u8>, Vec<u64>>>) {
+    // State cells hold value + 1; 0 is unset.
+    let state = |family: F, key: &[u8]| merged.get(&(family as u8)).and_then(|m| m.get(key)).map_or(0, |v| v[0]);
+    let mut pools: BTreeMap<&[u8], [u64; 4]> = BTreeMap::new();
+    for key in merged.get(&(F::BACKEND_DRAIN_STATE as u8)).into_iter().flat_map(BTreeMap::keys) {
+        let drain = state(F::BACKEND_DRAIN_STATE, key);
+        if drain == 0 {
+            continue;
+        }
+        let pool = key.split(|b| *b == 0).next().unwrap_or_default();
+        let counts = pools.entry(pool).or_default();
+        let slot = match (drain - 1, state(F::BACKEND_HEALTHY, key), state(F::BACKEND_EJECTED, key)) {
+            (2, _, _) => continue,
+            (1, _, _) => 3,
+            (_, 1, _) => 1,
+            (_, _, 2) => 2,
+            _ => 0,
+        };
+        counts[slot] += 1;
+    }
+    if pools.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "# HELP keel_pool_backends Backends per pool by state: available, unhealthy, ejected, draining\n# TYPE keel_pool_backends gauge"
+    );
+    for (pool, counts) in pools {
+        for (name, n) in POOL_STATES.iter().zip(counts) {
+            let labels = format!("{},state=\"{name}\"", label_text(&["pool"], pool));
+            sample(out, "keel_pool_backends", "", &labels, n);
+        }
+    }
 }
 
 fn render_globals(out: &mut String, region: &Region) {
@@ -749,6 +792,58 @@ mod tests {
         assert_eq!(line(&text, "keel_backend_healthy{"), Some(r#"keel_backend_healthy{pool="web",backend="a:1"} 0"#));
         assert_eq!(line(&text, "keel_backend_ejected{"), Some(r#"keel_backend_ejected{pool="web",backend="a:1"} 1"#));
         assert!(!text.contains("keel_backend_drain_state"), "no worker reported it");
+    }
+
+    /// `keel_pool_backends` of `pool` as [available, unhealthy, ejected, draining].
+    fn pool_counts(r: &Region, pool: &str) -> Vec<u64> {
+        let text = render_from(r);
+        POOL_STATES
+            .iter()
+            .map(|s| {
+                let l = line(&text, &format!("keel_pool_backends{{pool=\"{pool}\",state=\"{s}\"}}")).expect("emitted");
+                l.rsplit(' ').next().unwrap().parse().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backends_count_in_one_state_each_by_precedence() {
+        // Stripes 0 and 1 are workers, 2 the control worker's verdicts. States
+        // are stored as value + 1.
+        let r = region(3);
+        let drain = add(&r, F::BACKEND_DRAIN_STATE, &["web", "a:1"], &[1, 1, 0]);
+        let ejected = add(&r, F::BACKEND_EJECTED, &["web", "a:1"], &[1, 1, 0]);
+        add(&r, F::BACKEND_DRAIN_STATE, &["web", "b:1"], &[1, 1, 0]);
+        // A pool without a health check has no verdicts: available.
+        assert_eq!(pool_counts(&r, "web"), [2, 0, 0, 0]);
+
+        // Ejected by one worker only: ejected.
+        r.cell(1, ejected).store(2, Ordering::Relaxed);
+        assert_eq!(pool_counts(&r, "web"), [1, 0, 1, 0]);
+
+        // Failing its check: unhealthy, before ejected.
+        let verdict = add(&r, F::BACKEND_HEALTHY, &["web", "a:1"], &[0, 0, 1]);
+        assert_eq!(pool_counts(&r, "web"), [1, 1, 0, 0]);
+
+        // Draining in every worker: draining, before unhealthy.
+        r.cell(0, drain).store(2, Ordering::Relaxed);
+        r.cell(1, drain).store(2, Ordering::Relaxed);
+        assert_eq!(pool_counts(&r, "web"), [1, 0, 0, 1]);
+
+        // Removed in every worker: not counted, the pool still is.
+        r.cell(0, drain).store(3, Ordering::Relaxed);
+        r.cell(1, drain).store(3, Ordering::Relaxed);
+        assert_eq!(pool_counts(&r, "web"), [1, 0, 0, 0]);
+
+        // Recovered and re-admitted: available again.
+        r.cell(0, drain).store(1, Ordering::Relaxed);
+        r.cell(1, drain).store(1, Ordering::Relaxed);
+        r.cell(2, verdict).store(2, Ordering::Relaxed);
+        r.cell(1, ejected).store(1, Ordering::Relaxed);
+        assert_eq!(pool_counts(&r, "web"), [2, 0, 0, 0]);
+        // One worker still sends it new connections: not drained yet.
+        r.cell(0, drain).store(2, Ordering::Relaxed);
+        assert_eq!(pool_counts(&r, "web"), [2, 0, 0, 0]);
     }
 
     #[test]

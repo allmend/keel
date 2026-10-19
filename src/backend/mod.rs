@@ -82,6 +82,14 @@ impl BackendEntry {
         }
     }
 
+    /// Stop new connections; a backend this worker holds no connection to is
+    /// removed at once, as no release will come to remove it later.
+    fn start_drain(&self) {
+        let state = if self.connections.load(Ordering::Acquire) > 0 { DRAIN_DRAINING } else { DRAIN_REMOVED };
+        self.drain_state.store(state, Ordering::Release);
+        self.series.set_drain_state(state);
+    }
+
     /// One more connection to this backend.
     fn acquire(&self) {
         self.connections.fetch_add(1, Ordering::Relaxed);
@@ -287,19 +295,6 @@ impl PoolRegistry {
         }
     }
 
-    /// Initiate drain for a backend. Returns false if the backend was not found.
-    #[allow(dead_code)]
-    pub fn drain_backend(&self, pool_name: &str, addr: SocketAddr) -> bool {
-        if let Some(entry) = self.entry(pool_name, addr) {
-            entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-            entry.series.set_drain_state(DRAIN_DRAINING);
-            tracing::info!(pool = pool_name, backend = %addr, "drain initiated");
-            true
-        } else {
-            false
-        }
-    }
-
     /// Re-activate a backend (re-add after drain).
     #[allow(dead_code)]
     pub fn activate_backend(&self, pool_name: &str, addr: SocketAddr) -> bool {
@@ -374,8 +369,7 @@ impl PoolRegistry {
         let mut found = Vec::new();
         for (pool, entry) in self.entries() {
             if entry.label == addr {
-                entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-                entry.series.set_drain_state(DRAIN_DRAINING);
+                entry.start_drain();
                 tracing::info!(pool, backend = addr, "control: drain initiated");
                 found.push(pool.to_owned());
             }
@@ -407,8 +401,7 @@ impl PoolRegistry {
             for entry in entries.clone() {
                 let gone = !configured.contains(entry.config_address.as_str());
                 if gone && entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
-                    entry.drain_state.store(DRAIN_DRAINING, Ordering::Release);
-                    entry.series.set_drain_state(DRAIN_DRAINING);
+                    entry.start_drain();
                     tracing::info!(
                         pool = pool_name,
                         backend = entry.label,
@@ -636,8 +629,27 @@ mod tests {
         );
         assert_eq!(
             reg.drain["web"][&"127.0.0.2:8080".parse().unwrap()].drain_state.load(Ordering::Relaxed),
-            DRAIN_DRAINING
+            DRAIN_REMOVED,
+            "no connection open: removed at once"
         );
+    }
+
+    #[test]
+    fn a_drain_with_open_connections_ends_with_the_last_one() {
+        let reg = registry_of(["127.0.0.8:1", "127.0.0.8:2"], Duration::from_secs(60));
+        let a: SocketAddr = "127.0.0.8:1".parse().unwrap();
+        let state = |reg: &PoolRegistry| reg.drain["p"][&a].drain_state.load(Ordering::Relaxed);
+        reg.drain["p"][&a].acquire();
+        reg.drain["p"][&a].acquire();
+        assert_eq!(reg.drain_by_address("127.0.0.8:1"), ["p"]);
+        assert_eq!(state(&reg), DRAIN_DRAINING);
+        reg.release("p", a);
+        assert_eq!(state(&reg), DRAIN_DRAINING);
+        reg.release("p", a);
+        assert_eq!(state(&reg), DRAIN_REMOVED);
+        // Drained with nothing open: removed at once.
+        assert_eq!(reg.drain_by_address("127.0.0.8:2"), ["p"]);
+        assert_eq!(reg.drain["p"][&"127.0.0.8:2".parse().unwrap()].drain_state.load(Ordering::Relaxed), DRAIN_REMOVED);
     }
 
     #[test]

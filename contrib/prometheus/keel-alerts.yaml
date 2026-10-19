@@ -49,23 +49,19 @@ groups:
 
   - name: keel-backends
     rules:
-      # A backend is available when it is active, not unhealthy and not
-      # ejected. A pool with backends but none available answers 503.
+      # A pool with backends but none available answers 503. A pool being
+      # drained on purpose does not count.
       - alert: KeelPoolNoAvailableBackend
         expr: |
-          count by (instance, pool) (keel_backend_drain_state == 0)
-          unless on (instance, pool)
-          count by (instance, pool) (
-            (keel_backend_drain_state == 0)
-            unless on (instance, pool, backend) (keel_backend_healthy == 0)
-            unless on (instance, pool, backend) (keel_backend_ejected == 1)
-          )
+          keel_pool_backends{state="available"} == 0
+          and on (instance, pool)
+          sum without (state) (keel_pool_backends{state!="draining"}) > 0
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Pool {{ $labels.pool }} on {{ $labels.instance }} has no available backend"
-          description: "Every active backend is unhealthy or ejected. HTTP requests to the pool get 503, TCP connections are closed and UDP datagrams dropped."
+          description: "Every backend not being drained is unhealthy or ejected. HTTP requests to the pool get 503, TCP connections are closed and UDP datagrams dropped."
 
       - alert: KeelBackendUnhealthy
         expr: keel_backend_healthy == 0

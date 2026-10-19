@@ -64,6 +64,33 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 | `keel_backend_ejections_total` | counter | `pool`, `backend` | Passive ejections |
 | `keel_proxy_protocol_errors_total` | counter | `listener` | Connections or datagrams rejected for a missing or malformed PROXY protocol header |
 
+## Backends per pool
+
+`keel_pool_backends{pool, state}` — gauge, computed at each scrape from the node's view of every backend. Each backend that is not removed counts in exactly one state; the four values add up to the pool's backends. All four are emitted for every pool, zeros included.
+
+| `state` | Backend |
+|---|---|
+| `draining` | Being drained (by command, or removed from the config by a reload) |
+| `unhealthy` | Failing its health check |
+| `ejected` | Ejected by passive detection in at least one worker |
+| `available` | Gets new connections |
+
+A backend in several states counts in the first that applies, in this order. A pool without a health check has no `unhealthy` backends. A drained backend is removed, and no longer counted, when no worker holds a connection to it.
+
+Share of a pool's backends taking traffic, for a traffic-light panel:
+
+```promql
+keel_pool_backends{state="available"}
+  / ignoring(state) sum without(state) (keel_pool_backends)
+```
+
+The same, leaving planned drains out:
+
+```promql
+keel_pool_backends{state="available"}
+  / ignoring(state) sum without(state) (keel_pool_backends{state!="draining"})
+```
+
 ## TCP (L4) metrics
 
 | Metric | Type | Labels | Meaning |

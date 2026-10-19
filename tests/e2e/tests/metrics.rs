@@ -117,3 +117,55 @@ fn one_endpoint_counts_every_worker_and_outlives_a_killed_one() -> Result<()> {
     assert_eq!(sample(&stack, r#"keel_active_connections{pool="web",backend="172.29.87.20:80"}"#)?, 0.0);
     Ok(())
 }
+
+// `spare` has nothing listening: its check fails.
+const POOLS_CONFIG: &str = r#"
+listener "http" "0.0.0.0:80" {}
+
+pool "web" {
+  backend "172.29.87.20:80" {}
+}
+
+pool "spare" {
+  health_check "tcp" {
+    interval            = "1s"
+    unhealthy_threshold = 1
+  }
+
+  backend "172.29.87.20:81" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
+"#;
+
+fn pool_backends(stack: &Stack, pool: &str, state: &str) -> Result<f64> {
+    sample(stack, &format!(r#"keel_pool_backends{{pool="{pool}",state="{state}"}}"#))
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn backends_per_pool_by_state() -> Result<()> {
+    let stack = Stack::up("pool-backends", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", POOLS_CONFIG.to_owned())])?;
+    wait_until("spare unhealthy", Duration::from_secs(60), || {
+        Ok((pool_backends(&stack, "spare", "unhealthy").ok() == Some(1.0)).then_some(()))
+    })?;
+    for state in ["available", "ejected", "draining"] {
+        assert_eq!(pool_backends(&stack, "spare", state)?, 0.0, "spare {state}");
+    }
+    assert_eq!(pool_backends(&stack, "web", "available")?, 1.0);
+
+    // Drained with no connections open: removed at once, and no longer counted.
+    let out = stack.exec("keel", &["keel", "backend", "drain", "172.29.87.20:80"])?;
+    assert!(out.status.success(), "drain: {}", String::from_utf8_lossy(&out.stderr));
+    wait_until("web drained", Duration::from_secs(10), || {
+        let counts: Vec<f64> = ["available", "unhealthy", "ejected", "draining"]
+            .iter()
+            .map(|s| pool_backends(&stack, "web", s))
+            .collect::<Result<_>>()?;
+        Ok((counts == [0.0; 4]).then_some(()))
+    })?;
+    assert_eq!(sample(&stack, r#"keel_backend_drain_state{pool="web",backend="172.29.87.20:80"}"#)?, 2.0, "removed");
+    Ok(())
+}
