@@ -18,7 +18,7 @@ Both are [HCL](https://github.com/hashicorp/hcl/blob/main/hclsyntax/spec.md), na
 | `pool "<name>"` | config directory | Backend pools with health checks and load balancing | [Load balancing](load-balancing.md), [Health checks](health-checks.md) |
 | `vhost "<host>"` | config directory | Virtual host routing rules, TLS, cache rules | [Virtual hosts](virtual-hosts.md) |
 | `acme` | config directory | ACME issuers: directory, contact | [ACME](acme.md) |
-| `certificate "<host>"` | config directory | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-for-tcp--tls-passthrough-backends) |
+| `certificate "<host>"` | config directory | Certificates obtained or loaded without a vhost, for TCP listeners and backends | [ACME](acme.md#certificates-without-a-vhost) |
 | `locals` | both | Named values to refer to as `local.<name>` | [below](#locals) |
 
 A block in the wrong file is a load error naming the block and where it belongs.
@@ -150,7 +150,7 @@ One block per port and protocol. The labels are the protocol and the address:
 | `tcp` | Raw TCP to a pool. See [TCP proxying](tcp-proxying.md) |
 | `udp` | Datagrams to a pool. See [UDP proxying](udp-proxying.md) |
 
-On Linux the master binds every listener — TCP and UDP — before forking the workers, and the workers inherit the sockets (after dropping to `keel.user` when started as root). Workers never need the capability to bind ports below 1024, and every worker accepts on the same socket whether or not Keel started as root. On other platforms each worker binds its own listeners with `SO_REUSEPORT`.
+On Linux the master binds every listener before forking, and the workers inherit the sockets: ports below 1024 need root in the master only, and every worker accepts on the same socket. Elsewhere each worker binds its own with `SO_REUSEPORT`.
 
 ```hcl
 listener "http" "0.0.0.0:80" {}
@@ -180,7 +180,7 @@ listener "tcp" "0.0.0.0:53" {
 |---|---|---|---|
 | `pool` | string | none | `tcp` and `udp`: the pool to forward to; required. Refused on `http` and `https`, which route by vhost |
 | `proxy_protocol` | bool | `false` | Expect a PROXY protocol v1/v2 header from the load balancer in front and take the client address from it. Every protocol. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
-| `tls_mode` | string | `passthrough` | `tcp` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-handling--three-modes) |
+| `tls_mode` | string | `passthrough` | `tcp` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-modes) |
 | `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificate` block or a vhost with `tls`, served when the client's SNI has no certificate of its own |
 | `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's configured hostname |
 | `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs. A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
@@ -189,7 +189,7 @@ listener "tcp" "0.0.0.0:53" {
 
 For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and hands each worker its own; a replacement worker takes over the socket of the one it replaces.
 
-The worker passes its inherited TCP sockets to Pingora over a private Unix socket, `upgrade-<index>.sock` in a `workers/` subdirectory of the `keel.control_socket` directory (the worker's own control socket, `worker-<index>.sock`, lives there too). The master creates that subdirectory and assigns it to `keel.user` before forking, keeping the parent directory — which holds the instance control socket — root-owned. Pingora polls for the hand-off once a second and logs `No incoming socket transfer, sleep 1s and try again` at error level once per worker while it waits; the worker's next line, `handed inherited listeners to pingora`, confirms the transfer. Workers therefore start serving about one second after the master forks them.
+Each worker hands its inherited TCP sockets to Pingora over `workers/upgrade-<index>.sock` beside the control socket. Pingora checks for them once a second and logs `No incoming socket transfer, sleep 1s and try again` once per worker meanwhile; `handed inherited listeners to pingora` follows. Workers serve about one second after the fork.
 
 Changing listeners requires a process restart.
 

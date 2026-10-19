@@ -1,6 +1,6 @@
 # Security
 
-This page describes the security properties of Keel's proxy and cluster code: what each measure is and what it protects against.
+What each measure is and what it protects against.
 
 ---
 
@@ -10,13 +10,7 @@ The join handshake between a new node and the member it joins through runs over 
 
 Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. The key is derived from the shared secret (`SHA-256("keel-cluster-join-v1\0" + secret)`), and each message uses a fresh random nonce. The secret itself is never sent on the wire; successful decryption on the receiving side proves the peer holds it. A peer without the secret cannot read a captured exchange or forge a join request or response.
 
-A captured exchange can still be brute-forced offline against a low-entropy secret, so use a high-entropy token:
-
-```bash
-openssl rand -hex 32    # for cluster.secret in node.hcl
-```
-
-See [Cluster](cluster.md) for the full join flow.
+A captured exchange can be brute-forced offline against a low-entropy secret; `openssl rand -hex 32` gives a strong one.
 
 ---
 
@@ -30,15 +24,13 @@ Every member holds the cluster CA key, in memory and in its Raft store, so any m
 
 ## Peers require a shared secret
 
-A `node.hcl` with a `cluster` block and no non-empty `cluster.secret` is a load error. A node without the block opens no peer port.
-
-Without it, the join listener would issue a CA-signed mTLS identity to any peer that can reach the cluster port, granting that peer full cluster membership.
+A `cluster` block without a non-empty `secret` is a load error: the join listener would otherwise give cluster membership to any peer that reaches the port. A node without the block opens no peer port.
 
 ---
 
 ## Bounded cluster RPC reads
 
-The cluster port uses a length-prefixed wire protocol. Every length-prefixed read is capped before allocation; frames above the limit are rejected and the connection is dropped. A remote peer cannot drive large allocations by claiming an arbitrary size in the 4-byte length header.
+Every length-prefixed read on the cluster port is capped before allocation; a larger frame drops the connection. A peer cannot force large allocations through the length header.
 
 | Channel | Limit |
 |---|---|
@@ -49,20 +41,16 @@ The cluster port uses a length-prefixed wire protocol. Every length-prefixed rea
 
 ## Host header bounded before use
 
-Requests are mapped to a bounded, operator-configured vhost label before anything is logged or recorded: the exact configured host, `"*"` if only a wildcard vhost matches, or `"unmatched"`. The raw client-supplied `Host` header never reaches the filesystem or the metrics registry, and the access logger sanitizes the label to filesystem-safe characters as a second line of defense.
-
-This bounds three things that would otherwise be driven by a crafted header: access-log filenames (no path traversal, e.g. `Host: ../../etc/cron.d/x`), the number of log files created (no file-descriptor or inode exhaustion), and metric label cardinality.
-
-The original `Host` value is still forwarded upstream in `X-Forwarded-Host`, so backends see what the client sent. Only Keel's internal keys are bounded.
+Logs and metrics use the configured vhost name (`"*"`, a wildcard, or `"unmatched"`), never the client's `Host` header, and the access logger also sanitizes it to filesystem-safe characters. A crafted header cannot choose log file names (`Host: ../../etc/cron.d/x`), create files without bound, or add metric labels. Backends still get the original in `X-Forwarded-Host`.
 
 ---
 
 ## Metrics endpoint
 
-Metrics expose backend addresses, pool and vhost names, and traffic volumes. Access is restricted by default to limit what this reveals about the infrastructure.
+Metrics expose backend addresses, pool and vhost names, and traffic volumes.
 
-- The default bind is `127.0.0.1:10790`. To scrape from another host, set `metrics.address: 0.0.0.0:10790` and firewall the port, or run a local scrape agent against loopback.
-- Only `GET /metrics` is served. Any other method or path returns `404`.
+- The default bind is `127.0.0.1:10790`.
+- Only `GET /metrics` is served; anything else gets `404`.
 
 ---
 
@@ -70,21 +58,21 @@ Metrics expose backend addresses, pool and vhost names, and traffic volumes. Acc
 
 The remote control listener (`control.remote`, for [keelctl](keelctl.md)) accepts only clients presenting a certificate signed by the control CA. A connection without one fails at the TLS handshake. There is no password mode and no plaintext mode.
 
-The control CA, private key included, is replicated through the Raft log so every node authenticates the same keelconfigs. The log travels only over the cluster's mTLS mesh and is stored in each node's Raft store under `keel.state_dir`; on each node the key is also written to `control/ca.key` under `keel.state_dir` with mode 0600, the same as a locally generated one. Any node can therefore issue operator credentials, which is the intended property: a node with control-plane access is already trusted with the whole cluster's configuration.
+The control CA, key included, is replicated through Raft (over mTLS), kept in each node's Raft store and written to `control/ca.key` (0600) in `keel.state_dir`. Every node accepts the same keelconfigs and can issue them.
 
-The optional `allow:` list additionally restricts accepted source CIDRs. Source addresses are not reliable behind NAT or a Kubernetes Service, so the restriction narrows exposure but does not replace mTLS.
+`allow` restricts source CIDRs on top of mTLS; source addresses are unreliable behind NAT or a Kubernetes Service.
 
-Every remote command is audit-logged with the client certificate's CN and source address. To invalidate all issued credentials, run `keel credentials revoke-all`: the control CA is replaced — on every node of a cluster — and every existing keelconfig stops working.
+Every remote command is logged with the certificate CN and source address. `keel credentials revoke-all` replaces the control CA on every node; every issued keelconfig stops working.
 
 ---
 
 ## Control socket permissions
 
-Anyone who can open the control socket controls the proxy: draining backends, pushing config to the whole cluster.
+Whoever opens the control socket controls the node and can push config to the cluster.
 
-The master binds the socket as root, gives it to `keel.control_user` and that user's primary group, and sets `0660`. Operators reach it through that group; workers are not in it. If the ownership or mode cannot be applied, the master does not start.
+The master binds it as root, gives it to `keel.control_user` and that user's primary group, mode `0660`; workers are not in the group. If that fails, the master does not start.
 
-The directory holding it is owned by root, mode `0755`. Write permission on a directory allows unlinking its entries, so a worker-writable directory would let a compromised worker remove the socket, bind its own in that path, and answer operator commands. The workers create their sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory owned by `keel.user`, mode `0750`. The control worker reaches them through its membership of `keel.group`.
+Its directory is root's, mode `0755`: a worker cannot unlink the socket and put its own in its place. The workers create their sockets — `worker-<index>.sock` and the Pingora fd hand-off `upgrade-<index>.sock` — in a `workers/` subdirectory owned by `keel.user`, mode `0750`. The control worker reaches them through its membership of `keel.group`.
 
 Every control connection's request line is capped (64 MiB, enough for a config push), and the `control.remote` listener serves at most 64 connections at a time, handshakes included.
 
@@ -111,19 +99,19 @@ Workers get what they serve from the control worker over their sockets: the appl
 | `keel.config_dir` (`/etc/keel/config`) | `keel.control_user` | `0700` |
 | `access_log.dir` | `keel.user` | as found |
 
-A directory is chowned only when its owner is not already the right user, e.g. a new directory or a root-owned volume; a group set afterwards is kept. A state or config directory an earlier version gave to `keel.user` moves to `keel.control_user` at the next start. A read-only config directory (a mounted ConfigMap) is served from; writing applied versions back to it fails and is logged.
+A directory is chowned only when its owner is not the right user (a new directory, a root-owned volume); a group set afterwards is kept. A read-only config directory (a mounted ConfigMap) is served from; writing applied versions back to it fails and is logged.
 
 ---
 
 ## Minimum TLS 1.2 on proxy listeners
 
-Every TLS listener sets a TLS 1.2 floor and rejects TLS 1.0/1.1 handshakes. This applies to all proxy listeners. Cluster-internal mTLS uses modern defaults as well.
+Every TLS listener rejects TLS 1.0 and 1.1.
 
 ---
 
 ## Corrupt Raft snapshots surface as errors
 
-A Raft snapshot that fails to deserialize is returned as a storage error and surfaces to the operator. It is not silently replaced with an empty state, so a corrupt or tampered snapshot cannot wipe the replicated config and drain map unnoticed.
+A Raft snapshot that does not deserialize is a storage error, never an empty state: a corrupt snapshot cannot silently wipe the replicated config and drains.
 
 ---
 
@@ -139,17 +127,10 @@ Files that can hold a private key are `0600` in a `0700` directory:
 | `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys, ACME account keys |
 | the config directory | keys the config names by relative path |
 
-Exclude these from backups, or back them up as secrets. `/etc/keel/node.hcl` can hold the cluster secret; Keel never writes it.
-
-Ownership of these directories: [Processes and what each can read](#processes-and-what-each-can-read).
+`/etc/keel/node.hcl` can hold the cluster secret; Keel never writes it.
 
 ---
 
-## Operator checklist
+## Users
 
-| Requirement | Action |
-|---|---|
-| Peers need a secret | Set `cluster.secret` in `node.hcl`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
-| Metrics bind to loopback by default | To scrape from another host, set `metrics.address: 0.0.0.0:10790` explicitly and firewall the port. |
-| Two users | Startup fails if `keel.user`, `keel.group` or `keel.control_user` (default `keel-control`) cannot be resolved. Create them, e.g. `useradd --system keel-control`. |
-| All cluster nodes must speak the same join protocol | Run the same Keel build across the cluster when joining nodes. |
+Started as root, Keel needs `keel.user`, `keel.group` and `keel.control_user` (default `keel-control`) to exist; otherwise it does not start.

@@ -1,8 +1,6 @@
 # Access Logging
 
-Keel writes one NDJSON access log file per virtual host. Each line is a complete JSON object representing a single HTTP request.
-
-## Configuration
+One NDJSON line per HTTP request, TCP connection or UDP flow, in one file per vhost or pool.
 
 ```hcl
 access_log {
@@ -13,33 +11,23 @@ access_log {
 
 | Attribute | Default | Notes |
 |---|---|---|
-| `enabled` | `true` | Set to `false` to disable access logging entirely |
-| `dir` | `/var/log/keel` | Directory for log files; set to `-` for stdout |
+| `enabled` | `true` | |
+| `dir` | `/var/log/keel` | Absolute directory, or `-` for stdout |
 
-Access logging is enabled by default. Set `dir = "-"` to write all access logs to stdout instead of files.
+With `dir = "-"` every entry goes to stdout, and Keel's own log stays on stderr.
 
----
+## Files
 
-## File layout
+| Traffic | File |
+|---|---|
+| HTTP | `access_<vhost>.log`; entries with an `error` also in `error_<vhost>.log` |
+| HTTP answered by Keel itself, unrouted | `access_unknown.log`, `error_unknown.log` |
+| TCP | `access_tcp_<pool>.log` |
+| UDP | `access_udp_<pool>.log` |
 
-Log files are created in `dir` when the first request arrives for each vhost. The filename uses the vhost hostname:
+A file is created with its first entry. Each worker opens it once and keeps it open; Keel never reopens or rotates it. With logrotate, use `copytruncate` (files are opened for append).
 
-```
-/var/log/keel/access_api.example.com.log
-/var/log/keel/access_app.example.com.log
-```
-
-Files are named with a sortable prefix (`access_`) followed by the vhost hostname. This makes them easy to list, grep, and feed to logrotate.
-
-Requests whose entry has a non-null `error` are written a second time to `error_<vhost>.log` in the same directory.
-
-Keel does not rotate log files itself. Each worker opens a file on its first entry and keeps it open for the life of the process; neither a reload nor a signal reopens it. After logrotate renames a file, Keel keeps writing to the renamed file. Use logrotate's `copytruncate` (the files are opened in append mode), or restart Keel after rotation.
-
----
-
-## Log format
-
-One JSON object per line (NDJSON). Example:
+## HTTP
 
 ```json
 {
@@ -62,74 +50,33 @@ One JSON object per line (NDJSON). Example:
 }
 ```
 
----
-
-## Field reference
-
-| Field | Type | Notes |
-|---|---|---|
-| `timestamp` | string | ISO 8601, millisecond precision, UTC |
-| `method` | string | HTTP method: `GET`, `POST`, etc. |
-| `uri` | string | Full path including query string |
-| `protocol` | string | `HTTP/1.1`, `HTTP/2.0` |
-| `status` | integer | Backend response status code; `0` if no response was sent |
-| `client_addr` | string | Client IP and port (`ip:port`) |
-| `vhost` | string | Matched virtual host hostname |
-| `pool` | string | Backend pool that handled the request |
-| `backend_addr` | string or null | Selected backend address; `null` if no backend was chosen |
-| `bytes_in` | integer | Request body bytes received from client |
-| `bytes_out` | integer | Response body bytes sent to client |
-| `duration_ms` | float | End-to-end duration from first byte received to last byte sent |
-| `backend_duration_ms` | float | Duration from backend selected to response complete |
-| `user_agent` | string | Value of the `User-Agent` request header |
-| `tls` | bool | Whether the client connection used TLS |
-| `error` | string or null | Error code if the request failed; `null` on success |
-
-`backend_addr` is `null` when Keel could not select a backend — for example, when the pool is empty or all backends are unhealthy.
-
-`status` is `0` when Keel could not send a response to the client, typically due to a connection error before the response was written.
-
-`bytes_in` counts request body bytes only. Request headers are not included.
-
----
-
-## Error values
-
-When `error` is non-null, it contains one of these short strings:
-
-| Value | Meaning |
+| Field | Notes |
 |---|---|
-| `no_route` | The request was not routed to a pool: no vhost or route matched, or Keel answered the request itself (see below) |
-| `no_backend` | Pool exists but no backend was available (unhealthy, ejected or drained); Keel answers 503 |
-| `upstream_connect` | Proxying to the selected backend failed — a connect failure, a timeout, or an error after the connection was established; Keel answers 502 if no response was sent yet |
+| `timestamp` | ISO 8601 UTC, milliseconds |
+| `uri` | Path and query string |
+| `protocol` | `HTTP/1.1` or `HTTP/2.0` |
+| `status` | Status sent to the client; `0` if none was sent |
+| `client_addr` | `ip:port`, from the PROXY protocol header when the listener expects one |
+| `vhost` | The matched vhost as configured |
+| `backend_addr` | `null` if no backend was selected |
+| `bytes_in` | Request body bytes |
+| `bytes_out` | Response body bytes |
+| `duration_ms` | First byte in to last byte out |
+| `backend_duration_ms` | Backend selected to response complete |
+| `tls` | Client connection used TLS |
+| `error` | `null` or a reason below |
 
-Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` redirects and `default_action` responses — are logged before a vhost is resolved: `vhost`, `method` and `uri` are empty, `error` is `no_route`, `status` is the status Keel sent, and the entry goes to `access_unknown.log` and `error_unknown.log`.
+| `error` | Meaning |
+|---|---|
+| `no_route` | No vhost or route matched, or Keel answered itself |
+| `no_backend` | No available backend in the pool; Keel answered 503 |
+| `upstream_connect` | Proxying to the backend failed; Keel answered 502 if nothing was sent yet |
 
----
+Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` and `default_action` — have empty `vhost`, `method` and `uri`, `error` `no_route`, and the status Keel sent.
 
-## Querying logs
+## TCP
 
-Because each line is valid JSON, standard tools work well:
-
-```bash
-# Count non-2xx responses
-jq 'select(.status >= 400)' /var/log/keel/access_api.example.com.log | wc -l
-
-# Find slow requests (>500ms)
-jq 'select(.duration_ms > 500)' /var/log/keel/access_api.example.com.log
-
-# All errors
-jq 'select(.error != null)' /var/log/keel/access_api.example.com.log
-
-# Requests to a specific path
-jq 'select(.uri | startswith("/api/v2/"))' /var/log/keel/access_api.example.com.log
-```
-
----
-
-## TCP log format
-
-TCP listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection** to `access_tcp_<pool>.log` — L4 has no vhost or request concept, so routing and file naming are pool-based:
+One entry per connection, written when it closes:
 
 ```json
 {
@@ -152,23 +99,16 @@ TCP listeners ([TCP proxying](tcp-proxying.md)) write one entry per **connection
 
 | Field | Notes |
 |---|---|
-| `type` | `"tcp"` for passthrough, `"tls"` when Keel terminated TLS (`tls_mode` terminate or reencrypt) |
-| `listener` | Local address that accepted the connection |
-| `bytes_in` / `bytes_out` | Application bytes from/to the client over the connection lifetime (after TLS in the terminating modes) |
-| `duration_ms` | Full connection lifetime, accept to close |
-| `tls` | `true` when Keel terminated TLS |
-| `tls_sni` | SNI the client sent; `null` when none, or in passthrough |
-| `tls_version` | `TLSv1.2` or `TLSv1.3`; `null` in passthrough |
-| `tls_cipher` | Cipher suite as named by rustls, for example `TLS13_AES_256_GCM_SHA384`; `null` in passthrough |
-| `error` | `null`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, or `shutdown` |
+| `type` | `tcp` in passthrough, `tls` when Keel terminates TLS |
+| `listener` | Address that accepted the connection |
+| `bytes_in`, `bytes_out` | Application bytes from and to the client |
+| `duration_ms` | Accept to close |
+| `tls_sni`, `tls_version`, `tls_cipher` | When Keel terminates TLS; `null` otherwise |
+| `error` | `null`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
 
-No `method`, `uri`, `status`, `user_agent`, or `vhost` — HTTP concepts with no meaning at L4. In passthrough mode the stream is opaque to Keel, so the TLS fields stay null even when the client and backend negotiate TLS inside it.
+## UDP
 
----
-
-## UDP log format
-
-UDP listeners ([UDP proxying](udp-proxying.md)) write one entry per **flow** — a client `ip:port` pinned to one backend until idle for `keel.udp_flow_timeout_seconds` — to `access_udp_<pool>.log`. The entry is written when the flow ends:
+One entry per flow, written when it ends:
 
 ```json
 {
@@ -189,20 +129,7 @@ UDP listeners ([UDP proxying](udp-proxying.md)) write one entry per **flow** —
 
 | Field | Notes |
 |---|---|
-| `type` | Always `"udp"` |
-| `listener` | Local address that received the datagrams |
-| `backend_addr` | `null` when no backend was selected (`no_backend`) |
-| `bytes_in` / `bytes_out` | Bytes from/to the client over the flow lifetime |
-| `packets_in` / `packets_out` | Datagrams from/to the client — no equivalent in TCP or HTTP entries |
-| `duration_ms` | Flow lifetime, first datagram to expiry. Includes the idle timeout, so a single request/response exchange shows roughly `udp_flow_timeout_seconds` |
-| `error` | `null` (expired after idle timeout), `no_backend`, `upstream_bind`, `upstream_send`, `upstream_recv`, `downstream_send`, or `shutdown` |
-
-`upstream_recv` is what a backend that is not listening looks like: the ICMP port-unreachable reply surfaces as a receive error on the flow's upstream socket. A `no_backend` entry is written per dropped datagram, since no flow exists to aggregate them.
-
-No TLS fields: UDP carries none in v1.
-
----
-
-## App logs vs access logs
-
-Access logs (NDJSON files) cover per-request data. Application logs — startup, health check transitions, config reloads, errors — are written to stderr as structured text. These two streams are intentionally separate so they can be routed to different destinations, retention policies, and alerting pipelines.
+| `backend_addr` | `null` with `no_backend` |
+| `packets_in`, `packets_out` | Datagrams from and to the client |
+| `duration_ms` | First datagram to expiry, so it includes `keel.udp_flow_timeout` |
+| `error` | `null` (expired), `no_backend` (one entry per dropped datagram), `upstream_bind`, `upstream_send`, `upstream_recv` (ICMP port-unreachable from the backend), `downstream_send`, `shutdown` |

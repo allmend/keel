@@ -1,39 +1,8 @@
 # Caching
 
-Keel provides an HTTP cache with two optional storage tiers: in-memory (L1) and disk (L2). Cache rules are configured per vhost or per route within a vhost. Caching is disabled by default everywhere.
+An HTTP cache with two optional tiers: memory (L1) and disk (L2). Storage is set once in `keel.hcl`; what is cached is set per vhost or route. Off by default.
 
-## Storage configuration (global)
-
-Storage is configured once at the root level and shared across all vhosts.
-
-### Memory only
-
-```hcl
-cache {
-  memory = "256M"
-}
-```
-
-Stores objects in process memory using LRU eviction. Fast, no I/O, lost on restart.
-
-Each worker process has its own memory cache of the configured size, so total memory use can reach `memory` × number of workers, and an object cached by one worker is a miss in the others.
-
-### Disk only
-
-```hcl
-cache {
-  disk {
-    path = "/var/cache/keel"
-    size = "10G"
-  }
-}
-```
-
-Stores objects as files. Layout: `{path}/{hash[0:2]}/{hash}.keel`. The directory is created on first write. Every worker reads the same directory, so an object written by one worker is a hit in all of them.
-
-Eviction is tracked per worker process: each worker counts only the objects it wrote itself against `size` and evicts by LRU from those. Total disk use can therefore reach `size` × number of workers. Files left from a previous run are served on lookup but are not counted or evicted.
-
-### Tiered (memory + disk)
+## Storage
 
 ```hcl
 cache {
@@ -46,67 +15,30 @@ cache {
 }
 ```
 
-When both tiers are configured:
+Either tier may be left out. Without a `cache` block nothing is cached.
 
-- Reads check L1 (memory) first. On a hit, no disk I/O occurs.
-- On an L1 miss, L2 (disk) is checked.
-- On a full cache miss, the response is written to both tiers simultaneously. Subsequent requests find the object in L1.
-- If an L2 write fails (disk full, I/O error), L1 still stores the response. The failure is not logged and does not affect the response.
-
-This is the recommended production configuration. Memory absorbs the hot working set; disk holds everything else.
-
-### Size format
-
-| Suffix | Meaning |
+| Tier | Behaviour |
 |---|---|
-| `K` or `KB` | kibibytes (1024 bytes) |
-| `M` or `MB` | mebibytes |
-| `G` or `GB` | gibibytes |
-| none or `B` | bytes |
+| Memory | LRU in process memory, lost on restart. Per worker: total use up to `memory` × workers, and one worker's object is a miss in the others |
+| Disk | Files at `{path}/{hash[0:2]}/{hash}.keel`, created on first write, shared by all workers. Each worker counts and evicts (LRU) only what it wrote, so total use is up to `size` × workers. Files from an earlier run are served but not counted or evicted |
+| Both | Reads try memory, then disk. A miss is written to both. A failed disk write is not logged; memory still stores the response |
 
----
+| Size suffix | Unit |
+|---|---|
+| `K`, `KB` | KiB |
+| `M`, `MB` | MiB |
+| `G`, `GB` | GiB |
+| none, `B` | bytes |
 
-## Cache rules
+## Rules
 
-Rules control *which* responses are cached and for how long. They live on the vhost or on individual routes within a vhost — not on pools.
-
-### Vhost-level rules
-
-```hcl
-vhost "example.com" {
-  pool = "web"
-
-  cache {
-    enabled  = true
-    ttl      = "1m"
-    statuses = [200, 301]
-    content_types = [
-      "text/html",
-      "text/css",
-      "application/javascript",
-      "image/*",
-      "font/*",
-    ]
-  }
-}
-```
-
-| Attribute | Type | Default | Notes |
-|---|---|---|---|
-| `enabled` | bool | `false` | Must be `true` to cache any response for this vhost |
-| `ttl` | duration | none | Fallback TTL when the origin gives no freshness; see [How responses are evaluated](#how-responses-are-evaluated) |
-| `statuses` | list of numbers | `[200]` | HTTP status codes to cache |
-| `content_types` | list of strings | *(all)* | Content-type patterns to cache; empty means no restriction |
-
-### Route-level rules
-
-Routes inherit the vhost-level cache config. A route can override it, restrict it, or disable it entirely.
+A `cache` block on a vhost or route decides what is cached.
 
 ```hcl
 vhost "example.com" {
   cache {
     enabled = true
-    ttl     = "1m" # default for all routes
+    ttl     = "1m"
   }
 
   route "/static/" {
@@ -114,7 +46,7 @@ vhost "example.com" {
 
     cache {
       enabled       = true
-      ttl           = "24h" # static files: cache for a day
+      ttl           = "24h"
       statuses      = [200, 301]
       content_types = ["image/*", "text/css", "application/javascript", "font/*"]
     }
@@ -124,68 +56,37 @@ vhost "example.com" {
     pool = "api"
 
     cache {
-      enabled = false # API responses: never cache
+      enabled = false
     }
   }
 
-  # No cache block: inherits the vhost default (ttl 1m, all statuses/content_types)
   route "/" { pool = "web" }
 }
 ```
 
-Resolution order for a request: **route-level → vhost-level**. If a route defines a `cache` block, it is used in full — it does not merge with the vhost-level config. If the route has no `cache` block, the vhost-level config applies.
+| Attribute | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | |
+| `ttl` | duration | none | Fallback when the origin gives no freshness |
+| `statuses` | list of numbers | `[200]` | Status codes to cache |
+| `content_types` | list of strings | all | Content types to cache |
 
-A route with `enabled: false` will not cache even if the vhost-level config has `enabled: true`.
+A route's `cache` block replaces the vhost's, with no merging. A route without one uses the vhost's. Above, `/` uses the vhost's rule and `/api/` caches nothing.
 
----
+## What is stored
 
-## How responses are evaluated
+Only `GET` and `HEAD`. A response is stored when all of these hold:
 
-When a cacheable request arrives (GET or HEAD, cache enabled for the matching route/vhost):
+1. Its status is in `statuses`.
+2. Its `Content-Type` matches `content_types`, if set.
+3. It sets no cookie and has no `Vary: *`.
+4. `Cache-Control` does not say `private` or `no-store`. A request with `Authorization` is stored only with `public`, `s-maxage` or `must-revalidate` (RFC 9111 §3.5).
+5. It is fresh: `s-maxage`, `max-age` or `Expires` give the lifetime. Without any of them, and when storing is not forbidden, `ttl` does — except for requests with `Authorization` or `Cookie`.
 
-1. **Status filter** — the response status must be in `statuses`. If `statuses` is empty, only `200` is cached.
-2. **Content-type filter** — if `content_types` is non-empty, the response `Content-Type` header must match at least one pattern.
-3. **Set-Cookie** — a response that sets a cookie is never stored.
-4. **`Vary: *`** — never stored. Other `Vary` values are honoured; see [Vary](#vary).
-5. **Origin freshness** — `Cache-Control` `max-age` / `s-maxage`, then `Expires`, decide how long the response is fresh. `private` and `no-store` are never stored. A response to a request that carried `Authorization` is stored only when the origin allows it with `public`, `s-maxage`, or `must-revalidate` (RFC 9111 §3.5).
-6. **TTL fallback** — when the origin gives no freshness (no `max-age`, `s-maxage`, or `Expires`) and does not forbid storing, the response is stored for `ttl` seconds. The fallback does not apply to requests that carried `Authorization` or `Cookie`: a response that may be personalised is stored only when the origin says it may be.
+A response with `Vary` is stored per combination of the named request headers' values, and served only to a request with the same values.
 
-All conditions must pass. A response that matches the status and content-type filters but carries `Cache-Control: no-store` is not cached, whatever `ttl` is set to.
+Content types are matched without parameters (`text/html; charset=utf-8` is `text/html`). A trailing `*` is a prefix match: `image/*` matches `image/png`.
 
-### Vary
+## X-Cache
 
-A response with `Vary` is stored once per combination of values of the request headers it names. A request is answered from cache only by the entry whose values match its own. `Vary: Accept-Encoding`, for example, keeps compressed and uncompressed copies apart.
-
-### Content-type pattern matching
-
-Patterns match the base content type, ignoring parameters (`text/html; charset=utf-8` → `text/html`).
-
-A trailing `*` means prefix match:
-
-| Pattern | Matches |
-|---|---|
-| `image/*` | `image/png`, `image/jpeg`, `image/webp`, … |
-| `text/*` | `text/html`, `text/css`, `text/plain`, … |
-| `application/javascript` | `application/javascript` only |
-| `font/*` | `font/woff`, `font/woff2`, … |
-
----
-
-## X-Cache header
-
-When caching is enabled for a vhost or route, Keel adds an `X-Cache` header to every response:
-
-| Value | Meaning |
-|---|---|
-| `HIT` | Response served from cache |
-| `MISS` | Response fetched from upstream |
-
-The header is omitted on requests where caching is not configured.
-
----
-
-## Disabling cache entirely
-
-Omit the root `cache:` section. No storage is allocated and `X-Cache` headers are never added.
-
-Even with storage configured, individual vhosts and routes only cache when `enabled: true` is set on their cache block.
+Responses on a vhost or route with caching enabled carry `X-Cache: HIT` (from cache) or `X-Cache: MISS` (from the backend). Others carry none.

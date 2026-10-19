@@ -16,89 +16,74 @@ pool "web" {
 
 ### round_robin
 
-Distributes requests across all healthy backends in order. Respects weights: a backend with `weight = 2` receives twice as many requests as one with `weight = 1`.
+Distributes requests across the available backends in turn, by weight.
 
-Use for stateless services where any backend can handle any request. This is the right default for most workloads.
+Use for stateless services where any backend can handle any request.
 
 ### random
 
-Selects a backend at random on each request, weighted by `weight`. Produces approximately the same distribution as round-robin over time with less coordination overhead.
-
-Use as an alternative to round-robin when strict ordering doesn't matter and you want to reduce thundering herd effects.
+Picks a backend at random for each request, by weight. Over time the distribution matches round robin.
 
 ### least_connections
 
-Routes each request to the backend with the fewest active connections per unit of weight at the time the request arrives: with weights 1 and 3, the second backend takes new connections until it holds three times as many. Ties go to the backend listed first. Each worker process counts only the connections it opened itself.
+Picks the backend with the fewest active connections per unit of weight: with weights 1 and 3, the second takes new connections until it holds three times as many. Ties go to the backend listed first. Each worker counts only its own connections.
 
-Use for workloads where requests have variable processing time — long-lived connections or slow backends will receive fewer new requests automatically.
+Use when requests vary in duration — long-lived connections, slow backends.
 
 ### consistent_hash
 
-Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights: a backend with `weight = 2` gets about twice the share of keys.
+Hashes the client address to pick a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP. The same key reaches the same backend while the pool is unchanged. A backend with `weight = 2` gets about twice the keys.
 
-At L4 every new TCP connection uses a new source port, so affinity holds per connection (TCP) or per flow (UDP), not per client.
+At L4 every TCP connection has a new source port, so affinity holds per connection (TCP) or per flow (UDP), not per client.
 
-Use when backend-side caching or session affinity matters and you cannot use cookies.
+Use when a backend keeps per-client state, such as a local cache.
 
 ---
 
 ## Weighted backends
 
-Every algorithm honours per-backend weights. A backend with `weight = 2` receives twice as many requests as one with `weight = 1` (`round_robin` exactly, `random` and `consistent_hash` on average); `least_connections` balances connections per unit of weight.
+Every algorithm honours weights: `round_robin` exactly, `random` and `consistent_hash` on average, `least_connections` per connection.
 
 ```hcl
 pool "web" {
-  algorithm = "round_robin"
-
   backend "10.0.0.1:8080" {}
   backend "10.0.0.2:8080" {}
   backend "10.0.0.3:8080" { weight = 2 } # receives 50% of traffic
 }
 ```
 
-Weight defaults to `1` if omitted and must be 1–1000. Up to v0.24.0 weights were ignored: every backend got an equal share.
+Weight defaults to `1` and must be 1–1000.
 
 ---
 
 ## Health checks
 
-A pool with a `health_check` block is probed continuously and unhealthy
-backends are excluded from selection until they recover. Probe types are
-`tcp`, `udp`, `http`, `dns`, `ntp`, `icmp` and `tls`; thresholds, timeouts, a
-port override, and the status output are described in
-[Health checks](health-checks.md).
+A pool with a `health_check` block is probed, and unhealthy backends get no new traffic until they recover. See [Health checks](health-checks.md) for probe types, thresholds and passive ejection.
 
 ```hcl
 pool "web" {
   health_check "http" {
-    path                = "/health"
-    interval            = "10s"
-    timeout             = "2s"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
+    path     = "/health"
+    interval = "10s"
   }
 
   backend "10.0.0.1:8080" {}
 }
 ```
 
-Omit `health_check` to disable health checks for a pool. All backends in
-that pool are then always considered healthy. If no backend in a pool is
-available (all unhealthy, ejected or drained), Keel returns 503 for requests
-routed to that pool. A backend that is selected but cannot be reached gives
-502.
+When no backend of a pool is available (unhealthy, ejected or drained), requests to it get 503. A backend that is selected but cannot be reached gives 502.
 
 ---
 
 ## Backend drain
 
-Draining removes a backend from rotation without dropping active connections. New requests stop being routed to the backend immediately; existing connections are allowed to finish.
+Draining takes a backend out of rotation without dropping its connections: new requests stop at once, open ones finish.
 
 ```bash
 # Begin drain (returns immediately)
 keel backend drain 10.0.0.1:8080
 
-# Drain and block until complete, streaming live connection count
+# Drain and wait until no connection is left
 keel backend drain 10.0.0.1:8080 --wait
 ```
 
@@ -113,14 +98,4 @@ Draining 10.0.0.1:8080 from pools: web
 Drain complete (22s elapsed).
 ```
 
-Drain identifies the backend across all pools — you do not specify a pool name. If the address appears in multiple pools it is drained from all of them simultaneously.
-
-After drain completes the backend is in the `Removed` state. There is no command to return it to service yet, and neither a config reload, `keel config push` nor a restart re-activates it: the drain is committed through Raft and applies on every node. See [Cluster](cluster.md#drain).
-
----
-
-## Pool reference in vhosts
-
-A pool must be defined in `pools` before it can be referenced in a vhost. Keel validates all pool references at startup and on hot reload, and will reject a config where a vhost references a nonexistent pool.
-
-See [Virtual hosts](virtual-hosts.md) for routing configuration.
+The address is drained in every pool that has it. A drain is committed through Raft: it applies on every node and stays across reloads, pushes and restarts. See [Cluster](cluster.md#drain).

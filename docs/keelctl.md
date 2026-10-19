@@ -1,64 +1,42 @@
-# Remote Control (keelctl)
+# keelctl
 
-`keelctl` controls a running Keel node or cluster from an operator
-workstation, a CI job, or a bastion host. It speaks the same control protocol
-as the local `keel` subcommands, over TCP with mandatory mTLS. Binaries ship
-for Linux, macOS, and FreeBSD.
+`keelctl` runs the `keel` client commands against a node or cluster over TCP with mTLS. Binaries for Linux, macOS and FreeBSD.
 
 ## Security
 
-keelctl communicates over mTLS. The remote listener only accepts connections
-presenting a client certificate signed by the node's control CA; the
-certificate CN is the operator name, and every command is audit-logged as
-`name@address command`. Connections without a valid client certificate fail
-at the TLS handshake. There is no password mode and no plaintext mode.
+The listener accepts only client certificates signed by the node's control CA; the CN is the operator name, and every command is logged with it. Nothing else is accepted.
 
-The optional `allow` list additionally restricts which source CIDRs the
-listener accepts. Source addresses are not reliable behind NAT or a
-Kubernetes Service, so this narrows exposure but never replaces mTLS.
+`allow` restricts source CIDRs on top of that.
 
-## Enabling the remote listener
+## Listener
 
 ```hcl
 # /etc/keel/node.hcl
 control {
   remote {
     address = "0.0.0.0:10789"
-    allow   = ["10.1.2.0/24"] # optional; empty = any source
+    allow   = ["10.1.2.0/24"]
   }
 }
 ```
 
-Remote control is off unless `control.remote` is configured. The local Unix
-socket (`keel.control_socket`) is always on and unchanged — `keel status` on
-the node works exactly as before.
+Off without `control.remote`; the local control socket is always on. `address` is a literal `ip:port`. The master binds it, the control worker serves it.
 
-`address` takes a literal `ip:port`; a hostname is rejected during config validation. The master binds the port and the control worker serves it — see [Security](security.md#processes-and-what-each-can-read).
+The control CA is generated on the first start with `control.remote` (or the first `keel credentials create`) in `control/` in `keel.state_dir`: `ca.crt`, `ca.key` (0600). The listener's certificate is issued from it at each start.
 
-On first start with `control.remote` set (or on the first
-`keel credentials create`), Keel generates the control CA in `control/`
-under `keel.state_dir`: `ca.crt` and `ca.key` (0600, directory 0700). The listener's server
-certificate is issued from it in memory at each start.
+## Credentials
 
-## Creating credentials
-
-Run once on the node — via SSH, `docker exec`, or `kubectl exec`:
+On the node:
 
 ```bash
 keel credentials create john --endpoint lb1.example.com:10789 > keelconfig
 ```
 
-The output is a **keelconfig**: one YAML file with the endpoint, the control
-CA certificate, and a client certificate + private key for operator `john`.
-Treat it like a private key. Copy it to the workstation or CI secret store —
-after this, no shell access to the node is needed.
+A keelconfig is one YAML file: the endpoint, the control CA certificate, and a client certificate and private key for `john`.
 
-`--endpoint` is written into the keelconfig verbatim: it is the address the
-operator dials, which is usually not the bind address (DNS name, VIP,
-port-forward). The TLS identity keelctl verifies is the fixed name
-`keel-control` against the CA, so any reachable route to the node works.
+`--endpoint` is written as given. keelctl verifies the server as `keel-control` against the CA, so any route to the node works (DNS name, VIP, port-forward).
 
-## Using keelctl
+## Use
 
 ```bash
 keelctl status
@@ -70,53 +48,29 @@ keelctl cluster status
 keelctl cluster stepdown
 ```
 
-Same commands, same output as the on-node `keel` CLI.
-
-The keelconfig is resolved in order:
+The keelconfig is found in this order:
 
 1. `--config <path>`
 2. `KEEL_CONFIG` environment variable
 3. `./keelconfig` in the working directory
 4. `~/.keel/config`
 
-## Cluster mode
+## Cluster
 
-Every node with `control.remote` configured listens. `cluster stepdown`,
-`config push`, `config reload`, `backend drain` and `credentials revoke-all`
-sent to a follower reach the leader. `status` and `backend list` answer for
-the node that receives them.
+Every node with `control.remote` listens. Writes sent to a follower (`cluster stepdown`, `cluster remove`, `config push`, `config reload`, `backend drain`, `credentials revoke-all`) go to the leader; `status` and `backend list` answer for the receiving node.
 
-The control CA is cluster-wide. When a cluster forms, the leader commits
-its control CA (certificate and key) to the Raft log; every node, including
-one that joins later, writes it into its own control CA directory and re-keys
-its remote listener. One keelconfig therefore authenticates to every node, and
-`keel credentials create` produces a valid keelconfig on any node.
-
-A node that starts with a different local CA (for example a single node
-that later joined a cluster) adopts the cluster's and logs that it did; credentials
-issued by its old CA stop working. Create credentials once the cluster is
-up rather than on a node before it joins, for the same reason.
+The leader commits its control CA to Raft; every node, later joiners included, takes it and re-keys its listener. One keelconfig works on every node, and `keel credentials create` works on any node. A node joining with another CA adopts the cluster's and logs it; keelconfigs from its old CA stop working.
 
 ## Revocation
 
-There is no per-certificate revocation. To invalidate every issued
-credential, run on a node:
-
-```bash
-keel credentials revoke-all
-```
-
-It replaces the control CA through Raft, so every node re-keys its
-listener, and every keelconfig issued so far stops working.
-Issue new ones with `keel credentials create`.
+`keel credentials revoke-all` replaces the control CA through Raft; every keelconfig issued so far stops working. There is no per-certificate revocation.
 
 ## Audit log
 
-Every remote command appears in Keel's app log (stderr):
+Every remote command is logged:
 
 ```
 INFO keel::control: control: remote command client="john@203.0.113.7:52144" command="backend_drain"
 ```
 
-Local Unix-socket commands are not attributed — the socket is already
-restricted to owner+group on the node.
+Commands on the local socket are not attributed.

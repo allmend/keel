@@ -1,16 +1,16 @@
 # Quickstart
 
-## Build from source
+## Build
 
 ```bash
 cargo build --release
 ```
 
-The binary is at `target/release/keel`.
+The binary is `target/release/keel`.
 
-## Minimal configuration
+## Configure
 
-Keel reads a node file and the config directory it names. For a local test, create both in the current directory — `node.hcl`:
+A node file and the config directory it names. In the current directory, `node.hcl`:
 
 ```hcl
 keel {
@@ -32,38 +32,35 @@ vhost "*" {
 }
 ```
 
-This listens on port 8080 and proxies all traffic to a single backend at `127.0.0.1:3000`.
+Port 8080, every request to `127.0.0.1:3000`.
+
+```bash
+./keel --config node.hcl config validate
+```
 
 ## Run
 
 ```bash
 ./keel --config node.hcl
-```
-
-Started as root, Keel binds the listening ports and the control socket, then forks a control worker running as `keel-control` and worker processes running as `keel`; create both users first. Started as another user, every process runs as that user. The node is a cluster of one: see [Cluster](cluster.md) to add nodes, and [Architecture](architecture.md) for how the processes fit together.
-
-## Verify
-
-```bash
 curl http://localhost:8080/
 ```
 
-Check that the request reaches your backend and returns a response.
+Started as root, Keel binds the ports and the control socket, then runs the control worker as `keel-control` and the workers as `keel`; both users must exist. Started as another user, every process runs as that user. The node is a cluster of one.
 
-## Next steps
+## Next
 
-- [Architecture](architecture.md) — processes, sockets, config flow, cluster, in diagrams
-- [Configuration reference](configuration.md) — full schema for all sections
-- [Virtual hosts](virtual-hosts.md) — host-based routing, TLS, path routing
-- [Automatic TLS (ACME)](acme.md) — Let's Encrypt / ACME v2 certificates and renewal
-- [Load balancing](load-balancing.md) — algorithms, weights, backend drain
-- [Health checks](health-checks.md) — tcp, udp, http, dns, ntp, icmp and tls probes, passive detection, status output
-- [TCP proxying](tcp-proxying.md) — L4 passthrough for databases and TLS-on-connect services
-- [UDP proxying](udp-proxying.md) — per-client flows for DNS, syslog, and other datagram services
-- [Caching](caching.md) — memory and disk cache
-- [Cluster](cluster.md) — multi-node HA deployment
-- [CLI reference](cli.md) — `keel` subcommands
-- [Remote control](keelctl.md) — keelctl over mTLS from a workstation or CI
-- [Access logging](access-logging.md) — NDJSON request logs
-- [Metrics](metrics.md) — Prometheus metrics reference
-- [Security](security.md) — security properties and operator checklist
+- [Architecture](architecture.md)
+- [Configuration](configuration.md)
+- [Virtual hosts](virtual-hosts.md)
+- [ACME](acme.md)
+- [Load balancing](load-balancing.md)
+- [Health checks](health-checks.md)
+- [TCP proxying](tcp-proxying.md)
+- [UDP proxying](udp-proxying.md)
+- [Caching](caching.md)
+- [Cluster](cluster.md)
+- [CLI](cli.md)
+- [keelctl](keelctl.md)
+- [Access logging](access-logging.md)
+- [Metrics](metrics.md)
+- [Security](security.md)

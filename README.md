@@ -14,9 +14,9 @@
   <img src="https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white" alt="Rust">
 </p>
 
-> ⚠️ **Alpha.** Core proxy, TLS + ACME, clustering, and caching work. Expect rough edges and breaking config changes between versions. Not production-ready yet — feedback welcome.
+> **Alpha.** Configuration may change between versions.
 
-Keel is a feature-rich, self-hosted load balancer and reverse proxy written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). It does the things open-source proxies make you pay for or restart for — live backend drain, automatic TLS, certificate hot-swap, routing changes without restart — from a single binary.
+Keel is a self-hosted load balancer and reverse proxy for HTTP, TCP and UDP, written in Rust on Cloudflare's [Pingora](https://github.com/cloudflare/pingora). One binary, clustered or standalone.
 
 Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
@@ -24,65 +24,36 @@ Part of the [Allmend](https://github.com/allmend) suite of open-source tools.
 
 ## Features
 
-- HTTP/1.1 + HTTP/2 reverse proxy — h2 offered over TLS by ALPN
-- Virtual host routing (SNI + Host header)
-- Path-based routing
-- Load balancing — round robin, weighted, consistent hash, least-conn
-- TCP (L4) proxying — `tcp_pool` listeners with `passthrough`, `terminate`, and `reencrypt` TLS modes; certificates from ACME or files, SNI selection, optional backend verification
-- UDP (L4) load balancing — `udp_pool` listeners, per-client flows with idle expiry, shared drain and connection counting
-- PROXY Protocol v1/v2 — real client addresses behind an NLB or another proxy, on HTTP, HTTPS, TCP, and UDP listeners
-- TLS termination with per-vhost certificates
-- ACME / automatic TLS — named issuers (public or internal CAs), HTTP-01, renewal at 30% remaining lifetime, standalone certs for TCP/passthrough backends
-- HTTP → HTTPS redirect (implicit for ACME vhosts)
-- Default vhost action — redirect or static response for unknown hosts, no pool needed
-- Graceful shutdown on SIGTERM/SIGINT/SIGQUIT with configurable grace period
-- Health checks — `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, and `tls` probes; status/body matching, port override, failure reason in `keel status`
-- Passive detection — backends ejected after consecutive upstream failures, re-admitted on a timer; never the last one
-- Backend drain with live connection tracking
-- Config hot reload (SIGHUP or `keel config reload`) — vhost routing, certificates, backend removal
-- TLS certificate hot-swap
-- Two-tier HTTP cache (memory L1 + disk L2)
-- Prometheus metrics (`/metrics`)
-- NDJSON access logs, per-vhost
-- Config directory — `keel.yaml` plus per-team files for pools, vhosts and certificates; in a cluster, one versioned set replicated to every node
-- Raft-based clustering with mTLS, encrypted join, automatic voter promotion, and state on disk — nodes restart without rejoining
-- Distributed config push via `keel config push`
-- Cluster-replicated ACME certificates and HTTP-01 challenges — leader issues, every node serves and answers validation
-- Graceful node removal — `keel cluster stepdown` with quorum-loss protection
-- keelctl — remote control over mTLS from mac/Linux/FreeBSD; kubeconfig-style credentials file, per-operator audit log
-
-In the roadmap: HTTP/3.
-
-On hold since v0.14.0, after shipping earlier: API gateway rules (per-IP rate
-limiting, JWT auth, header and path rules) and ACME DNS-01, which is what
-wildcard issuance needs. Both were withdrawn rather than left half-owned and
-may return — see [CHANGELOG.md](CHANGELOG.md).
-
----
-
-## Tech stack
-
-Rust · [Pingora](https://github.com/cloudflare/pingora) · Tokio · rustls + OpenSSL · [openraft](https://github.com/databendlabs/openraft) · Prometheus
-
-Single binary (links OpenSSL dynamically). Async multithreaded, CPU balanced across cores. Minimal attack surface.
+- HTTP/1.1 and HTTP/2 reverse proxy; vhosts by Host header and SNI, path routing
+- TCP proxying: `passthrough`, `terminate` and `reencrypt`
+- UDP proxying: one flow per client, idle expiry
+- Load balancing: round robin, random, least connections, consistent hash; weights
+- Health checks: `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, `tls`; passive ejection
+- Backend drain with connection tracking
+- TLS with per-vhost certificates, hot-swapped on reload
+- ACME (HTTP-01): named issuers, renewal, certificates for TCP backends
+- PROXY protocol v1/v2 on every listener
+- HTTP cache: memory and disk
+- Config reload without dropped connections
+- Clustering: Raft over mTLS; config, drains and certificates replicated
+- Prometheus metrics, NDJSON access logs
+- `keelctl`: remote control over mTLS
 
 ---
 
 ## Quick start
 
-The fastest way to try Keel — proxy `:8080` across three test backends with Docker Compose:
+Keel and three test backends with Docker Compose:
 
 ```bash
 git clone https://github.com/allmend/keel
 cd keel
 docker compose up --build
 
-curl http://localhost:8080          # round-robins across backend1/2/3
-curl http://localhost:10790/metrics  # Prometheus metrics
+curl http://localhost:8080
+curl http://localhost:10790/metrics
 
-# Control commands
 docker compose exec keel keel status
-docker compose exec keel keel backend list --pool web
 docker compose exec keel keel backend drain backend1:80 --wait
 ```
 
@@ -93,175 +64,125 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ### Container image
 
 ```bash
-docker pull ghcr.io/allmend/keel:0.25.0
-docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:0.25.0
+docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:<version>
 ```
 
-### Prebuilt binaries
+### Binaries
 
-Download a Linux binary (x86_64 or arm64), or the best-effort FreeBSD
-x86_64 build, from the
-[releases page](https://github.com/allmend/keel/releases) — each release
-includes the binary, an example config, and `SHA256SUMS`.
+Linux (x86_64, arm64) and FreeBSD (x86_64) on the [releases page](https://github.com/allmend/keel/releases), with example config files and `SHA256SUMS`.
 
-### Build from source
+### From source
 
 ```bash
-# Prerequisites: Rust 1.75+, libssl-dev (Linux) or Homebrew OpenSSL (macOS)
-
-# macOS (Apple Silicon)
-OPENSSL_DIR=/opt/homebrew/opt/openssl cargo build --release
-
-# macOS (Intel)
-OPENSSL_DIR=/usr/local/opt/openssl cargo build --release
-
-# Linux
+# Linux: libssl-dev. macOS: OPENSSL_DIR=$(brew --prefix openssl)
 cargo build --release
-
-./target/release/keel --config node.yaml
+./target/release/keel --config node.hcl
 ```
 
 ---
 
 ## Configuration
 
-Keel reads two files: the node file, `/etc/keel/node.yaml` — how this node runs — and the config directory it names, `/etc/keel/config/` — the load balancer. Minimal config: listen on port 80, proxy to two backends:
+A node file, `/etc/keel/node.hcl`, and the config directory it names, `/etc/keel/config/`. Both are HCL.
 
-```yaml
-# /etc/keel/node.yaml
-keel:
-  workers: 4
+```hcl
+# /etc/keel/node.hcl
+keel {
+  workers = 4
+}
 ```
 
-```yaml
-# /etc/keel/config/keel.yaml
-listeners:
-  - address: 0.0.0.0:80
+```hcl
+# /etc/keel/config/keel.hcl
+listener "http" "0.0.0.0:80" {}
 
-pools:
-  web:
-    backends:
-      - address: 127.0.0.1:8080
-      - address: 127.0.0.1:8081
+listener "https" "0.0.0.0:443" {}
 
-vhosts:
-  - host: example.com
-    pool: web
+pool "web" {
+  backend "10.0.0.1:8080" {}
+  backend "10.0.0.2:8080" {}
+}
+
+vhost "example.com" {
+  pool = "web"
+
+  tls {
+    acme = true
+  }
+}
 ```
 
-### Automatic TLS
-
-Add three lines and Keel obtains and renews the certificate itself:
-
-```yaml
-acme:
-  issuers:
-    default:
-      email: ops@example.com
-
-vhosts:
-  - host: example.com
-    pool: web
-    tls:
-      acme: true      # HTTP-01 challenge; renews automatically
+```bash
+keel config validate
+keel config fmt
 ```
 
-HTTP-01 is the only challenge, so ACME does not issue wildcards. A wildcard
-vhost serves a certificate you supply with `tls.cert`/`tls.key`.
-
-See [docs/acme.md](docs/acme.md) for named issuers (multiple CAs side by
-side), renewal tuning, and certificates for TCP/passthrough backends.
+See [Configuration](docs/configuration.md).
 
 ---
 
 ## CLI
 
 ```bash
-keel status                              # node status + pool overview
-keel backend list --pool web             # list backends and connection counts
-keel backend drain 10.0.0.1:8080 --wait  # drain a backend, stream live status
-keel config reload                       # push the config directory as the next version (same as SIGHUP)
-keel config push /etc/keel/config        # commit a config directory as the cluster's next version
-keel cluster status                      # cluster membership and Raft roles
-keel cluster stepdown                    # gracefully leave the cluster (--force to override quorum guard)
+keel status
+keel backend list --pool web
+keel backend drain 10.0.0.1:8080 --wait
+keel config reload
+keel config push /etc/keel/config
+keel cluster status
 ```
 
-The same commands work remotely with keelctl over mTLS — create credentials
-once on the node, then control the node or cluster from a workstation or CI:
-
-```bash
-# on the node (once)
-keel credentials create john --endpoint lb1.example.com:10789 > keelconfig
-
-# from anywhere with the keelconfig
-keelctl status
-keelctl backend drain 10.0.0.1:8080 --wait
-keelctl config push ./config
-```
-
-See [docs/keelctl.md](docs/keelctl.md).
+The same commands run remotely with `keelctl`. See [CLI](docs/cli.md) and [keelctl](docs/keelctl.md).
 
 ---
 
 ## Clustering
 
-A single node is a cluster of one. Three nodes: each `node.yaml` gets a `cluster:` section, and every node but the first names a member to join through:
+Every node is a cluster, of one or more. Nodes join through a shared secret and then talk mTLS. A config push, a drain or an ACME certificate is committed through Raft and applied on every node. Traffic does not depend on the cluster.
 
-```yaml
-cluster:
-  advertise: 10.0.0.2:7654
-  secret: mytoken
-  join: [10.0.0.1:7654]    # omitted on 10.0.0.1, which starts the cluster
+```hcl
+cluster {
+  advertise = "10.0.0.2:7654"
+  secret    = "change-me"
+  join      = ["10.0.0.1:7654"]
+}
 ```
 
-All inter-node traffic is mTLS and the join exchange itself is encrypted with a key derived from the shared secret. The cluster CA is generated by the first node and replicated to every member, so a new node can join through any of them. Joining nodes retry with backoff (safe to start all nodes at once) and are promoted to Raft voters once caught up. The config directory is replicated as versions (`keel config push` or `SIGHUP` on any node) and applied on every node; drains and ACME certificates are committed through Raft too; `keel cluster stepdown` removes a node gracefully, refusing (without `--force`) when the remaining nodes would lose quorum.
+See [Cluster](docs/cluster.md).
 
 ---
 
 ## Documentation
 
 - [Quickstart](docs/quickstart.md)
-- [Configuration reference](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [Configuration](docs/configuration.md)
 - [Virtual hosts](docs/virtual-hosts.md)
 - [Load balancing](docs/load-balancing.md)
 - [Health checks](docs/health-checks.md)
-- [TCP proxying (L4)](docs/tcp-proxying.md)
-- [UDP proxying (L4)](docs/udp-proxying.md)
-- [Clustering](docs/cluster.md)
+- [TCP proxying](docs/tcp-proxying.md)
+- [UDP proxying](docs/udp-proxying.md)
+- [ACME](docs/acme.md)
 - [Caching](docs/caching.md)
+- [Cluster](docs/cluster.md)
 - [Access logging](docs/access-logging.md)
-- [Metrics reference](docs/metrics.md)
-- [Automatic TLS / ACME](docs/acme.md)
-- [CLI reference](docs/cli.md)
-- [Remote control / keelctl](docs/keelctl.md)
-- [Security hardening](docs/security.md)
-
----
-
-## Status
-
-Keel is at v0.25.0, alpha quality. Core proxy, TLS + ACME (HTTP-01), clustering, caching, TCP and UDP (L4) proxying, PROXY protocol, and protocol health checks with passive detection are implemented and working. TLS is terminated with rustls on Pingora 0.9, HTTPS offers HTTP/2, and FreeBSD binaries are published alongside the Linux ones. See [CHANGELOG.md](CHANGELOG.md) for known limitations before deploying.
-
-v0.14.0 withdrew the API gateway rules and ACME DNS-01 (see above). Upgrading
-from 0.12.x or 0.13.x: delete `rate_limit`, `headers`, `rewrite`, and
-`auth.jwt` from your vhosts and routes, and `challenge`/`dns` from your ACME
-issuers. Keel ignores unknown keys rather than refusing them, so a config that
-keeps them starts normally with the rule no longer applied — the one case it
-does refuse is a wildcard vhost with `tls.acme`.
+- [Metrics](docs/metrics.md)
+- [CLI](docs/cli.md)
+- [keelctl](docs/keelctl.md)
+- [Security](docs/security.md)
 
 ---
 
 ## Contributing
 
-Issues and pull requests welcome. Branch off `main`, use [Conventional Commits](https://www.conventionalcommits.org), and keep `main` releasable.
-
-`cargo test --workspace` runs the unit tests. The end-to-end suite in `tests/e2e/` runs Keel in Docker containers — clusters, privileges, remote control — and needs a running Docker daemon:
+Branch off `main`, use [Conventional Commits](https://www.conventionalcommits.org), keep `main` releasable.
 
 ```bash
-cargo test -p keel-e2e --no-fail-fast -- --ignored
+cargo test --workspace                              # unit tests
+cargo test -p keel-e2e --no-fail-fast -- --ignored  # end-to-end, needs Docker
 ```
 
-It builds a debug image of the working tree first (several minutes the first time; later builds reuse a cache). `KEEL_E2E_IMAGE=<tag>` uses an existing image instead, and `KEEL_E2E_KEEP=1` leaves the containers of a failed test running for inspection.
+The e2e suite builds an image of the working tree first. `KEEL_E2E_IMAGE=<tag>` uses an existing image; `KEEL_E2E_KEEP=1` keeps a failed test's containers.
 
 ---
 

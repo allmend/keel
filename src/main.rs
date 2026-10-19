@@ -41,16 +41,6 @@ struct Cli {
     #[arg(long)]
     force_new_cluster: bool,
 
-    // Removed: node.hcl decides. Accepted only to say what replaces them.
-    #[arg(long, hide = true)]
-    cluster: bool,
-    #[arg(long, hide = true)]
-    bootstrap: bool,
-    #[arg(long, hide = true)]
-    join: Option<String>,
-    #[arg(long, hide = true)]
-    secret: Option<String>,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -128,12 +118,6 @@ enum BackendCommand {
         #[arg(long)]
         pool: String,
     },
-    /// Add a backend to a pool
-    Add {
-        address: String,
-        #[arg(long)]
-        pool: String,
-    },
     /// Drain a backend (stop new connections, wait for active to finish)
     Drain {
         address: String,
@@ -196,23 +180,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// Flags that used to choose how a node starts, and what replaced them.
-fn removed_flag(cli: &Cli) -> Option<&'static str> {
-    if cli.cluster || cli.bootstrap {
-        Some("--cluster and --bootstrap are gone: a node with no stored state starts a cluster of its own")
-    } else if cli.join.is_some() {
-        Some("--join is gone: list the members to join in node.hcl, cluster.join")
-    } else if cli.secret.is_some() {
-        Some("--secret is gone: set it in node.hcl, cluster.secret")
-    } else {
-        None
-    }
-}
-
 fn run_server(cli: &Cli) -> Result<()> {
-    if let Some(message) = removed_flag(cli) {
-        anyhow::bail!("{message}");
-    }
     let cfg = config::load(&cli.config)
         .with_context(|| format!("failed to load config: {}", cli.config))?;
     info!(workers = cfg.keel.workers, user = cfg.keel.user, control_user = cfg.keel.control_user, config = cli.config, "starting keel");
@@ -229,9 +197,6 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
     match cmd {
         Command::Credentials { command: CredentialsCommand::Create { name, endpoint } } => {
             return cli_credentials_create(cli, name, endpoint);
-        }
-        Command::Backend { command: BackendCommand::Add { address, pool } } => {
-            return cli_backend_add(address, pool);
         }
         Command::Config { command: ConfigCommand::Fmt { paths, write, list, diff, check } } => {
             let mut paths = paths.clone();
@@ -259,7 +224,6 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
             BackendCommand::Drain { address, wait } => {
                 client::backend_drain(&mut stream, address, *wait)
             }
-            BackendCommand::Add { .. } => unreachable!(),
         },
         Command::Config { command } => match command {
             ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload),
@@ -320,42 +284,4 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
     eprintln!("# Save as ~/.keel/config (or point KEEL_CONFIG at it) and run: keelctl status");
     print!("{}", kc.to_yaml()?);
     Ok(())
-}
-
-fn cli_backend_add(address: &str, pool: &str) -> Result<()> {
-    Err(anyhow::anyhow!(
-        "Live backend addition is not supported.\n\
-         Add '{address}' to pool '{pool}' in the config directory and run 'keel config reload'."
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::Cli;
-
-    #[test]
-    fn start_flags_are_refused_with_what_replaced_them() {
-        for (args, field) in [
-            (vec!["--cluster", "--bootstrap"], "starts a cluster of its own"),
-            (vec!["--join", "10.0.0.1:7654"], "cluster.join"),
-            (vec!["--secret", "s"], "cluster.secret"),
-        ] {
-            let cli = Cli::try_parse_from(std::iter::once("keel").chain(args)).unwrap();
-            assert!(super::removed_flag(&cli).is_some_and(|m| m.contains(field)), "{field}");
-        }
-        assert!(super::removed_flag(&Cli::try_parse_from(["keel", "--force-new-cluster"]).unwrap()).is_none());
-    }
-
-    #[test]
-    fn own_ca_flags_are_refused() {
-        for flag in ["--ca-cert", "--ca-key"] {
-            let err = Cli::try_parse_from(["keel", flag, "ca.pem"])
-                .err()
-                .expect("flag must be refused")
-                .to_string();
-            assert!(err.contains(flag), "error names the flag: {err}");
-        }
-    }
 }

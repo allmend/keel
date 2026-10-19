@@ -1,13 +1,11 @@
-# Automatic TLS (ACME)
+# ACME
 
-Keel can obtain and renew certificates automatically using the ACME v2 protocol with the HTTP-01 challenge. Certificates come from named issuers. An issuer defaults to the public ACME directory at `https://acme-v02.api.letsencrypt.org/directory`, but any ACME v2 CA works, and different vhosts can use different CAs.
-
-## Quick start
+Keel obtains and renews certificates over ACME v2 with the HTTP-01 challenge, from named issuers: any ACME v2 CA, one or several.
 
 ```hcl
 acme {
   issuer "default" {
-    email = "ops@example.com" # optional; the CA sends expiry warnings here
+    email = "ops@example.com"
   }
 }
 
@@ -15,24 +13,18 @@ vhost "example.com" {
   pool = "web"
 
   tls {
-    acme = true # use the issuer named "default"
+    acme = true
   }
 }
 ```
 
-The `acme` block is itself optional. `acme = true` in a vhost's `tls` block on its own implies a `default` issuer pointing at the public production directory above, without a contact email.
+`acme = true` uses the issuer `default`. Without an `acme` block, `default` is the public directory `https://acme-v02.api.letsencrypt.org/directory` without contact email.
 
-On startup Keel registers an ACME account, proves control of `example.com` by answering the HTTP-01 challenge on port 80, obtains the certificate, and begins serving it. No restart is required.
-
-HTTP → HTTPS redirect is enabled automatically for ACME vhosts, with the challenge path exempted. Set `redirect_http = false` on the vhost to opt out.
-
----
+Keel registers an account, answers the challenge on port 80, obtains the certificate and serves it. ACME vhosts redirect plain HTTP to HTTPS, except the challenge path; `redirect_http = false` turns that off.
 
 ## Issuers
 
-An issuer is a named CA relationship: a directory URL, an account contact, and optionally a trust root. Each issuer has one ACME account, stored under `storage/<issuer>/account.json` and reused for every issuance — in a cluster, one account for all nodes. Reusing one account per issuer is what keeps Keel inside the CA's rate limits.
-
-Vhosts select an issuer by name:
+Each issuer has one ACME account, `storage/<issuer>/account.json`, used for every issuance; in a cluster, by every node.
 
 ```hcl
 acme {
@@ -44,17 +36,8 @@ acme {
   }
 
   issuer "internal" {
-    email     = "infra@example.com"
     directory = "https://ca.corp.internal/acme/acme/directory"
     root_ca   = "certs/corp-root.pem"
-  }
-}
-
-vhost "www.example.com" {
-  pool = "web"
-
-  tls {
-    acme = true # issuer "default"
   }
 }
 
@@ -62,90 +45,48 @@ vhost "intranet.corp.internal" {
   pool = "intranet"
 
   tls {
-    acme = "internal" # named issuer
+    acme = "internal"
   }
 }
 ```
 
-Config validation rejects three cases:
-
-- `tls.acme` naming an issuer the `acme` block does not define. Only `default` may be implicit.
-- The same hostname assigned to two different issuers. A hostname belongs to exactly one issuer.
-- A wildcard host (`*`) with ACME. HTTP-01 cannot issue wildcards; supply a wildcard certificate with `tls.cert`/`tls.key` instead.
-
-### Issuer attributes
-
 | Attribute | Default | Notes |
 |---|---|---|
-| `email` | none | Account contact. Optional but recommended. |
-| `directory` | `https://acme-v02.api.letsencrypt.org/directory` | Any ACME v2 directory URL. Staging: `https://acme-staging-v02.api.letsencrypt.org/directory` |
-| `root_ca` | none | PEM trust root for the ACME API itself. Needed for internal or self-signed CAs; not for public ones. A relative path is a file of the config directory and travels with a push. |
-| `renew_before` | global value | Per-issuer renewal override. |
+| `email` | none | Account contact |
+| `directory` | `https://acme-v02.api.letsencrypt.org/directory` | ACME v2 directory URL |
+| `root_ca` | none | PEM trust root for the ACME API. A relative path is a file of the config directory |
+| `renew_before` | the `acme` block's | Per-issuer override |
 
----
+Load errors:
+
+- `acme = "<name>"` for an issuer that is not defined; only `default` may be implicit.
+- One host with two issuers.
+- ACME on a wildcard host: HTTP-01 cannot issue wildcards. A wildcard vhost uses `tls.cert` and `tls.key`.
 
 ## Renewal
 
-```hcl
-acme {
-  renew_before = "30%" # global default; issuers may override
-}
-```
+`renew_before` (default `30%`) is a share of the certificate's lifetime (`30%`: a 90-day certificate renews with 27 days left) or a duration (`20d`).
 
-`renew_before` decides when a certificate is renewed. It takes one of two forms:
-
-- **Percentage** (`30%`) — renew when less than that share of the certificate's total lifetime remains. This scales with the CA's policy: a 90-day certificate renews with about 27 days left, a 6-day certificate with about 1.7 days left. This is the default.
-- **Duration** (`20d`) — renew when less than that remains. Simpler, but wrong for short-lived certificates. Prefer the percentage form.
-
-The renewal check runs every 60 seconds, so a certificate is renewed within a minute of crossing its threshold. Renewed certificates are hot-swapped into the TLS listeners with no restart and no dropped connections.
-
-Failed issuance retries with exponential backoff (1 minute, doubling to a 6-hour maximum) so a misconfigured domain cannot exhaust the CA's rate limits. Each failure is logged with its reason.
-
----
+Renewal is checked every 60 seconds. A renewed certificate is served from the next handshake. A failed issuance is logged and retried after 1 minute, doubling up to 6 hours.
 
 ## Requirements
 
-- **Port 80 must reach Keel** for the hostname being issued. The CA fetches `http://<host>/.well-known/acme-challenge/<token>`, and Keel answers on any plain (non-TLS) listener, ahead of redirects and vhost routing.
-- **Resolvable DNS.** The CA resolves the hostname itself — public resolvers for a public CA, or whatever DNS an internal CA uses.
-- **No wildcards.** HTTP-01 cannot issue `*.example.com`. Use your own wildcard certificate for a wildcard vhost; a wildcard host with `tls.acme` is refused at load.
+- Port 80 for the host reaches Keel. The CA fetches `http://<host>/.well-known/acme-challenge/<token>`; Keel answers on every `http` listener, before redirects and routing. A token Keel does not know is proxied like any request.
+- The CA can resolve the host.
 
-DNS-01 (RFC 2136 + TSIG), which could issue wildcards, shipped in v0.10.0 and was withdrawn in v0.14.0.
+## Certificates without a vhost
 
----
-
-## Certificates for TCP / TLS-passthrough backends
-
-Sometimes Keel is not the TLS terminator — a backend behind Keel terminates TLS itself (databases, TLS passthrough, plain TCP services). Those backends still need certificates, and Keel already owns port 80 for the domain. A `certificate` block covers this: Keel performs the HTTP-01 challenge and writes the certificate to disk without loading it into its own listeners.
+A `certificate` block gets a certificate for a host Keel does not terminate HTTP for: a TCP listener, or a backend that terminates TLS itself.
 
 ```hcl
 certificate "db.example.com" {
-  issuer = "default" # optional; "default" when omitted
+  issuer = "default"
 }
 ```
 
-Issued certificates live in `acme.storage` (default `/var/lib/keel/acme`), never in the config directory: a push replaces that directory, and the storage path must be absolute and outside it.
+Keel writes `db.example.com.crt` (0644) and `db.example.com.key` (0600) to `acme.storage` and rewrites them atomically on renewal. A `tcp` listener with `tls_mode = "terminate"` or `"reencrypt"` serves it when its `tls_host` names the block.
 
-Any file of the config directory can declare `certificate` blocks alongside its pools:
-
-```hcl
-# /etc/keel/config/db-team.hcl
-pool "db-frontend" {
-  backend "10.0.4.1:5432" {}
-}
-
-certificate "db.example.com" {}
-```
-
-Keel answers the challenge for `db.example.com` and writes:
-
-```
-/var/lib/keel/acme/db.example.com.crt    (0644)
-/var/lib/keel/acme/db.example.com.key    (0600)
-```
-
-Point the backend at these files, or copy them out. Renewals rewrite the files atomically, so have the backend watch them or reload periodically.
-
-The same blocks serve TCP listeners with `tls_mode = "terminate"` or `"reencrypt"` ([TCP proxying](tcp-proxying.md)): the listener's `tls_host` names the block, and Keel serves the issued certificate itself, renewing it in place. A block can also point at files Keel does not issue:
+A block with `cert` and `key` loads those files instead of issuing; `issuer` is ignored, and the files are re-read with every applied version:
 
 ```hcl
 certificate "ldap.example.com" {
@@ -154,71 +95,38 @@ certificate "ldap.example.com" {
 }
 ```
 
-Such a block is not ACME-managed; `issuer` is ignored on it, and the files are re-read whenever a version is applied (a push, or `SIGHUP`).
+`certificate` blocks may be in any file of the config directory.
 
----
-
-## Storage layout
+## Storage
 
 ```
-/var/lib/keel/acme/               # acme.storage, created 0700
-├── default/
-│   └── account.json              # one ACME account per issuer (0600)
-├── internal/
-│   └── account.json
-├── www.example.com.crt           # certificate chain
-├── www.example.com.key           # private key (0600)
-└── db.example.com.crt / .key
+/var/lib/keel/acme/               acme.storage, 0700
+├── default/account.json          one account per issuer, 0600
+├── internal/account.json
+├── www.example.com.crt           certificate chain
+├── www.example.com.key           0600
+└── db.example.com.crt, .key
 ```
 
-Certificate files are flat (`{host}.crt` / `{host}.key`) regardless of issuer, because a hostname has exactly one certificate. Live HTTP-01 tokens are not here but in `challenges/` in the runtime directory (`/var/run/keel/challenges`), which the workers can read. Changing an issuer's `directory` registers a fresh account; existing certificates keep serving until their normal renewal.
+One certificate per host, whatever its issuer. `acme.storage` is absolute and outside the config directory. Challenge tokens are in `challenges/` in the runtime directory (`/var/run/keel/challenges`). A changed `directory` registers a new account.
 
----
+Certificates on disk are reused across restarts; the CA is contacted only for a certificate that is missing, expired, unreadable or due. A reload or push applies ACME changes at once: a new host is issued, a vhost switched from its own certificate to ACME serves the old one until the new one arrives, and a host switched away keeps its files in `storage`.
 
-## Reloads, restarts and persistence
+## Cluster
 
-A reload or a pushed version applies ACME changes at once. A new `tls.acme` vhost or `certificate` block is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
+- Only the leader talks to the CA.
+- An issuer's account is committed to Raft when first registered; every node writes it, and a new leader reuses it.
+- Issued certificates are committed to Raft; every node writes and serves them, nodes that join later included.
+- Disk and Raft are reconciled per host: the valid certificate with the longest remaining lifetime wins.
+- Challenge tokens are committed to Raft. The leader asks the CA to validate only once every node holds the token, so any node can answer the validation request.
 
-Certificates persist on disk and are not re-issued on restart, reload, or reboot. On startup Keel loads whatever is in `storage`; the CA is contacted only when a certificate is missing, expired, unparsable, or inside its renewal window. A node that restarts while the CA is unreachable keeps serving its existing certificates.
+The leader serves a new certificate at once; the other nodes within 60 seconds. For a first issuance, other nodes cannot serve TLS for the host until then.
 
----
+## Processes
 
-## Cluster mode
-
-A node is always a cluster, of one or more. Certificates are replicated through the Raft log:
-
-- Only the leader contacts the CAs. One issuance, no duplicate certificates across nodes.
-- Each issuer's account is committed to the Raft log when first registered. Every node writes it to `storage/<issuer>/account.json`, and a new leader uses it instead of registering another. A node's own account file is committed only when the log holds none for that issuer's directory.
-- Issued and renewed certificates are committed as Raft entries. Every node — including any node that joins later, via snapshot — writes them to its own `storage` and hot-swaps them into its listeners.
-- On startup, and continuously afterwards, disk and Raft state are reconciled per hostname: the valid certificate with the most remaining lifetime wins and overwrites the other side. A full-cluster restart recovers certificates from disk, and the leader pushes them back into Raft.
-- HTTP-01 challenge tokens are committed to the Raft log during issuance. The leader confirms every node holds the token before telling the CA to validate, so validation requests — which may come from multiple vantage points and land on any node — are answered wherever they arrive. Port 80 for the domain may reach any cluster node. Tokens are retracted from all nodes when the order completes.
-
-### Issuance flow
-
-The CA never pushes anything to Keel. Its only inbound request is the HTTP-01 validation `GET`; everything else happens over the leader's outbound connection to the CA's API.
-
-1. The leader starts the order and receives the challenge token from the CA.
-2. The token is committed to the Raft log; every node writes it to its challenge directory.
-3. The leader confirms every node holds the token, then tells the CA to validate. The validation requests may land on any node — each serves the same token.
-4. The leader polls the order until validation completes, submits the CSR, and downloads the certificate — all over its own connection to the CA. Which node answered the validation request plays no part here.
-5. The challenge tokens are retracted from all nodes; the certificate is committed to the Raft log.
-6. Every other node adopts the certificate and hot-swaps it into its TLS listeners on its next check cycle, within 60 seconds.
-
-During step 6 the leader serves the new certificate while the other nodes still serve the previous one. For a renewal both are valid, so this is invisible. For a first issuance, nodes other than the leader cannot terminate TLS for the hostname until they adopt the certificate — up to a minute after the leader obtains it.
-
----
-
-## How it works
-
-The control worker runs the ACME service; it is the only process that can read `acme.storage`. It writes challenge tokens into the runtime directory, where every worker answers the CA's validation request, and sends issued and renewed certificates to the workers, which swap them into their listeners — no restart, no dropped connections.
-
-A request for `/.well-known/acme-challenge/<token>` where the token is unknown is proxied normally. A backend that manages its own ACME certificates behind Keel keeps working.
-
----
+The control worker runs ACME and is the only process that reads `acme.storage`. It writes challenge tokens to the runtime directory, which every worker answers from, and sends certificates to the workers.
 
 ## Testing against a local CA
-
-For local testing, point an issuer at a self-hosted ACME test server such as Pebble and supply its trust root:
 
 ```hcl
 acme {
@@ -229,14 +137,6 @@ acme {
     root_ca   = "/path/to/test-ca-root.pem"
   }
 }
-
-vhost "test.example" {
-  pool = "web"
-
-  tls {
-    acme = "test"
-  }
-}
 ```
 
-`root_ca` makes Keel trust the test server's self-signed API certificate. It is never needed for a public CA.
+`root_ca` is the test CA's API certificate (Pebble's, for example).

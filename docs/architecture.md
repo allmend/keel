@@ -193,8 +193,7 @@ See [Clustering](cluster.md).
 | Passive ejection | real traffic failing to connect, per worker | that worker |
 
 Every worker probes every backend, so a backend receives one probe per
-worker per interval. Planned: one prober per node, in the control worker,
-with the result shared with the workers through shared memory.
+worker per interval.
 
 ---
 

@@ -44,6 +44,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
   and `--check` (exit 3 when a file is not formatted). See
   [Checking and formatting](docs/configuration.md#checking-and-formatting).
 
+### Removed
+
+- `keel backend add`, which only printed that it is not supported.
+- The hidden `--cluster`, `--bootstrap`, `--join` and `--secret` flags,
+  which only named the `node.hcl` settings that replaced them.
+
 ---
 
 ## [0.25.0] — 2026-10-17
