@@ -9,6 +9,7 @@
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -34,13 +35,14 @@ impl CertPair {
 /// Parse a PEM chain and key into what rustls serves. The full chain is kept
 /// so clients receive intermediates; the leaf is first, as in the file.
 fn certified_key(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<CertifiedKey> {
-    let chain: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut &cert_pem[..]).collect::<Result<_, _>>()?;
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<_, _>>()?;
     if chain.is_empty() {
         anyhow::bail!("no certificate in PEM");
     }
-    let key: PrivateKeyDer<'static> =
-        rustls_pemfile::private_key(&mut &key_pem[..])?.ok_or_else(|| anyhow::anyhow!("no private key in PEM"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => anyhow::anyhow!("no private key in PEM"),
+        e => anyhow::anyhow!("private key: {e}"),
+    })?;
     let signing = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| anyhow::anyhow!("unsupported key type: {e}"))?;
     Ok(CertifiedKey::new(chain, signing))
@@ -261,8 +263,7 @@ pub fn verifying_client_config(extra_ca_pem: Option<&[u8]>) -> anyhow::Result<Ar
     }
     roots.add_parsable_certificates(native.certs);
     if let Some(pem) = extra_ca_pem {
-        let extra: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut &pem[..]).collect::<Result<_, _>>()?;
+        let extra: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>()?;
         if extra.is_empty() {
             anyhow::bail!("tls_ca contains no certificates");
         }
@@ -428,7 +429,7 @@ mod tests {
         let (c2, k2) = pem_pair("a.test");
         let issued = Issued::from([("a.test".to_owned(), (String::from_utf8(c2.clone()).unwrap(), String::from_utf8(k2).unwrap()))]);
         store.reload(&config(&acme, &[]), &issued).unwrap();
-        let from_pem = rustls_pemfile::certs(&mut &c2[..]).next().unwrap().unwrap();
+        let from_pem = CertificateDer::pem_slice_iter(&c2[..]).next().unwrap().unwrap();
         assert_eq!(leaf(), Some(from_pem.to_vec()), "the issued certificate replaces it");
 
         store.reload(&config(&head, &[]), &issued).unwrap();
@@ -440,7 +441,7 @@ mod tests {
         let (c, k) = pem_pair("api.example.com");
         let pair = CertPair::from_pem(&c, &k, "test").unwrap();
         assert_eq!(pair.rustls.cert.len(), 1);
-        let from_pem = rustls_pemfile::certs(&mut &c[..]).next().unwrap().unwrap();
+        let from_pem = CertificateDer::pem_slice_iter(&c[..]).next().unwrap().unwrap();
         assert_eq!(pair.rustls.cert[0].as_ref(), from_pem.as_ref());
     }
 

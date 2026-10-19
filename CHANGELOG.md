@@ -40,6 +40,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   backend healthy, and the verdicts stay while the control worker is down.
   `icmp` checks use one socket pair, held by the control worker.
 
+- **Breaking:** the keelconfig credentials file is HCL, as is
+  `members.hcl` in the state directory (`member "<node_id>"` blocks; was
+  `members.yaml`). Keelconfigs issued before are not read: issue new ones
+  with `keel credentials create`. Keel reads and writes no YAML.
+
 ### Added
 
 - `keel config validate [node.hcl]`: load a node file and its config
@@ -54,6 +59,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - `keel_pool_backends{pool, state}`: backends per pool that are available,
   unhealthy, ejected or draining, counted at each scrape from the node's
   view; the `KeelPoolNoAvailableBackend` alert rule in `contrib/` uses it.
+- Minimum Rust version 1.90, declared as `rust-version` and built in CI.
+- CI runs `cargo deny`: advisories, licenses, duplicate versions.
+  Dependabot proposes cargo and GitHub Actions updates weekly.
 
 ### Fixed
 
@@ -77,6 +85,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 - `keel backend add`, which only printed that it is not supported.
 - The hidden `--cluster`, `--bootstrap`, `--join` and `--secret` flags,
   which only named the `node.hcl` settings that replaced them.
+
+### Security
+
+- rustls 0.23.46: fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted at the wrong encryption level), RUSTSEC-2026-0346 (secrets in
+  `Debug` output) and three more advisories against 0.23.44.
+- PEM files are parsed by rustls' own types; `rustls-pemfile` is
+  unmaintained. `serde_yml` (RUSTSEC-2025-0068, unsound) is gone with YAML.
 
 ---
 

@@ -458,7 +458,8 @@ mod tests {
         assert_eq!(tls.sni.as_deref(), Some("cache.example.test"));
         assert_eq!(tls.version.as_deref(), Some("TLSv1.3"));
         assert!(tls.cipher.is_some());
-        let expected = rustls_pemfile::certs(&mut cert.as_bytes()).next().unwrap().unwrap();
+        use rustls::pki_types::pem::PemObject;
+        let expected = rustls::pki_types::CertificateDer::pem_slice_iter(cert.as_bytes()).next().unwrap().unwrap();
         assert_eq!(served, expected.to_vec());
     }
 

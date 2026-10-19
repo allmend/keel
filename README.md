@@ -74,7 +74,7 @@ Linux (x86_64, arm64) and FreeBSD (x86_64) on the [releases page](https://github
 ### From source
 
 ```bash
-# Linux: libssl-dev. macOS: OPENSSL_DIR=$(brew --prefix openssl)
+# Rust 1.90 or later. Linux: libssl-dev. macOS: OPENSSL_DIR=$(brew --prefix openssl)
 cargo build --release
 ./target/release/keel --config node.hcl
 ```

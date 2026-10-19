@@ -32,7 +32,7 @@ On the node:
 keel credentials create john --endpoint lb1.example.com:10789 > keelconfig
 ```
 
-A keelconfig is one YAML file: the endpoint, the control CA certificate, and a client certificate and private key for `john`.
+A keelconfig is one HCL file: the endpoint, the control CA certificate, and a client certificate and private key for `john`.
 
 `--endpoint` is written as given. keelctl verifies the server as `keel-control` against the CA, so any route to the node works (DNS name, VIP, port-forward).
 

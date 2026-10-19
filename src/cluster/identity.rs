@@ -14,7 +14,7 @@ const NODE_ID_FILE: &str = "node_id";
 const NODE_CERT_FILE: &str = "node.crt";
 const NODE_KEY_FILE: &str = "node.key";
 const CLUSTER_CA_FILE: &str = "cluster-ca.crt";
-const MEMBERS_FILE: &str = "members.yaml";
+const MEMBERS_FILE: &str = "members.hcl";
 
 /// Read the node ID from `<state_dir>/node_id`, or generate a random one and
 /// store it there on first start. The ID stays the node's identity for as long
@@ -90,16 +90,15 @@ pub fn load_node_tls(state_dir: &Path) -> Result<Option<NodeTls>> {
     }
 }
 
-/// One entry of `members.yaml`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// One entry of `members.hcl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
-    #[serde(with = "id_as_string")]
     pub node_id: NodeId,
     pub addr: String,
     pub role: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemberList {
     pub members: Vec<Member>,
 }
@@ -108,32 +107,39 @@ pub struct MemberList {
 /// Readable for operators; a node that has lost its Raft store rejoins
 /// through the members listed here.
 pub fn write_members(state_dir: &Path, list: &MemberList) -> Result<()> {
-    let body = serde_yml::to_string(list)?;
-    let text = format!("# Last known cluster members, rewritten by Keel on every membership change.\n{body}");
+    let quote = |s: &str| hcl::Expression::from(s).to_string();
+    let mut text = String::from("# Last known cluster members, rewritten by Keel on every membership change.\n");
+    for m in &list.members {
+        text.push_str(&format!("\nmember \"{}\" {{\n  addr = {}\n  role = {}\n}}\n", m.node_id, quote(&m.addr), quote(&m.role)));
+    }
     write_file(state_dir, MEMBERS_FILE, &text, 0o644)
 }
 
 pub fn read_members(state_dir: &Path) -> Result<Option<MemberList>> {
     let path = state_dir.join(MEMBERS_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(text) => serde_yml::from_str(&text).map(Some).with_context(|| format!("{} is not readable", path.display())),
+        Ok(text) => parse_members(&text).map(Some).with_context(|| format!("{} is not readable", path.display())),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
     }
 }
 
-/// YAML integers are signed 64-bit; node IDs use all 64 bits, so they are
-/// written as strings.
-mod id_as_string {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(id: &u64, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(id)
+/// `member "<node_id>" { addr = "...", role = "..." }` blocks.
+fn parse_members(text: &str) -> Result<MemberList> {
+    let body = hcl::parse(text)?;
+    let mut members = Vec::new();
+    for block in body.blocks().filter(|b| b.identifier() == "member") {
+        let [label] = block.labels() else { bail!("a member block takes one label: its node ID") };
+        let node_id = label.as_str().parse().with_context(|| format!("node ID '{}'", label.as_str()))?;
+        let text = |name: &str| -> Result<String> {
+            match block.body().attributes().find(|a| a.key() == name).map(|a| a.expr()) {
+                Some(hcl::Expression::String(s)) => Ok(s.clone()),
+                _ => bail!("member {node_id}: `{name}` is missing or not a string"),
+            }
+        };
+        members.push(Member { node_id, addr: text("addr")?, role: text("role")? });
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
-    }
+    Ok(MemberList { members })
 }
 
 fn random_id() -> Result<NodeId> {
@@ -169,6 +175,25 @@ pub fn announce_addr(addr: &str, advertise: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn members_round_trip_as_hcl_blocks() {
+        let dir = std::env::temp_dir().join(format!("keel-members-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = MemberList {
+            members: vec![
+                Member { node_id: u64::MAX, addr: "10.0.0.1:7654".into(), role: "voter".into() },
+                Member { node_id: 7, addr: "[::1]:7654".into(), role: "learner".into() },
+            ],
+        };
+        write_members(&dir, &list).unwrap();
+        let text = std::fs::read_to_string(dir.join(MEMBERS_FILE)).unwrap();
+        assert!(text.contains("member \"18446744073709551615\" {\n  addr = \"10.0.0.1:7654\"\n  role = \"voter\"\n}"), "{text}");
+        assert_eq!(read_members(&dir).unwrap(), Some(list));
+        std::fs::write(dir.join(MEMBERS_FILE), "member \"x\" {}\n").unwrap();
+        assert!(read_members(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("keel-identity-{name}-{}", std::process::id()));

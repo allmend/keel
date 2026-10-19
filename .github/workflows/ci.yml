@@ -39,6 +39,32 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  msrv:
+    name: Rust 1.90 (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.90
+
+      - name: Build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends libssl-dev pkg-config cmake
+
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Advisories, licenses and duplicate versions, as deny.toml says.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   e2e:
     name: end-to-end
     # Minutes of image build and cluster start-up per run: on main only, not

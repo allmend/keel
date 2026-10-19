@@ -150,7 +150,7 @@ fn relative_key(path: &str) -> Option<&str> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The node file this config was loaded from — set by load(), not from YAML.
+    /// The node file this config was loaded from — set by load(), not by the files.
     #[serde(skip, default)]
     pub path: String,
 

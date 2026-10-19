@@ -1,5 +1,5 @@
 //! The keelconfig credentials file — endpoint, control CA certificate, and a
-//! client certificate + key signed by that CA, in one YAML document. Created
+//! client certificate + key signed by that CA, as HCL attributes. Created
 //! on a node with `keel credentials create`; consumed by `keelctl`.
 
 use std::path::PathBuf;
@@ -25,12 +25,12 @@ pub struct Keelconfig {
 }
 
 impl Keelconfig {
-    pub fn to_yaml(&self) -> Result<String> {
-        Ok(serde_yml::to_string(self)?)
+    pub fn to_hcl(&self) -> Result<String> {
+        Ok(hcl::to_string(self)?)
     }
 
-    pub fn from_yaml(s: &str) -> Result<Self> {
-        Ok(serde_yml::from_str(s)?)
+    pub fn from_hcl(s: &str) -> Result<Self> {
+        Ok(hcl::from_str(s)?)
     }
 
     /// Load from an explicit path, or resolve via [`resolve_path`].
@@ -38,7 +38,7 @@ impl Keelconfig {
         let path = resolve_path(explicit)?;
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read keelconfig at {}", path.display()))?;
-        Self::from_yaml(&raw).with_context(|| format!("invalid keelconfig at {}", path.display()))
+        Self::from_hcl(&raw).with_context(|| format!("invalid keelconfig at {}", path.display()))
     }
 }
 

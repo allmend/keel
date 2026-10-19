@@ -8,7 +8,8 @@
 //! against the control CA in the keelconfig — the endpoint address is pure
 //! transport, so IPs, DNS names, and port-forwards all work unchanged.
 
-use std::io::Cursor;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::TcpStream;
 use std::sync::Arc;
 
@@ -147,17 +148,15 @@ fn connect(kc: &Keelconfig) -> Result<rustls::StreamOwned<rustls::ClientConnecti
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut Cursor::new(kc.ca_cert.as_bytes())) {
+    for cert in CertificateDer::pem_slice_iter(kc.ca_cert.as_bytes()) {
         let cert = cert.context("invalid ca_cert in keelconfig")?;
         roots.add(cert).map_err(|e| anyhow::anyhow!("invalid ca_cert in keelconfig: {e}"))?;
     }
 
-    let client_certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(kc.client_cert.as_bytes()))
+    let client_certs: Vec<_> = CertificateDer::pem_slice_iter(kc.client_cert.as_bytes())
         .collect::<Result<_, _>>()
         .context("invalid client_cert in keelconfig")?;
-    let client_key = rustls_pemfile::private_key(&mut Cursor::new(kc.client_key.as_bytes()))
-        .context("invalid client_key in keelconfig")?
-        .context("no private key found in keelconfig client_key")?;
+    let client_key = PrivateKeyDer::from_pem_slice(kc.client_key.as_bytes()).context("invalid client_key in keelconfig")?;
 
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)

@@ -2,6 +2,7 @@
 name = "keel-e2e"
 version = "0.0.0"
 edition = "2021"
+rust-version = "1.90"
 publish = false
 description = "End-to-end tests: keel in containers, driven over the control protocol"
 

@@ -563,8 +563,8 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn from_keelconfig(yaml: &str) -> Result<Control> {
-        Ok(Control { kc: Keelconfig::from_yaml(yaml)? })
+    pub fn from_keelconfig(text: &str) -> Result<Control> {
+        Ok(Control { kc: Keelconfig::from_hcl(text)? })
     }
 
     /// Send one request and return its `data`, or the error the node answered.

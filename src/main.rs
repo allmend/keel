@@ -282,6 +282,6 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
 
     eprintln!("# keelconfig for '{name}' — contains a private key, store it like one.");
     eprintln!("# Save as ~/.keel/config (or point KEEL_CONFIG at it) and run: keelctl status");
-    print!("{}", kc.to_yaml()?);
+    print!("{}", kc.to_hcl()?);
     Ok(())
 }

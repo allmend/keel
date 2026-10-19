@@ -479,8 +479,8 @@ fn a_removed_member_stays_out() -> Result<()> {
     for node in [leader.as_str(), asker] {
         cluster.wait_for_voters(node, &rest)?;
     }
-    let listed = cluster.stack.exec(asker, &["cat", "/var/lib/keel/members.yaml"])?;
-    assert!(!String::from_utf8_lossy(&listed.stdout).contains(&gone_id.to_string()), "members.yaml updated");
+    let listed = cluster.stack.exec(asker, &["cat", "/var/lib/keel/members.hcl"])?;
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(&gone_id.to_string()), "members.hcl updated");
 
     // It comes back with its state: the others refuse it, and writes still
     // commit with two voters.
@@ -581,10 +581,10 @@ fn a_follower_admits_a_joiner() -> Result<()> {
 #[ignore = "needs Docker"]
 fn members_file_lists_the_cluster() -> Result<()> {
     let cluster = Cluster::up("cluster-members")?;
-    let out = cluster.stack.exec("node2", &["cat", "/var/lib/keel/members.yaml"])?;
+    let out = cluster.stack.exec("node2", &["cat", "/var/lib/keel/members.hcl"])?;
     let text = String::from_utf8_lossy(&out.stdout);
     for node in NODES {
-        assert!(text.contains(&cluster.id(node).to_string()), "{node} listed:\n{text}");
+        assert!(text.contains(&format!("member \"{}\" {{", cluster.id(node))), "{node} listed:\n{text}");
         assert!(text.contains(&format!("{}:7654", ip(node))), "{node}'s address listed:\n{text}");
     }
     Ok(())

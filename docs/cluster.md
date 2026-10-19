@@ -51,11 +51,11 @@ A single node with a `cluster` block added and a restart keeps its state and mov
 
 Raft state is in `raft/store.redb` under `keel.state_dir` (default `/var/lib/keel`): log, vote, committed index, snapshot. A node with stored state restarts from it, catches up from the leader and ignores `cluster.join` — except a node that is alone in its stored cluster and lists `join`: it started a cluster of its own earlier, and refuses to start until `raft/` is removed.
 
-The state directory also holds `node_id`, `node.crt`, `node.key` (0600), `cluster-ca.crt` and `members.yaml` (the last known members).
+The state directory also holds `node_id`, `node.crt`, `node.key` (0600), `cluster-ca.crt` and `members.hcl`, the last known members as `member "<node_id>"` blocks.
 
 ### Lost or damaged Raft state
 
-An unreadable store is moved to `raft.corrupt-<time>/` and logged (`Raft store unreadable and set aside`). The node serves traffic from its local config and rejoins through `cluster.join` and `members.yaml`, never starting a new cluster. The leader replaces the old member with the node as a learner. If `members.yaml` lists only the node itself, it starts a new one-member cluster; drain state is lost and logged as lost.
+An unreadable store is moved to `raft.corrupt-<time>/` and logged (`Raft store unreadable and set aside`). The node serves traffic from its local config and rejoins through `cluster.join` and `members.hcl`, never starting a new cluster. The leader replaces the old member with the node as a learner. If `members.hcl` lists only the node itself, it starts a new one-member cluster; drain state is lost and logged as lost.
 
 A node whose stored address differs from `advertise` rejoins the same way, its store moved to `raft.moved-<time>/`. A one-member cluster updates its own membership instead.
 

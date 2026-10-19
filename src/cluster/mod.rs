@@ -6,15 +6,14 @@ pub mod store;
 pub mod types;
 
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as RaftConfig, Raft};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -130,7 +129,7 @@ pub struct ClusterOpts {
     pub cluster_addr: Option<String>,
     /// Address announced to the other nodes (`cluster.advertise`, or the bind address).
     pub advertise: String,
-    /// `keel.state_dir`: node ID, certificates, `members.yaml`, and `raft/`.
+    /// `keel.state_dir`: node ID, certificates, `members.hcl`, and `raft/`.
     pub state_dir: std::path::PathBuf,
     /// Forced recovery: keep the stored state, make this node the only member.
     pub force_new_cluster: bool,
@@ -282,11 +281,11 @@ impl Ca {
 }
 
 fn parse_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    certs(&mut Cursor::new(pem.as_bytes())).filter_map(Result::ok).collect()
+    CertificateDer::pem_slice_iter(pem.as_bytes()).filter_map(Result::ok).collect()
 }
 
 fn parse_key(pem: &str) -> Option<PrivateKeyDer<'static>> {
-    private_key(&mut Cursor::new(pem.as_bytes())).ok().flatten()
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).ok()
 }
 
 fn build_client_tls(
@@ -958,7 +957,7 @@ async fn exit_when_raft_stops(raft: Arc<ClusterRaft>, shutdown: pingora::server:
     }
 }
 
-/// Rewrite `members.yaml` whenever the membership changes.
+/// Rewrite `members.hcl` whenever the membership changes.
 async fn keep_members_file(raft: Arc<ClusterRaft>, state_dir: std::path::PathBuf) {
     let mut metrics = raft.metrics();
     let mut written: Option<identity::MemberList> = None;
@@ -980,7 +979,7 @@ async fn keep_members_file(raft: Arc<ClusterRaft>, state_dir: std::path::PathBuf
         if !list.members.is_empty() && written.as_ref() != Some(&list) {
             match identity::write_members(&state_dir, &list) {
                 Ok(()) => written = Some(list),
-                Err(e) => warn!(error = %format!("{e:#}"), "cluster: cannot write members.yaml"),
+                Err(e) => warn!(error = %format!("{e:#}"), "cluster: cannot write members.hcl"),
             }
         }
         if metrics.changed().await.is_err() {
@@ -1802,7 +1801,8 @@ mod tests {
         let ca = Ca::generate().unwrap();
         let copy = Ca::from_pems(&ca.cert_pem, &ca.key_pem).unwrap();
         let (cert_pem, _) = copy.issue_node_cert(42).unwrap();
-        let der = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem.as_bytes())).next().unwrap().unwrap();
+        use rustls::pki_types::pem::PemObject;
+        let der = super::CertificateDer::pem_slice_iter(cert_pem.as_bytes()).next().unwrap().unwrap();
         let cert = openssl::x509::X509::from_der(der.as_ref()).unwrap();
         let ca_cert = openssl::x509::X509::from_pem(ca.cert_pem.as_bytes()).unwrap();
         assert!(cert.verify(&ca_cert.public_key().unwrap()).unwrap(), "signed by the original CA");

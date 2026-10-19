@@ -18,7 +18,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use ipnet::IpNet;
-use rustls_pemfile::{certs, private_key};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -199,11 +200,10 @@ fn build_server_tls(
     key_pem: &str,
     ca_pem: &str,
 ) -> Result<Arc<rustls::ServerConfig>> {
-    use std::io::Cursor;
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = rustls::RootCertStore::empty();
-    for c in certs(&mut Cursor::new(ca_pem.as_bytes())).filter_map(|r| r.ok()) {
+    for c in CertificateDer::pem_slice_iter(ca_pem.as_bytes()).filter_map(|r| r.ok()) {
         roots.add(c).map_err(|e| anyhow::anyhow!("invalid control CA cert: {e}"))?;
     }
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
@@ -211,11 +211,8 @@ fn build_server_tls(
         .map_err(|e| anyhow::anyhow!("client verifier: {e}"))?;
 
     let cert_chain: Vec<_> =
-        certs(&mut Cursor::new(cert_pem.as_bytes())).filter_map(|r| r.ok()).collect();
-    let key = private_key(&mut Cursor::new(key_pem.as_bytes()))
-        .ok()
-        .flatten()
-        .context("missing control server key")?;
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).filter_map(|r| r.ok()).collect();
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).ok().context("missing control server key")?;
 
     let cfg = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
