@@ -1,78 +1,72 @@
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod fmt;
+mod hcl;
+
 /// Default location of the node-local file. A node without one runs on the
 /// defaults of every node setting.
-pub const DEFAULT_NODE_PATH: &str = "/etc/keel/node.yaml";
+pub const DEFAULT_NODE_PATH: &str = "/etc/keel/node.hcl";
 
 /// The replicated config: every file under the config directory by relative
-/// path. Only `*.yaml` files are parsed as config; others (certificates)
+/// path. Only `*.hcl` files are parsed as config; others (certificates)
 /// travel with them unchanged.
 pub use keel_control::FileSet;
 
-/// The config directory's root file, loaded before every other `*.yaml`.
-pub const ROOT_FILE: &str = "keel.yaml";
+/// The config directory's root file, loaded before every other `*.hcl`.
+pub const ROOT_FILE: &str = "keel.hcl";
 
-/// Sections of `node.yaml`: how this node is reached and run.
-const NODE_SECTIONS: [&str; 4] = ["keel", "cluster", "control", "metrics"];
-/// `keel:` settings that describe the node rather than the load balancer.
-const NODE_KEEL_KEYS: [&str; 7] = ["workers", "user", "group", "control_user", "control_socket", "state_dir", "config_dir"];
-/// Sections only the root file of the config directory may hold; the other
-/// files add pools, vhosts, listeners and certificates.
-const ROOT_ONLY_SECTIONS: [&str; 4] = ["keel", "access_log", "acme", "cache"];
-
-/// Load `node.yaml` at `node_path` and the config directory it names
+/// Load the node file at `node_path` and the config directory it names
 /// (`keel.config_dir`). A missing file at the default path means defaults.
 pub fn load(node_path: &str) -> Result<Config> {
-    let node_yaml = match fs::read_to_string(node_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && node_path == DEFAULT_NODE_PATH => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {node_path}")),
-    };
-    let dir = config_dir(&node_yaml).with_context(|| format!("cannot parse {node_path}"))?;
+    let node_file = read_node_file(node_path)?;
+    let dir = config_dir(node_path, &node_file)?;
     let files = read_config_dir(&dir)?;
-    let mut cfg = assemble(&node_yaml, &files).with_context(|| format!("invalid config ({node_path}, {})", dir.display()))?;
+    let mut cfg = build(node_path, &node_file, &files, Some(&dir))?;
     cfg.path = node_path.to_owned();
-    cfg.node_yaml = node_yaml;
+    cfg.node_file = node_file;
     Ok(cfg)
 }
 
-/// `node_yaml` without its `cluster:` section: what the workers get. The
-/// join secret stays with the control worker.
-pub fn without_cluster_section(node_yaml: &str) -> String {
-    let Ok(mut node) = parse_mapping("node.yaml", node_yaml) else { return String::new() };
-    node.remove("cluster");
-    if node.is_empty() {
-        return String::new();
+/// The node file's text; empty when the default one does not exist.
+pub fn read_node_file(node_path: &str) -> Result<String> {
+    match fs::read_to_string(node_path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && node_path == DEFAULT_NODE_PATH => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {node_path}")),
     }
-    serde_yml::to_string(&serde_yml::Value::Mapping(node)).unwrap_or_default()
+}
+
+/// `node_file` without its `cluster` block: what the workers get. The join
+/// secret stays with the control worker.
+pub fn without_cluster_section(node_file: &str) -> String {
+    let Ok(mut body) = hcl_edit::parser::parse_body(node_file) else { return String::new() };
+    body.remove_blocks("cluster");
+    body.to_string()
 }
 
 impl Config {
-    /// This config as the workers get it: without the `cluster:` section
-    /// and its join secret.
+    /// This config as the workers get it: without the `cluster` block and
+    /// its join secret.
     pub fn for_workers(&self) -> Config {
         let mut cfg = self.clone();
         cfg.cluster = None;
-        cfg.node_yaml = without_cluster_section(&self.node_yaml);
+        cfg.node_file = without_cluster_section(&self.node_file);
         cfg
     }
 }
 
 /// `keel.config_dir` from a node file, or its default.
-fn config_dir(node_yaml: &str) -> Result<PathBuf> {
-    let node = parse_mapping("node.yaml", node_yaml)?;
-    let dir = node
-        .get("keel")
-        .and_then(|k| k.get("config_dir"))
-        .and_then(|d| d.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(default_config_dir);
-    Ok(PathBuf::from(dir))
+pub fn config_dir(node_path: &str, node_file: &str) -> Result<PathBuf> {
+    let node = hcl::Source { name: node_path.to_owned(), text: node_file };
+    let doc = hcl::read(Some(&node), &[])?;
+    let dir = doc.value.get("keel").and_then(|k| k.get("config_dir")).and_then(|d| d.as_str());
+    Ok(PathBuf::from(dir.map(str::to_owned).unwrap_or_else(default_config_dir)))
 }
 
 /// Every file below `dir`, by relative path.
@@ -80,106 +74,35 @@ pub fn read_config_dir(dir: &std::path::Path) -> Result<FileSet> {
     keel_control::read_file_set(dir)
 }
 
-fn parse_mapping(name: &str, text: &str) -> Result<serde_yml::Mapping> {
-    if text.trim().is_empty() {
-        return Ok(serde_yml::Mapping::new());
+/// The config files of a set in load order: the root file, then every other
+/// `*.hcl` in path order. A YAML file is refused: the format changed.
+pub fn config_files(files: &FileSet) -> Result<Vec<(&str, &str)>> {
+    if let Some(old) = files.keys().find(|p| p.ends_with(".yaml") || p.ends_with(".yml")) {
+        anyhow::bail!("{old}: the configuration is HCL now (*.hcl); YAML files are not read");
     }
-    match serde_yml::from_str::<serde_yml::Value>(text).with_context(|| format!("cannot parse {name}"))? {
-        serde_yml::Value::Mapping(m) => Ok(m),
-        serde_yml::Value::Null => Ok(serde_yml::Mapping::new()),
-        _ => anyhow::bail!("{name}: expected a mapping of sections"),
-    }
+    let root = files.get(ROOT_FILE).with_context(|| format!("the config directory has no {ROOT_FILE}"))?;
+    let mut out = vec![(ROOT_FILE, root.as_str())];
+    out.extend(files.iter().filter(|(p, _)| p.ends_with(".hcl") && p.as_str() != ROOT_FILE).map(|(p, t)| (p.as_str(), t.as_str())));
+    Ok(out)
 }
 
-fn keel_keys(section: &serde_yml::Mapping) -> Vec<String> {
-    section
-        .get("keel")
-        .and_then(|k| k.as_mapping())
-        .map(|m| m.keys().map(|k| k.as_str().to_owned()).collect())
-        .unwrap_or_default()
+/// Build the config from this node's node file and a replicated file set.
+pub fn assemble(node_file: &str, files: &FileSet) -> Result<Config> {
+    build("node.hcl", node_file, files, None)
 }
 
-/// `node.yaml` holds node settings only; everything else is replicated.
-fn check_node_file(node: &serde_yml::Mapping) -> Result<()> {
-    for key in node.keys().map(|k| k.as_str()) {
-        if !NODE_SECTIONS.contains(&key) {
-            anyhow::bail!("node.yaml: `{key}` belongs in the config directory, not in node.yaml");
-        }
-    }
-    for key in keel_keys(node) {
-        if !NODE_KEEL_KEYS.contains(&key.as_str()) {
-            anyhow::bail!("node.yaml: `keel.{key}` belongs in the config directory's {ROOT_FILE}, not in node.yaml");
-        }
-    }
-    Ok(())
-}
-
-/// Files of the config directory hold no node settings, and only the root
-/// file holds the sections that exist once.
-fn check_replicated_file(path: &str, file: &serde_yml::Mapping) -> Result<()> {
-    for key in file.keys().map(|k| k.as_str()) {
-        if key == "include" {
-            anyhow::bail!("{path}: `include` is not supported: every *.yaml in the config directory is loaded");
-        }
-        if NODE_SECTIONS.contains(&key) && key != "keel" {
-            anyhow::bail!("{path}: `{key}` belongs in node.yaml");
-        }
-        if path != ROOT_FILE && ROOT_ONLY_SECTIONS.contains(&key) {
-            anyhow::bail!("{path}: `{key}` may only be set in {ROOT_FILE}");
-        }
-    }
-    for key in keel_keys(file) {
-        if NODE_KEEL_KEYS.contains(&key.as_str()) {
-            anyhow::bail!("{path}: `keel.{key}` belongs in node.yaml");
-        }
-    }
-    Ok(())
-}
-
-/// Build the config from this node's `node.yaml` and a replicated file set:
-/// the set's `keel.yaml` first, then its other `*.yaml` files in path order.
-pub fn assemble(node_yaml: &str, files: &FileSet) -> Result<Config> {
-    let node = parse_mapping("node.yaml", node_yaml)?;
-    check_node_file(&node)?;
-    let root_text = files.get(ROOT_FILE).with_context(|| format!("the config directory has no {ROOT_FILE}"))?;
-    let mut root = parse_mapping(ROOT_FILE, root_text)?;
-    check_replicated_file(ROOT_FILE, &root)?;
-
-    // Node settings join the root: its `keel:` keys into the root's `keel:`.
-    for (key, value) in node {
-        match (key.as_str(), value) {
-            ("keel", serde_yml::Value::Mapping(node_keel)) => {
-                let keel = root.entry("keel".to_owned()).or_insert_with(|| serde_yml::Value::Mapping(Default::default()));
-                if let serde_yml::Value::Mapping(keel) = keel {
-                    keel.extend(node_keel);
-                }
-            }
-            (_, value) => {
-                root.insert(key, value);
-            }
-        }
-    }
-    let mut cfg: Config = serde_yml::from_value(serde_yml::Value::Mapping(root)).context("cannot parse config")?;
-
-    for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".yaml") && p.as_str() != ROOT_FILE) {
-        let file = parse_mapping(path, text)?;
-        check_replicated_file(path, &file)?;
-        let fragment: IncludeFragment =
-            serde_yml::from_value(serde_yml::Value::Mapping(file)).with_context(|| format!("cannot parse {path}"))?;
-
-        // Pools merge as a map — duplicate name is an error.
-        for (name, pool) in fragment.pools {
-            if cfg.pools.contains_key(&name) {
-                anyhow::bail!("{path}: pool '{name}' is already defined in another config file");
-            }
-            cfg.pools.insert(name, pool);
-        }
-        // Vhosts, listeners, and certificates are appended in load order.
-        cfg.vhosts.extend(fragment.vhosts);
-        cfg.listeners.extend(fragment.listeners);
-        cfg.certificates.extend(fragment.certificates);
-    }
-
+/// Build a config; errors name files below `dir` when given, else by their
+/// path in the set.
+fn build(node_name: &str, node_file: &str, files: &FileSet, dir: Option<&Path>) -> Result<Config> {
+    let name = |p: &str| dir.map_or_else(|| p.to_owned(), |d| d.join(p).display().to_string());
+    let listed = config_files(files).map_err(|e| match dir {
+        Some(d) => anyhow::anyhow!("{}: {e:#}", d.display()),
+        None => e,
+    })?;
+    let sources: Vec<hcl::Source> = listed.into_iter().map(|(p, text)| hcl::Source { name: name(p), text }).collect();
+    let node = hcl::Source { name: node_name.to_owned(), text: node_file };
+    let doc = hcl::read(Some(&node), &sources)?;
+    let mut cfg: Config = from_document(&doc)?;
     cfg.files = files.clone();
     cfg.validate()?;
     // The ACME client reads its extra trust root from disk: a relative
@@ -195,28 +118,35 @@ pub fn assemble(node_yaml: &str, files: &FileSet) -> Result<Config> {
     Ok(cfg)
 }
 
+/// Deserialize a document; an error names the file, line and column of the
+/// attribute or block it is about.
+fn from_document<T: DeserializeOwned>(doc: &hcl::Document) -> Result<T> {
+    serde_path_to_error::deserialize(serde_json::Value::Object(doc.value.clone())).map_err(|e| {
+        let path = hcl::path_of(e.path());
+        let mut msg = e.inner().to_string();
+        let mut at = path.clone();
+        for (serde, ours) in [("unknown field `", "unknown attribute `"), ("missing field `", "missing attribute `")] {
+            if let Some(name) = msg.strip_prefix(serde).and_then(|rest| rest.split('`').next()) {
+                if serde.starts_with("unknown") {
+                    at = if path.is_empty() { name.to_owned() } else { format!("{path}.{name}") };
+                }
+                msg = format!("{ours}{name}`");
+            }
+        }
+        match doc.locate(&at) {
+            Some(pos) => hcl::error_at(pos, msg),
+            None => anyhow::anyhow!("{msg}"),
+        }
+    })
+}
+
 /// A relative path in the config names a file of the config directory.
 fn relative_key(path: &str) -> Option<&str> {
     (!std::path::Path::new(path).is_absolute()).then(|| path.trim_start_matches("./"))
 }
 
-/// A file of the config directory other than its root `keel.yaml`.
-#[derive(Debug, Deserialize, Default)]
-struct IncludeFragment {
-    #[serde(default)]
-    pools: HashMap<String, Pool>,
-
-    #[serde(default)]
-    vhosts: Vec<Vhost>,
-
-    #[serde(default)]
-    listeners: Vec<Listener>,
-
-    #[serde(default)]
-    certificates: Vec<CertificateRequest>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// The node file this config was loaded from — set by load(), not from YAML.
     #[serde(skip, default)]
@@ -225,7 +155,7 @@ pub struct Config {
     /// The node file's text as loaded — set by load(). A cluster node builds
     /// every replicated version against it.
     #[serde(skip, default)]
-    pub node_yaml: String,
+    pub node_file: String,
 
     /// The config directory's files this config was built from — set by
     /// assemble(). Relative file paths in the config resolve against it.
@@ -270,6 +200,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub remote: Option<RemoteControlConfig>,
 }
@@ -301,7 +232,7 @@ impl Config {
             // Without it the join listener would hand a CA-signed identity to
             // any peer that reaches the cluster port.
             if cluster.secret.as_deref().unwrap_or("").is_empty() {
-                anyhow::bail!("cluster.secret is required when node.yaml has a cluster section");
+                anyhow::bail!("cluster.secret is required when node.hcl has a cluster block");
             }
         }
         self.check_port_collisions()?;
@@ -328,13 +259,7 @@ impl Config {
             if pool.passive.failures == 0 {
                 anyhow::bail!("pool '{name}': passive.failures must be at least 1");
             }
-            parse_duration(&pool.passive.eject_for)
-                .map_err(|e| anyhow::anyhow!("pool '{name}': passive.eject_for: {e}"))?;
             if let Some(hc) = &pool.health_check {
-                parse_duration(&hc.interval)
-                    .map_err(|e| anyhow::anyhow!("pool '{name}': health_check.interval: {e}"))?;
-                parse_duration(&hc.timeout)
-                    .map_err(|e| anyhow::anyhow!("pool '{name}': health_check.timeout: {e}"))?;
                 if hc.healthy_threshold == 0 || hc.unhealthy_threshold == 0 {
                     anyhow::bail!("pool '{name}': health_check thresholds must be at least 1");
                 }
@@ -382,79 +307,52 @@ impl Config {
                 })?;
             }
         }
-        if self.keel.udp_flow_timeout_seconds == 0 {
-            anyhow::bail!("keel.udp_flow_timeout_seconds must be at least 1");
-        }
         if self.keel.udp_max_flows == 0 {
             anyhow::bail!("keel.udp_max_flows must be at least 1");
         }
+        let mut bound: HashSet<(bool, &str)> = HashSet::new();
         for l in &self.listeners {
-            if let Some(pool) = &l.tcp_pool {
-                if !self.pools.contains_key(pool) {
-                    anyhow::bail!("listener '{}' references unknown tcp_pool '{pool}'", l.address);
-                }
-                if l.tls {
-                    anyhow::bail!(
-                        "listener '{}': tcp_pool is passthrough — remove 'tls' \
-                         (TLS termination for TCP pools is not implemented)",
-                        l.address
-                    );
-                }
+            let id = format!("listener \"{}\" \"{}\"", serde_json::to_value(l.protocol).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default(), l.address);
+            // http, https and tcp listeners share TCP ports; udp has its own.
+            if !bound.insert((l.protocol == Protocol::Udp, l.address.as_str())) {
+                anyhow::bail!("{id}: another listener already uses {}", l.address);
             }
-            if l.tcp_pool.is_none() && (l.tls_mode != TlsMode::Passthrough || l.tls_host.is_some()) {
-                anyhow::bail!("listener '{}': tls_mode and tls_host apply to tcp_pool listeners only", l.address);
+            match (l.protocol, &l.pool) {
+                (Protocol::Tcp | Protocol::Udp, None) => anyhow::bail!("{id} needs a pool"),
+                (Protocol::Tcp | Protocol::Udp, Some(pool)) if !self.pools.contains_key(pool) => {
+                    anyhow::bail!("{id} references unknown pool '{pool}'")
+                }
+                (Protocol::Http | Protocol::Https, Some(_)) => {
+                    anyhow::bail!("{id}: an HTTP listener routes by vhost and takes no pool")
+                }
+                _ => {}
             }
-            if l.tcp_pool.is_some() {
+            if l.protocol != Protocol::Tcp && (l.tls_mode != TlsMode::Passthrough || l.tls_host.is_some() || l.tls_verify || l.tls_ca.is_some()) {
+                anyhow::bail!("{id}: tls_mode, tls_host, tls_verify and tls_ca apply to tcp listeners only");
+            }
+            if l.protocol == Protocol::Tcp {
                 match l.tls_mode {
                     TlsMode::Passthrough => {
                         if l.tls_host.is_some() || l.tls_verify || l.tls_ca.is_some() {
-                            anyhow::bail!(
-                                "listener '{}': tls_host, tls_verify, and tls_ca need tls_mode terminate or reencrypt",
-                                l.address
-                            );
+                            anyhow::bail!("{id}: tls_host, tls_verify and tls_ca need tls_mode terminate or reencrypt");
                         }
                     }
                     TlsMode::Terminate | TlsMode::Reencrypt => {
                         let Some(host) = &l.tls_host else {
-                            anyhow::bail!(
-                                "listener '{}': tls_mode {:?} needs tls_host (a certificates: entry or a vhost with tls)",
-                                l.address, l.tls_mode
-                            );
+                            anyhow::bail!("{id}: tls_mode {:?} needs tls_host (a certificate block or a vhost with tls)", l.tls_mode);
                         };
                         let known = self.certificates.iter().any(|c| &c.host == host)
                             || self.vhosts.iter().any(|v| &v.host == host && v.tls.is_some());
                         if !known {
-                            anyhow::bail!(
-                                "listener '{}': tls_host '{host}' matches no certificates: entry or vhost with tls",
-                                l.address
-                            );
+                            anyhow::bail!("{id}: tls_host '{host}' matches no certificate block or vhost with tls");
                         }
                         if l.tls_mode == TlsMode::Terminate && (l.tls_verify || l.tls_ca.is_some()) {
-                            anyhow::bail!("listener '{}': tls_verify and tls_ca apply to tls_mode reencrypt only", l.address);
+                            anyhow::bail!("{id}: tls_verify and tls_ca apply to tls_mode reencrypt only");
                         }
                         if l.tls_ca.is_some() && !l.tls_verify {
-                            anyhow::bail!("listener '{}': tls_ca needs tls_verify: true", l.address);
+                            anyhow::bail!("{id}: tls_ca needs tls_verify = true");
                         }
                     }
-                }
-            }
-            if let Some(pool) = &l.udp_pool {
-                if !self.pools.contains_key(pool) {
-                    anyhow::bail!("listener '{}' references unknown udp_pool '{pool}'", l.address);
-                }
-                if l.tls {
-                    anyhow::bail!(
-                        "listener '{}': udp_pool cannot be combined with 'tls' \
-                         (UDP datagrams are forwarded as-is, never terminated)",
-                        l.address
-                    );
-                }
-                if l.tcp_pool.is_some() {
-                    anyhow::bail!(
-                        "listener '{}': udp_pool and tcp_pool are mutually exclusive — \
-                         use one listener entry per protocol",
-                        l.address
-                    );
                 }
             }
         }
@@ -499,12 +397,19 @@ impl Config {
                     }
                 }
             }
+            if vhost.pool.is_some() && !vhost.routes.is_empty() {
+                anyhow::bail!("vhost '{}': pool and route blocks exclude each other; add route \"/\" instead", vhost.host);
+            }
             if let Some(pool) = &vhost.pool {
                 if !self.pools.contains_key(pool) {
                     anyhow::bail!("vhost '{}' references unknown pool '{pool}'", vhost.host);
                 }
             }
+            let mut paths = HashSet::new();
             for route in &vhost.routes {
+                if !paths.insert(route.path.as_str()) {
+                    anyhow::bail!("vhost '{}': route \"{}\" is defined twice", vhost.host, route.path);
+                }
                 if !self.pools.contains_key(&route.pool) {
                     anyhow::bail!(
                         "vhost '{}' route '{}' references unknown pool '{}'",
@@ -578,7 +483,7 @@ impl Config {
         for (field, address) in own {
             let Some(address) = address else { continue };
             let Ok(ours) = address.parse::<SocketAddr>() else { continue };
-            for l in self.listeners.iter().filter(|l| l.udp_pool.is_none()) {
+            for l in self.listeners.iter().filter(|l| l.protocol != Protocol::Udp) {
                 if l.address.parse::<SocketAddr>().is_ok_and(|theirs| overlaps(ours, theirs)) {
                     anyhow::bail!("{field} {address} collides with listener {}", l.address);
                 }
@@ -751,6 +656,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeelConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
@@ -770,18 +676,18 @@ pub struct KeelConfig {
     #[serde(default = "default_control_socket")]
     pub control_socket: String,
 
-    /// Seconds to let in-flight requests finish on graceful shutdown before
+    /// Time in-flight requests get to finish on graceful shutdown before
     /// the process exits. Keep below the supervisor's kill timeout
     /// (docker stop default 10s, K8s terminationGracePeriodSeconds 30s).
-    #[serde(default = "default_grace_period")]
-    pub grace_period_seconds: u64,
+    #[serde(default = "default_grace_period", with = "duration")]
+    pub grace_period: Duration,
 
-    /// Seconds a UDP flow (one client ip:port on a `udp_pool` listener) may
-    /// stay idle before it expires and releases its backend. Must be >= 1.
-    #[serde(default = "default_udp_flow_timeout")]
-    pub udp_flow_timeout_seconds: u64,
+    /// How long a UDP flow (one client ip:port on a `udp` listener) may stay
+    /// idle before it expires and releases its backend.
+    #[serde(default = "default_udp_flow_timeout", with = "duration")]
+    pub udp_flow_timeout: Duration,
 
-    /// Most UDP flows each `udp_pool` listener will hold open at once (a
+    /// Most UDP flows each `udp` listener will hold open at once (a
     /// worker runs one service per such listener). A flow costs an upstream
     /// socket and a task, so an unbounded table lets a datagram flood from
     /// spoofed sources exhaust the worker's descriptors — which its HTTP and
@@ -794,7 +700,7 @@ pub struct KeelConfig {
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
 
-    /// The replicated config directory: `keel.yaml` and every other `*.yaml`
+    /// The replicated config directory: `keel.hcl` and every other `*.hcl`
     /// below it. In cluster mode Keel writes it after each applied version.
     #[serde(default = "default_config_dir")]
     pub config_dir: String,
@@ -808,8 +714,8 @@ impl Default for KeelConfig {
             group: default_group(),
             control_user: default_control_user(),
             control_socket: default_control_socket(),
-            grace_period_seconds: default_grace_period(),
-            udp_flow_timeout_seconds: default_udp_flow_timeout(),
+            grace_period: default_grace_period(),
+            udp_flow_timeout: default_udp_flow_timeout(),
             udp_max_flows: default_udp_max_flows(),
             state_dir: default_state_dir(),
             config_dir: default_config_dir(),
@@ -833,8 +739,8 @@ impl KeelConfig {
 }
 fn default_config_dir() -> String { "/etc/keel/config".into() }
 
-fn default_grace_period() -> u64 { 10 }
-fn default_udp_flow_timeout() -> u64 { 30 }
+fn default_grace_period() -> Duration { Duration::from_secs(10) }
+fn default_udp_flow_timeout() -> Duration { Duration::from_secs(30) }
 fn default_udp_max_flows() -> usize { 8192 }
 
 fn default_workers() -> usize {
@@ -847,39 +753,32 @@ fn default_group() -> String { "keel".into() }
 fn default_control_user() -> String { "keel-control".into() }
 fn default_control_socket() -> String { "/var/run/keel/keel.sock".into() }
 
+/// `listener "<protocol>" "<address>" { ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Listener {
+    pub protocol: Protocol,
+
     pub address: String,
 
+    /// The pool a `tcp` or `udp` listener forwards to. HTTP listeners route
+    /// by vhost instead.
     #[serde(default)]
-    pub tls: bool,
+    pub pool: Option<String>,
 
     /// Expect a PROXY protocol v1/v2 header on every connection (TCP, HTTP)
     /// or datagram (UDP) and take the client address from it. Connections
-    /// without one are rejected. On `tls: true` listeners the header is read
+    /// without one are rejected. On `https` listeners the header is read
     /// before the handshake.
     #[serde(default)]
     pub proxy_protocol: bool,
 
-    /// L4 mode: splice raw TCP to this pool (passthrough — the stream is
-    /// never inspected, TLS is end-to-end between client and backend).
-    /// Mutually exclusive with `tls` (termination) and HTTP routing.
-    #[serde(default)]
-    pub tcp_pool: Option<String>,
-
-    /// L4 mode: forward UDP datagrams to this pool. One flow per client
-    /// ip:port, pinned to a backend until idle for
-    /// `keel.udp_flow_timeout_seconds`. Mutually exclusive with `tls` and
-    /// `tcp_pool`.
-    #[serde(default)]
-    pub udp_pool: Option<String>,
-
-    /// TLS handling on a `tcp_pool` listener.
+    /// TLS handling on a `tcp` listener.
     #[serde(default)]
     pub tls_mode: TlsMode,
 
     /// Certificate served by a terminating listener: the host of a
-    /// `certificates:` entry or of a vhost with `tls`. Used when the client
+    /// `certificate` block or of a vhost with `tls`. Used when the client
     /// sends no SNI or an SNI with no certificate of its own.
     #[serde(default)]
     pub tls_host: Option<String>,
@@ -895,6 +794,34 @@ pub struct Listener {
     pub tls_ca: Option<String>,
 }
 
+/// What a listener speaks: HTTP routed by vhost (plain or TLS-terminated),
+/// or a TCP or UDP pool.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    Http,
+    Https,
+    Tcp,
+    Udp,
+}
+
+impl Listener {
+    /// Terminates TLS for HTTP.
+    pub fn tls(&self) -> bool {
+        self.protocol == Protocol::Https
+    }
+
+    /// The pool of a `tcp` listener.
+    pub fn tcp_pool(&self) -> Option<&str> {
+        self.pool.as_deref().filter(|_| self.protocol == Protocol::Tcp)
+    }
+
+    /// The pool of a `udp` listener.
+    pub fn udp_pool(&self) -> Option<&str> {
+        self.pool.as_deref().filter(|_| self.protocol == Protocol::Udp)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
@@ -908,6 +835,7 @@ pub enum TlsMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default = "default_metrics_address")]
     pub address: String,
@@ -925,6 +853,7 @@ impl Default for MetricsConfig {
 fn default_metrics_address() -> String { "127.0.0.1:10790".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pool {
     #[serde(default)]
     pub algorithm: LbAlgorithm,
@@ -942,6 +871,7 @@ pub struct Pool {
 /// Outlier ejection: a backend whose real requests, connections, or UDP
 /// flows fail `failures` times in a row is taken out for `eject_for`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PassiveConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -949,8 +879,8 @@ pub struct PassiveConfig {
     #[serde(default = "default_passive_failures")]
     pub failures: u32,
 
-    #[serde(default = "default_passive_eject_for")]
-    pub eject_for: String,
+    #[serde(default = "default_passive_eject_for", with = "duration")]
+    pub eject_for: Duration,
 }
 
 impl Default for PassiveConfig {
@@ -964,7 +894,7 @@ impl Default for PassiveConfig {
 }
 
 fn default_passive_failures() -> u32 { 5 }
-fn default_passive_eject_for() -> String { "30s".into() }
+fn default_passive_eject_for() -> Duration { Duration::from_secs(30) }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -984,8 +914,10 @@ pub struct HealthCheck {
     #[serde(flatten)]
     pub probe: ProbeConfig,
 
-    pub interval: String,
-    pub timeout: String,
+    #[serde(with = "duration")]
+    pub interval: Duration,
+    #[serde(with = "duration")]
+    pub timeout: Duration,
     pub healthy_threshold: u32,
     pub unhealthy_threshold: u32,
 
@@ -1035,13 +967,13 @@ pub enum ProbeConfig {
     /// ICMP echo to the backend host; proves the host, not the service.
     Icmp,
     /// TLS handshake completes; optionally the certificate stays valid for
-    /// at least `min_days_valid` days. The chain is not verified.
+    /// at least `min_valid`. The chain is not verified.
     Tls {
         /// SNI to send; default: the backend IP (no SNI).
         #[serde(default)]
         sni: Option<String>,
-        #[serde(default)]
-        min_days_valid: Option<u32>,
+        #[serde(default, with = "duration::option")]
+        min_valid: Option<Duration>,
     },
 }
 
@@ -1073,7 +1005,7 @@ fn probe_fields(kind: &str) -> Option<&'static [&'static str]> {
         "tcp" | "udp" | "ntp" | "icmp" => &[],
         "http" => &["path", "host", "tls", "expect_status", "expect_body"],
         "dns" => &["query", "record", "transport", "expect"],
-        "tls" => &["sni", "min_days_valid"],
+        "tls" => &["sni", "min_valid"],
         _ => return None,
     })
 }
@@ -1083,10 +1015,10 @@ fn probe_fields(kind: &str) -> Option<&'static [&'static str]> {
 struct RawHealthCheck {
     #[serde(flatten)]
     probe: ProbeConfig,
-    #[serde(default = "default_health_interval")]
-    interval: String,
-    #[serde(default = "default_health_timeout")]
-    timeout: String,
+    #[serde(default = "default_health_interval", with = "duration")]
+    interval: Duration,
+    #[serde(default = "default_health_timeout", with = "duration")]
+    timeout: Duration,
     #[serde(default = "default_healthy_threshold")]
     healthy_threshold: u32,
     #[serde(default = "default_unhealthy_threshold")]
@@ -1098,14 +1030,14 @@ struct RawHealthCheck {
 impl<'de> Deserialize<'de> for HealthCheck {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         use serde::de::Error;
-        let value = serde_yml::Value::deserialize(d)?;
+        let value = serde_json::Value::deserialize(d)?;
         let map = value
-            .as_mapping()
-            .ok_or_else(|| D::Error::custom("health_check must be a mapping"))?;
+            .as_object()
+            .ok_or_else(|| D::Error::custom("health_check must be a block"))?;
         let kind = map
             .get("type")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| D::Error::custom("health_check.type is required"))?
+            .ok_or_else(|| D::Error::custom("health_check needs its type as label"))?
             .to_owned();
         let extra = probe_fields(&kind).ok_or_else(|| {
             D::Error::custom(format!(
@@ -1113,15 +1045,14 @@ impl<'de> Deserialize<'de> for HealthCheck {
                 PROBE_TYPES.join(", ")
             ))
         })?;
-        for key in map.keys() {
-            let k = key.as_str();
+        for k in map.keys().map(String::as_str) {
             if !HEALTH_COMMON_FIELDS.contains(&k) && !extra.contains(&k) {
                 return Err(D::Error::custom(format!(
-                    "health_check: field '{k}' is not valid for type '{kind}'"
+                    "health_check: attribute '{k}' is not valid for type '{kind}'"
                 )));
             }
         }
-        let raw: RawHealthCheck = serde_yml::from_value(value).map_err(D::Error::custom)?;
+        let raw: RawHealthCheck = serde_json::from_value(value).map_err(D::Error::custom)?;
         Ok(HealthCheck {
             probe: raw.probe,
             interval: raw.interval,
@@ -1133,34 +1064,69 @@ impl<'de> Deserialize<'de> for HealthCheck {
     }
 }
 
-/// Strict duration parser for config values: `500ms`, `10s`, `2m`, `1h`.
+/// Units of a duration in the config, in seconds. A second is the smallest.
+const DURATION_UNITS: [(&str, u64); 6] =
+    [("s", 1), ("m", 60), ("h", 3600), ("d", 86_400), ("w", 7 * 86_400), ("y", 365 * 86_400)];
+
+/// A duration in the config: a whole number and a unit, `30s`, `5m`, `12h`,
+/// `30d`, `2w` or `1y`; at least one second.
 pub fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (num, unit) = s.split_at(split);
-    let n: u64 = num
-        .parse()
-        .map_err(|_| anyhow::anyhow!("'{s}' is not a duration (use e.g. 500ms, 10s, 2m)"))?;
-    let d = match unit {
-        "ms" => Duration::from_millis(n),
-        "s" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
-        "h" => Duration::from_secs(n * 3600),
-        _ => anyhow::bail!("'{s}' is not a duration (use e.g. 500ms, 10s, 2m)"),
-    };
-    if d.is_zero() {
-        anyhow::bail!("'{s}': duration must be greater than zero");
+    let wrong = || anyhow::anyhow!("'{s}' is not a duration: a whole number and one of s, m, h, d, w, y (e.g. 30s)");
+    let n: u64 = num.parse().map_err(|_| wrong())?;
+    let (_, scale) = DURATION_UNITS.iter().find(|(u, _)| *u == unit).ok_or_else(wrong)?;
+    if n == 0 {
+        anyhow::bail!("'{s}': a duration is at least 1s");
     }
-    Ok(d)
+    Ok(Duration::from_secs(n.saturating_mul(*scale)))
+}
+
+/// Attributes that hold a duration; `keel config validate --write` adds the
+/// unit to a bare number there.
+pub const DURATION_ATTRIBUTES: [&str; 7] =
+    ["grace_period", "udp_flow_timeout", "eject_for", "interval", "timeout", "ttl", "min_valid"];
+
+/// Serde for duration attributes: a string such as `30s`.
+mod duration {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{}s", d.as_secs()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => super::parse_duration(&s).map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!("expected a duration such as \"30s\", got {other}"))),
+        }
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+            match d {
+                Some(d) => super::serialize(d, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+            super::deserialize(d).map(Some)
+        }
+    }
 }
 
 fn default_health_path() -> String { "/health".into() }
-fn default_health_interval() -> String { "10s".into() }
-fn default_health_timeout() -> String { "2s".into() }
+fn default_health_interval() -> Duration { Duration::from_secs(10) }
+fn default_health_timeout() -> Duration { Duration::from_secs(2) }
 fn default_healthy_threshold() -> u32 { 2 }
 fn default_unhealthy_threshold() -> u32 { 3 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Backend {
     pub address: String,
 
@@ -1187,6 +1153,7 @@ pub enum ForwardedMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForwardedHeadersConfig {
     #[serde(default)]
     pub mode: ForwardedMode,
@@ -1196,6 +1163,7 @@ pub struct ForwardedHeadersConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Memory budget, e.g. "256M", "1G". Memory cache disabled if absent.
     pub memory: Option<String>,
@@ -1204,6 +1172,7 @@ pub struct CacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiskCacheConfig {
     /// Directory for cache files.
     pub path: String,
@@ -1212,11 +1181,13 @@ pub struct DiskCacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VhostCacheConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Fallback TTL in seconds when origin sends no Cache-Control.
-    pub ttl: Option<u32>,
+    /// Fallback TTL when origin sends no Cache-Control.
+    #[serde(default, with = "duration::option")]
+    pub ttl: Option<Duration>,
     /// HTTP status codes to cache. Defaults to [200] when empty.
     #[serde(default)]
     pub statuses: Vec<u16>,
@@ -1227,6 +1198,7 @@ pub struct VhostCacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Vhost {
     pub host: String,
 
@@ -1255,6 +1227,7 @@ pub struct Vhost {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DefaultAction {
     /// Absolute URL to 301 to. Path + query are appended unless
     /// `preserve_path: false`.
@@ -1279,6 +1252,7 @@ impl Vhost {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub path: String,
     pub pool: String,
@@ -1287,6 +1261,7 @@ pub struct Route {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Certificate path (BYO cert). Not set when ACME is enabled.
     pub cert: Option<String>,
@@ -1331,14 +1306,15 @@ impl AcmeRef {
 pub const DEFAULT_ISSUER: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
     /// Directory for certificates, keys, accounts, and challenge tokens.
     #[serde(default = "default_acme_storage")]
     pub storage: String,
 
     /// When to renew: a percentage of the certificate's total lifetime
-    /// remaining ("30%", works for both 90-day and short-lived certs) or an
-    /// absolute window ("20d"). Per-issuer override available.
+    /// remaining ("30%", works for both 90-day and short-lived certs) or a
+    /// duration ("20d"). Per-issuer override available.
     #[serde(default = "default_renew_before")]
     pub renew_before: String,
 
@@ -1360,6 +1336,7 @@ impl Default for AcmeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeIssuer {
     /// Contact email for this issuer's ACME account (expiry warnings).
     pub email: Option<String>,
@@ -1394,6 +1371,7 @@ impl Default for AcmeIssuer {
 /// standalone-style). Lives at the top level so conf.d files can declare
 /// their own, next to their vhosts and pools.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificateRequest {
     pub host: String,
     /// Issuer name from `acme.issuers`. Defaults to "default". Ignored when
@@ -1422,8 +1400,8 @@ fn default_issuer_name() -> String { DEFAULT_ISSUER.into() }
 pub enum RenewBefore {
     /// Renew when less than this percentage of total lifetime remains.
     Percent(u8),
-    /// Renew when fewer than this many days remain.
-    Days(u32),
+    /// Renew when less than this time remains.
+    Before(Duration),
 }
 
 impl RenewBefore {
@@ -1435,14 +1413,10 @@ impl RenewBefore {
                 anyhow::bail!("renew_before percentage must be 1–90, got {pct}%");
             }
             Ok(RenewBefore::Percent(pct))
-        } else if let Some(d) = s.strip_suffix('d') {
-            let days: u32 = d.trim().parse().context("renew_before days")?;
-            if days == 0 {
-                anyhow::bail!("renew_before days must be at least 1");
-            }
-            Ok(RenewBefore::Days(days))
         } else {
-            anyhow::bail!("renew_before must be a percentage ('30%') or days ('20d'), got '{s}'")
+            parse_duration(s)
+                .map(RenewBefore::Before)
+                .map_err(|_| anyhow::anyhow!("renew_before must be a percentage ('30%') or a duration ('20d'), got '{s}'"))
         }
     }
 }
@@ -1454,6 +1428,7 @@ fn default_acme_storage() -> String { "/var/lib/keel/acme".into() }
 fn default_renew_before() -> String { "30%".into() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogConfig {
     #[serde(default = "default_access_log_enabled")]
     pub enabled: bool,
@@ -1495,25 +1470,57 @@ pub struct ClusterConfig {
 
 fn default_cluster_addr() -> String { "0.0.0.0:7654".into() }
 
+/// A config from the text of one `keel.hcl`, not validated: for tests that
+/// need a config of a certain shape.
+#[cfg(test)]
+pub fn parse(text: &str) -> Result<Config> {
+    parse_with_node("", text)
+}
+
+/// A config from a node file and the text of one `keel.hcl`, not validated.
+#[cfg(test)]
+pub fn parse_with_node(node: &str, text: &str) -> Result<Config> {
+    let node = hcl::Source { name: "node.hcl".into(), text: node };
+    let doc = hcl::read(Some(&node), &[hcl::Source { name: ROOT_FILE.into(), text }])?;
+    from_document(&doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const POOL: &str = "pools:\n  dns:\n    backends:\n      - address: 10.0.0.1:53\n";
+    const POOL: &str = "pool \"dns\" {\n  backend \"10.0.0.1:53\" {}\n}\n";
 
-    fn parse(listeners: &str) -> Config {
-        serde_yml::from_str(&format!("{POOL}listeners:\n{listeners}")).expect("yaml parses")
+    fn with_pool(text: &str) -> Config {
+        parse(&format!("{POOL}{text}")).expect("config parses")
     }
 
     fn err(cfg: &Config) -> String {
         cfg.validate().expect_err("validation should fail").to_string()
     }
 
+    fn parse_err(text: &str) -> String {
+        format!("{:#}", parse(text).expect_err("should not parse"))
+    }
+
     fn files(entries: &[(&str, &str)]) -> FileSet {
         entries.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect()
     }
 
-    const ROOT: &str = "keel:\n  grace_period_seconds: 3\nlisteners:\n  - address: 0.0.0.0:80\npools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n";
+    const ROOT: &str = r#"keel {
+  grace_period = "3s"
+}
+
+listener "http" "0.0.0.0:80" {}
+
+pool "web" {
+  backend "10.0.0.1:80" {}
+}
+
+vhost "a.test" {
+  pool = "web"
+}
+"#;
 
     fn assemble_err(node: &str, set: &FileSet) -> String {
         format!("{:#}", assemble(node, set).expect_err("must be refused"))
@@ -1521,15 +1528,15 @@ mod tests {
 
     #[test]
     fn node_file_and_config_directory_assemble_into_one_config() {
-        let node = "keel:\n  workers: 3\n  config_dir: /srv/lb\nmetrics:\n  address: 127.0.0.1:9999\n";
+        let node = "keel {\n  workers    = 3\n  config_dir = \"/srv/lb\"\n}\nmetrics {\n  address = \"127.0.0.1:9999\"\n}\n";
         let set = files(&[
-            ("keel.yaml", ROOT),
-            ("vhosts/b.yaml", "vhosts:\n  - host: b.test\n    pool: api\n"),
-            ("pools/api.yaml", "pools:\n  api:\n    backends:\n      - address: 10.0.0.2:80\n"),
+            ("keel.hcl", ROOT),
+            ("vhosts/b.hcl", "vhost \"b.test\" {\n  pool = \"api\"\n}\n"),
+            ("pools/api.hcl", "pool \"api\" {\n  backend \"10.0.0.2:80\" {}\n}\n"),
             ("certs/b.crt", "-----BEGIN CERTIFICATE-----\nnot parsed\n"),
         ]);
         let cfg = assemble(node, &set).unwrap();
-        assert_eq!((cfg.keel.workers, cfg.keel.grace_period_seconds), (3, 3), "keel: from both files");
+        assert_eq!((cfg.keel.workers, cfg.keel.grace_period), (3, Duration::from_secs(3)), "keel from both files");
         assert_eq!(cfg.keel.config_dir, "/srv/lb");
         assert_eq!(cfg.metrics.address, "127.0.0.1:9999");
         assert!(cfg.pools.contains_key("web") && cfg.pools.contains_key("api"));
@@ -1538,34 +1545,50 @@ mod tests {
     }
 
     #[test]
+    fn errors_name_file_line_and_column() {
+        let set = files(&[("keel.hcl", ROOT), ("pools/api.hcl", "pool \"api\" {\n  backend \"10.0.0.2:80\" {}\n\n    algorithmn = \"round_robin\"\n}\n")]);
+        assert_eq!(assemble_err("", &set), "pools/api.hcl:4:5: unknown attribute `algorithmn`");
+        let set = files(&[("keel.hcl", &ROOT.replace("\"3s\"", "3"))]);
+        let e = assemble_err("", &set);
+        assert!(e.starts_with("keel.hcl:2:3: expected a duration such as \"30s\", got 3"), "{e}");
+        let set = files(&[("keel.hcl", &ROOT.replace("pool = \"web\"", "pool = 7"))]);
+        let e = assemble_err("", &set);
+        assert!(e.starts_with("keel.hcl:12:3: invalid type: integer `7`, expected a string"), "{e}");
+        let e = assemble_err("keel {\n  workers = \"many\"\n}\n", &files(&[("keel.hcl", ROOT)]));
+        assert!(e.starts_with("node.hcl:2:3: invalid type: string \"many\""), "{e}");
+        let set = files(&[("keel.hcl", &ROOT.replace("vhost \"a.test\" {", "vhost \"a.test\" {\n  tls {}"))]);
+        assert_eq!(assemble_err("", &set), "vhost 'a.test': tls requires cert and key paths (or acme)");
+    }
+
+    #[test]
+    fn yaml_files_and_a_missing_root_file_are_refused() {
+        let e = assemble_err("", &files(&[("keel.hcl", ROOT), ("pools/old.yaml", "pools: {}\n")]));
+        assert_eq!(e, "pools/old.yaml: the configuration is HCL now (*.hcl); YAML files are not read");
+        let e = assemble_err("", &files(&[("pools.hcl", "")]));
+        assert!(e.contains("has no keel.hcl"), "{e}");
+    }
+
+    #[test]
     fn replicated_sections_are_refused_in_the_node_file() {
-        let set = files(&[("keel.yaml", ROOT)]);
-        let err = assemble_err("listeners:\n  - address: 0.0.0.0:81\n", &set);
-        assert!(err.contains("`listeners` belongs in the config directory"), "{err}");
-        let err = assemble_err("keel:\n  grace_period_seconds: 5\n", &set);
-        assert!(err.contains("`keel.grace_period_seconds` belongs in the config directory"), "{err}");
+        let set = files(&[("keel.hcl", ROOT)]);
+        let e = assemble_err("listener \"http\" \"0.0.0.0:81\" {}\n", &set);
+        assert!(e.contains("`listener` belongs in the config directory"), "{e}");
+        let e = assemble_err("keel {\n  grace_period = \"5s\"\n}\n", &set);
+        assert!(e.contains("`keel.grace_period` belongs in the config directory"), "{e}");
     }
 
     #[test]
     fn node_sections_are_refused_in_the_config_directory() {
-        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}cluster:\n  addr: 10.0.0.1:7654\n"))]));
-        assert!(err.contains("keel.yaml: `cluster` belongs in node.yaml"), "{err}");
-        let err = assemble_err("", &files(&[("keel.yaml", &ROOT.replace("grace_period_seconds: 3", "workers: 2"))]));
-        assert!(err.contains("`keel.workers` belongs in node.yaml"), "{err}");
+        let e = assemble_err("", &files(&[("keel.hcl", &format!("{ROOT}cluster {{\n  addr = \"10.0.0.1:7654\"\n}}\n"))]));
+        assert!(e.contains("keel.hcl:14:1: `cluster` belongs in the node file"), "{e}");
+        let e = assemble_err("", &files(&[("keel.hcl", &ROOT.replace("grace_period = \"3s\"", "workers = 2"))]));
+        assert!(e.contains("`keel.workers` belongs in the node file"), "{e}");
     }
 
     #[test]
     fn once_only_sections_stay_in_the_root_file() {
-        let err = assemble_err("", &files(&[("keel.yaml", ROOT), ("more.yaml", "cache:\n  memory: 1M\n")]));
-        assert!(err.contains("more.yaml: `cache` may only be set in keel.yaml"), "{err}");
-        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}include:\n  - x/*.yaml\n"))]));
-        assert!(err.contains("`include` is not supported"), "{err}");
-    }
-
-    #[test]
-    fn a_config_directory_needs_its_root_file() {
-        let err = assemble_err("", &files(&[("pools.yaml", "pools: {}\n")]));
-        assert!(err.contains("has no keel.yaml"), "{err}");
+        let e = assemble_err("", &files(&[("keel.hcl", ROOT), ("more.hcl", "cache {\n  memory = \"1M\"\n}\n")]));
+        assert!(e.contains("more.hcl:1:1: `cache` may only be set in keel.hcl"), "{e}");
     }
 
     #[test]
@@ -1573,20 +1596,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("keel-configdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("vhosts")).unwrap();
-        std::fs::write(dir.join("keel.yaml"), ROOT).unwrap();
-        std::fs::write(dir.join("vhosts/b.yaml"), "vhosts: []\n").unwrap();
-        std::fs::write(dir.join(".keel.yaml.swp"), "editor").unwrap();
+        std::fs::write(dir.join("keel.hcl"), ROOT).unwrap();
+        std::fs::write(dir.join("vhosts/b.hcl"), "").unwrap();
+        std::fs::write(dir.join(".keel.hcl.swp"), "editor").unwrap();
         let set = read_config_dir(&dir).unwrap();
-        assert_eq!(set.keys().map(String::as_str).collect::<Vec<_>>(), vec!["keel.yaml", "vhosts/b.yaml"]);
+        assert_eq!(set.keys().map(String::as_str).collect::<Vec<_>>(), vec!["keel.hcl", "vhosts/b.hcl"]);
+        let node = std::env::temp_dir().join(format!("keel-node-{}.hcl", std::process::id()));
+        std::fs::write(&node, format!("locals {{\n  dir = \"{}\"\n}}\nkeel {{\n  config_dir = local.dir\n}}\n", dir.display())).unwrap();
+        let cfg = load(node.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.vhosts.len(), 1);
+        std::fs::write(dir.join("vhosts/b.hcl"), "vhost \"b.test\" {\n  pool = \"nope\"\n}\n").unwrap();
+        std::fs::write(dir.join("vhosts/c.hcl"), "vhost \"c.test\" {\n  pool = 1\n}\n").unwrap();
+        let e = format!("{:#}", load(node.to_str().unwrap()).unwrap_err());
+        assert_eq!(e, format!("{}/vhosts/c.hcl:2:3: invalid type: integer `1`, expected a string", dir.display()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&node);
     }
 
-    const TLS_ROOT: &str = "listeners:\n  - address: 0.0.0.0:443\n    tls: true\npools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n    tls:\n      cert: certs/a.crt\n      key: ./certs/a.key\n";
+    const TLS_ROOT: &str = r#"listener "https" "0.0.0.0:443" {}
+
+pool "web" {
+  backend "10.0.0.1:80" {}
+}
+
+vhost "a.test" {
+  pool = "web"
+  tls {
+    cert = "certs/a.crt"
+    key  = "./certs/a.key"
+  }
+}
+"#;
 
     #[test]
     fn relative_file_paths_come_from_the_config_directory() {
-        let set = files(&[("keel.yaml", TLS_ROOT), ("certs/a.crt", "CERT"), ("certs/a.key", "KEY")]);
+        let set = files(&[("keel.hcl", TLS_ROOT), ("certs/a.crt", "CERT"), ("certs/a.key", "KEY")]);
         let cfg = assemble("", &set).unwrap();
+        assert!(cfg.listeners[0].tls());
         assert_eq!(cfg.read_file("certs/a.crt").unwrap(), b"CERT");
         assert_eq!(cfg.read_file("./certs/a.key").unwrap(), b"KEY");
         let abs = std::env::temp_dir().join(format!("keel-abs-{}.crt", std::process::id()));
@@ -1595,195 +1641,186 @@ mod tests {
         let _ = std::fs::remove_file(&abs);
     }
 
-    const WEB: &str = "pools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\n";
+    const WEB: &str = "pool \"web\" {\n  backend \"10.0.0.1:80\" {}\n}\n";
 
     #[test]
     fn the_control_worker_needs_a_user_of_its_own() {
-        let err = assemble_err("keel:\n  user: keel\n  control_user: keel\n", &files(&[("keel.yaml", WEB)]));
-        assert!(err.contains("keel.control_user and keel.user are both 'keel'"), "{err}");
+        let e = assemble_err("keel {\n  user         = \"keel\"\n  control_user = \"keel\"\n}\n", &files(&[("keel.hcl", WEB)]));
+        assert!(e.contains("keel.control_user and keel.user are both 'keel'"), "{e}");
     }
 
     #[test]
     fn a_cluster_section_needs_a_secret() {
-        let err = assemble_err("cluster:\n  advertise: 10.0.0.1:7654\n", &files(&[("keel.yaml", WEB)]));
-        assert!(err.contains("cluster.secret is required"), "{err}");
+        let e = assemble_err("cluster {\n  advertise = \"10.0.0.1:7654\"\n}\n", &files(&[("keel.hcl", WEB)]));
+        assert!(e.contains("cluster.secret is required"), "{e}");
     }
 
     #[test]
     fn control_and_peer_ports_must_not_be_listeners() {
-        let listening = |address: &str| format!("{WEB}listeners:\n  - address: {address}\n");
-        let remote = "control:\n  remote:\n    address: 0.0.0.0:10789\n";
-        let err = assemble_err(remote, &files(&[("keel.yaml", &listening("10.0.0.1:10789"))]));
-        assert!(err.contains("control.remote.address 0.0.0.0:10789 collides with listener 10.0.0.1:10789"), "{err}");
-        let peer = "cluster:\n  addr: 10.0.0.1:7654\n  secret: s\n";
-        let err = assemble_err(peer, &files(&[("keel.yaml", &listening("0.0.0.0:7654"))]));
-        assert!(err.contains("cluster.addr 10.0.0.1:7654 collides"), "{err}");
+        let listening = |address: &str| format!("{WEB}listener \"http\" \"{address}\" {{}}\n");
+        let remote = "control {\n  remote {\n    address = \"0.0.0.0:10789\"\n  }\n}\n";
+        let e = assemble_err(remote, &files(&[("keel.hcl", &listening("10.0.0.1:10789"))]));
+        assert!(e.contains("control.remote.address 0.0.0.0:10789 collides with listener 10.0.0.1:10789"), "{e}");
+        let peer = "cluster {\n  addr   = \"10.0.0.1:7654\"\n  secret = \"s\"\n}\n";
+        let e = assemble_err(peer, &files(&[("keel.hcl", &listening("0.0.0.0:7654"))]));
+        assert!(e.contains("cluster.addr 10.0.0.1:7654 collides"), "{e}");
         // Another address on the same port, or a UDP listener, is no collision.
-        assemble(peer, &files(&[("keel.yaml", &listening("10.0.0.2:7654"))])).unwrap();
-        let udp = format!("{WEB}listeners:\n  - address: 0.0.0.0:7654\n    udp_pool: web\n");
-        assemble(peer, &files(&[("keel.yaml", &udp)])).unwrap();
+        assemble(peer, &files(&[("keel.hcl", &listening("10.0.0.2:7654"))])).unwrap();
+        let udp = format!("{WEB}listener \"udp\" \"0.0.0.0:7654\" {{\n  pool = \"web\"\n}}\n");
+        assemble(peer, &files(&[("keel.hcl", &udp)])).unwrap();
     }
 
     #[test]
-    fn workers_get_the_node_file_without_its_cluster_section() {
-        let node = "keel:\n  workers: 2\ncluster:\n  secret: s3cret\n";
+    fn workers_get_the_node_file_without_its_cluster_block() {
+        let node = "keel {\n  workers = 2\n}\n\ncluster {\n  secret = \"s3cret\"\n}\n";
         let stripped = without_cluster_section(node);
-        assert!(!stripped.contains("s3cret") && stripped.contains("workers: 2"), "{stripped}");
-        assert_eq!(without_cluster_section("cluster:\n  secret: s\n"), "");
-        let cfg = assemble(node, &files(&[("keel.yaml", WEB)])).unwrap();
+        assert!(!stripped.contains("s3cret") && stripped.contains("workers = 2"), "{stripped}");
+        assert_eq!(without_cluster_section("cluster {\n  secret = \"s\"\n}\n").trim(), "");
+        let cfg = assemble(node, &files(&[("keel.hcl", WEB)])).unwrap();
         let mut loaded = cfg.clone();
-        loaded.node_yaml = node.into();
+        loaded.node_file = node.into();
         assert!(loaded.for_workers().cluster.is_none());
-        assert!(!loaded.for_workers().node_yaml.contains("s3cret"));
+        assert!(!loaded.for_workers().node_file.contains("s3cret"));
+        assemble(&loaded.for_workers().node_file, &files(&[("keel.hcl", WEB)])).expect("what workers get still loads");
     }
 
     #[test]
     fn a_relative_file_the_set_does_not_carry_is_refused() {
-        let err = assemble_err("", &files(&[("keel.yaml", TLS_ROOT), ("certs/a.crt", "CERT")]));
-        assert!(err.contains("vhost 'a.test': tls.key 'certs/a.key' is not in the config directory"), "{err}");
+        let e = assemble_err("", &files(&[("keel.hcl", TLS_ROOT), ("certs/a.crt", "CERT")]));
+        assert!(e.contains("vhost 'a.test': tls.key 'certs/a.key' is not in the config directory"), "{e}");
     }
 
     #[test]
     fn directories_keel_writes_to_are_absolute_and_outside_the_config_directory() {
-        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}access_log:\n  dir: logs\n"))]));
-        assert!(err.contains("access_log.dir must be an absolute path"), "{err}");
-        let err = assemble_err("", &files(&[("keel.yaml", &format!("{ROOT}cache:\n  disk:\n    path: cache\n    size: 1M\n"))]));
-        assert!(err.contains("cache.disk.path must be an absolute path"), "{err}");
-        let acme = |storage: &str| format!("{ROOT}acme:\n  storage: {storage}\n  issuers:\n    default:\n      email: a@b.test\n");
-        let err = assemble_err("", &files(&[("keel.yaml", &acme("/etc/keel/config/acme"))]));
-        assert!(err.contains("inside the config directory"), "{err}");
-        let err = assemble_err("", &files(&[("keel.yaml", &acme("acme"))]));
-        assert!(err.contains("acme.storage must be an absolute path"), "{err}");
+        let e = assemble_err("", &files(&[("keel.hcl", &format!("{ROOT}access_log {{\n  dir = \"logs\"\n}}\n"))]));
+        assert!(e.contains("access_log.dir must be an absolute path"), "{e}");
+        let e = assemble_err("", &files(&[("keel.hcl", &format!("{ROOT}cache {{\n  disk {{\n    path = \"cache\"\n    size = \"1M\"\n  }}\n}}\n"))]));
+        assert!(e.contains("cache.disk.path must be an absolute path"), "{e}");
+        let acme = |storage: &str| format!("{ROOT}acme {{\n  storage = \"{storage}\"\n  issuer \"default\" {{\n    email = \"a@b.test\"\n  }}\n}}\n");
+        let e = assemble_err("", &files(&[("keel.hcl", &acme("/etc/keel/config/acme"))]));
+        assert!(e.contains("inside the config directory"), "{e}");
+        let e = assemble_err("", &files(&[("keel.hcl", &acme("acme"))]));
+        assert!(e.contains("acme.storage must be an absolute path"), "{e}");
     }
 
     #[test]
     fn a_relative_acme_root_ca_is_the_config_directory_file() {
-        let root = format!("{ROOT}acme:\n  issuers:\n    test:\n      directory: https://ca.test/dir\n      root_ca: certs/ca.pem\n");
-        let err = assemble_err("", &files(&[("keel.yaml", &root)]));
-        assert!(err.contains("acme issuer 'test': root_ca 'certs/ca.pem' is not in the config directory"), "{err}");
-        let cfg = assemble("keel:\n  config_dir: /srv/lb\n", &files(&[("keel.yaml", &root), ("certs/ca.pem", "PEM")])).unwrap();
+        let root = format!("{ROOT}acme {{\n  issuer \"test\" {{\n    directory = \"https://ca.test/dir\"\n    root_ca   = \"certs/ca.pem\"\n  }}\n}}\n");
+        let e = assemble_err("", &files(&[("keel.hcl", &root)]));
+        assert!(e.contains("acme issuer 'test': root_ca 'certs/ca.pem' is not in the config directory"), "{e}");
+        let cfg = assemble("keel {\n  config_dir = \"/srv/lb\"\n}\n", &files(&[("keel.hcl", &root), ("certs/ca.pem", "PEM")])).unwrap();
         assert_eq!(cfg.acme.unwrap().issuers["test"].root_ca.as_deref(), Some("/srv/lb/certs/ca.pem"));
     }
 
     #[test]
-    fn the_shipped_examples_load() {
-        let example = files(&[("keel.yaml", include_str!("../../keel.yaml"))]);
-        assemble(include_str!("../../node.yaml"), &example).expect("node.yaml + keel.yaml");
-        let dev = files(&[("keel.yaml", include_str!("../../dev/config/keel.yaml"))]);
-        assemble(include_str!("../../dev/node.yaml"), &dev).expect("dev stack");
-    }
-
-    #[test]
-    fn control_ca_dir_is_not_a_setting() {
-        let yaml = format!("{POOL}control:\n  remote:\n    address: 127.0.0.1:10789\n    ca_dir: /x\n");
-        let err = serde_yml::from_str::<Config>(&yaml).expect_err("ca_dir must be refused").to_string();
-        assert!(err.contains("ca_dir"), "error names the option: {err}");
-        assert_eq!(KeelConfig::default().control_ca_dir(), "/var/lib/keel/control");
-    }
-
-    #[test]
-    fn cluster_ca_files_are_not_settings() {
-        for key in ["ca_cert", "ca_key"] {
-            let yaml = format!("{POOL}cluster:\n  addr: 10.0.0.1:7654\n  {key}: /etc/keel/ca.pem\n");
-            let err = serde_yml::from_str::<Config>(&yaml).expect_err("CA files must be refused").to_string();
-            assert!(err.contains(key), "error names the option: {err}");
+    fn the_shipped_examples_load_and_are_formatted() {
+        for (node, root) in [
+            (include_str!("../../node.hcl"), include_str!("../../keel.hcl")),
+            (include_str!("../../dev/node.hcl"), include_str!("../../dev/config/keel.hcl")),
+        ] {
+            assemble(node, &files(&[("keel.hcl", root)])).expect("example loads");
+            assert_eq!(fmt::format(node), node);
+            assert_eq!(fmt::format(root), root);
         }
     }
 
-    #[test]
-    fn cluster_node_id_is_not_a_setting() {
-        let yaml = format!("{POOL}cluster:\n  addr: 10.0.0.1:7654\n  node_id: 1\n");
-        let err = serde_yml::from_str::<Config>(&yaml).expect_err("node_id must be refused").to_string();
-        assert!(err.contains("node_id"), "error names the option: {err}");
+    fn node_err(node: &str) -> String {
+        format!("{:#}", parse_with_node(node, POOL).expect_err("should not parse"))
     }
 
     #[test]
-    fn cluster_advertise_and_state_dir_parse() {
-        let yaml = format!("{POOL}keel:\n  state_dir: /srv/keel\ncluster:\n  addr: 0.0.0.0:7654\n  advertise: 10.0.0.1:7654\n");
-        let cfg: Config = serde_yml::from_str(&yaml).expect("yaml parses");
-        assert_eq!(cfg.keel.state_dir, "/srv/keel");
-        assert_eq!(cfg.cluster.unwrap().advertise.as_deref(), Some("10.0.0.1:7654"));
-        let cfg: Config = serde_yml::from_str(POOL).expect("yaml parses");
+    fn removed_and_misspelt_settings_are_refused() {
+        let e = node_err("control {\n  remote {\n    address = \"127.0.0.1:10789\"\n    ca_dir  = \"/x\"\n  }\n}\n");
+        assert!(e.contains("node.hcl:4:5: unknown attribute `ca_dir`"), "{e}");
+        assert_eq!(KeelConfig::default().control_ca_dir(), "/var/lib/keel/control");
+        for key in ["ca_cert", "ca_key", "node_id"] {
+            let e = node_err(&format!("cluster {{\n  addr = \"10.0.0.1:7654\"\n  {key} = \"x\"\n}}\n"));
+            assert!(e.contains(&format!("unknown attribute `{key}`")), "{e}");
+        }
+        let e = parse_err(&format!("{POOL}vhost \"a\" {{\n  pool    = \"dns\"\n  redirect_htp = true\n}}\n"));
+        assert!(e.contains("unknown attribute `redirect_htp`"), "{e}");
+    }
+
+    #[test]
+    fn defaults() {
+        let cfg = parse_with_node("cluster {\n  addr      = \"0.0.0.0:7654\"\n  advertise = \"10.0.0.1:7654\"\n}\n", POOL).unwrap();
         assert_eq!(cfg.keel.state_dir, "/var/lib/keel");
-    }
-
-    #[test]
-    fn metrics_defaults_to_loopback_off_the_prometheus_port() {
+        assert_eq!(cfg.cluster.unwrap().advertise.as_deref(), Some("10.0.0.1:7654"));
         // 9090 is Prometheus's own default, so a node colocated with a
         // Prometheus server collided with it; 10790 sits next to the remote
         // control port (10789) and outside the 9100-9999 exporter range.
-        let yaml = "pools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
-        let cfg = serde_yml::from_str::<Config>(yaml).unwrap();
+        let cfg = with_pool("");
         assert_eq!(cfg.metrics.address, "127.0.0.1:10790");
+        assert_eq!(cfg.keel.udp_flow_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.keel.grace_period, Duration::from_secs(10));
+        let p = &cfg.pools["dns"].passive;
+        assert!(p.enabled);
+        assert_eq!((p.failures, p.eject_for), (5, Duration::from_secs(30)));
+        cfg.validate().expect("valid");
     }
 
     #[test]
     fn remote_control_address_must_be_literal() {
         // A hostname would resolve through tokio's blocking pool, adding a
         // thread to the process that forks workers.
-        let yaml = "control:\n  remote:\n    address: localhost:10789\npools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
-        let err = serde_yml::from_str::<Config>(yaml).unwrap().validate().unwrap_err().to_string();
-        assert!(err.contains("literal ip:port"), "unexpected error: {err}");
-
-        let yaml = "control:\n  remote:\n    address: 0.0.0.0:10789\npools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n";
-        assert!(serde_yml::from_str::<Config>(yaml).unwrap().validate().is_ok());
+        let remote = |address: &str| parse_with_node(&format!("control {{\n  remote {{\n    address = \"{address}\"\n  }}\n}}\n"), POOL).unwrap();
+        assert!(err(&remote("localhost:10789")).contains("literal ip:port"));
+        remote("0.0.0.0:10789").validate().unwrap();
     }
 
     #[test]
-    fn udp_pool_listener_is_accepted() {
-        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
-        cfg.validate().expect("valid");
-        assert_eq!(cfg.listeners[0].udp_pool.as_deref(), Some("dns"));
-        assert_eq!(cfg.keel.udp_flow_timeout_seconds, 30);
+    fn listeners_by_protocol() {
+        let cfg = with_pool("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n}\nlistener \"tcp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n}\n");
+        cfg.validate().expect("udp and tcp share an address and a pool");
+        assert_eq!((cfg.listeners[0].udp_pool(), cfg.listeners[0].tcp_pool()), (Some("dns"), None));
+        assert_eq!((cfg.listeners[1].udp_pool(), cfg.listeners[1].tcp_pool()), (None, Some("dns")));
+
+        let e = |text: &str| err(&with_pool(text));
+        assert!(e("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"resolvers\"\n}\n").contains("references unknown pool 'resolvers'"));
+        assert!(e("listener \"tcp\" \"0.0.0.0:53\" {}\n").contains("needs a pool"));
+        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  pool = \"dns\"\n}\n").contains("takes no pool"));
+        assert!(e("listener \"http\" \"0.0.0.0:80\" {}\nlistener \"tcp\" \"0.0.0.0:80\" {\n  pool = \"dns\"\n}\n").contains("another listener already uses 0.0.0.0:80"));
+        assert!(e("listener \"https\" \"0.0.0.0:443\" {\n  tls_mode = \"terminate\"\n}\n").contains("tcp listeners only"));
+        let e = parse_err("listener \"quic\" \"0.0.0.0:443\" {}\n");
+        assert!(e.contains("keel.hcl:1:10: unknown variant `quic`"), "{e}");
     }
 
     #[test]
-    fn udp_pool_must_name_an_existing_pool() {
-        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: resolvers\n");
-        assert!(err(&cfg).contains("unknown udp_pool 'resolvers'"));
+    fn proxy_protocol_allowed_on_every_listener_kind() {
+        for (protocol, body) in [("http", ""), ("https", ""), ("udp", "  pool = \"dns\"\n"), ("tcp", "  pool = \"dns\"\n")] {
+            with_pool(&format!("listener \"{protocol}\" \"0.0.0.0:5353\" {{\n{body}  proxy_protocol = true\n}}\n")).validate().expect(protocol);
+        }
     }
 
     #[test]
-    fn udp_pool_rejects_tls() {
-        let cfg = parse("  - address: 0.0.0.0:853\n    udp_pool: dns\n    tls: true\n");
-        assert!(err(&cfg).contains("udp_pool cannot be combined with 'tls'"));
+    fn vhosts_take_a_pool_or_routes() {
+        let cfg = with_pool("vhost \"a.test\" {\n  pool = \"dns\"\n  route \"/\" {\n    pool = \"dns\"\n  }\n}\n");
+        assert!(err(&cfg).contains("pool and route blocks exclude each other"));
+        let cfg = with_pool("vhost \"a.test\" {\n  route \"/a/\" {\n    pool = \"dns\"\n  }\n  route \"/a/\" {\n    pool = \"dns\"\n  }\n}\n");
+        assert!(err(&cfg).contains("route \"/a/\" is defined twice"));
+        let cfg = with_pool("vhost \"a.test\" {\n  route \"/api/\" {\n    pool = \"dns\"\n    cache {\n      enabled = true\n      ttl     = \"1d\"\n    }\n  }\n}\n");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.vhosts[0].routes[0].cache.as_ref().unwrap().ttl, Some(Duration::from_secs(86_400)));
     }
 
-    #[test]
-    fn udp_pool_rejects_tcp_pool_on_same_listener() {
-        let cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n    tcp_pool: dns\n");
-        assert!(err(&cfg).contains("udp_pool and tcp_pool are mutually exclusive"));
+    fn health(hc: &str) -> Config {
+        with_pool(&format!("pool \"p\" {{\n  backend \"10.0.0.1:80\" {{}}\n  {hc}\n}}\n"))
     }
 
-    #[test]
-    fn udp_and_tcp_on_separate_listeners_share_a_pool() {
-        let cfg = parse(
-            "  - address: 0.0.0.0:53\n    udp_pool: dns\n  - address: 0.0.0.0:53\n    tcp_pool: dns\n",
-        );
-        cfg.validate().expect("valid");
-    }
-
-    fn pool_with(hc: &str) -> Config {
-        let yaml = format!("pools:\n  p:\n    health_check:\n{hc}    backends:\n      - address: 10.0.0.1:80\n");
-        serde_yml::from_str(&yaml).expect("yaml parses")
-    }
-
-    fn parse_err(hc: &str) -> String {
-        let yaml = format!("pools:\n  p:\n    health_check:\n{hc}    backends:\n      - address: 10.0.0.1:80\n");
-        serde_yml::from_str::<Config>(&yaml).expect_err("should not parse").to_string()
+    fn health_err(hc: &str) -> String {
+        parse_err(&format!("pool \"p\" {{\n  backend \"10.0.0.1:80\" {{}}\n  {hc}\n}}\n"))
     }
 
     #[test]
     fn health_check_tcp_and_http_keep_their_shape() {
-        let cfg = pool_with("      type: tcp\n      interval: 5s\n");
+        let cfg = health("health_check \"tcp\" {\n    interval = \"5s\"\n  }");
         let hc = cfg.pools["p"].health_check.as_ref().unwrap();
         assert!(matches!(hc.probe, ProbeConfig::Tcp));
-        assert_eq!(hc.interval, "5s");
-        assert_eq!(hc.timeout, "2s");
+        assert_eq!((hc.interval, hc.timeout), (Duration::from_secs(5), Duration::from_secs(2)));
         assert_eq!(hc.healthy_threshold, 2);
         cfg.validate().expect("valid");
 
-        let cfg = pool_with("      type: http\n      path: /ready\n      expect_status: [200, 204]\n      port: 9000\n");
+        let cfg = health("health_check \"http\" {\n    path          = \"/ready\"\n    expect_status = [200, 204]\n    port          = 9000\n  }");
         let hc = cfg.pools["p"].health_check.as_ref().unwrap();
         match &hc.probe {
             ProbeConfig::Http { path, expect_status, tls, .. } => {
@@ -1793,21 +1830,21 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert_eq!(hc.interval, Duration::from_secs(10));
         assert_eq!(hc.port, Some(9000));
         cfg.validate().expect("valid");
     }
 
     #[test]
-    fn health_check_rejects_fields_of_other_types() {
-        assert!(parse_err("      type: tcp\n      path: /health\n").contains("'path' is not valid for type 'tcp'"));
-        assert!(parse_err("      type: udp\n      expect_body: ok\n").contains("'expect_body' is not valid for type 'udp'"));
-        assert!(parse_err("      type: smtp\n").contains("not one of"));
-        assert!(parse_err("      interval: 5s\n").contains("type is required"));
+    fn health_check_rejects_attributes_of_other_types() {
+        assert!(health_err("health_check \"tcp\" {\n    path = \"/health\"\n  }").contains("'path' is not valid for type 'tcp'"));
+        assert!(health_err("health_check \"udp\" {\n    expect_body = \"ok\"\n  }").contains("'expect_body' is not valid for type 'udp'"));
+        assert!(health_err("health_check \"smtp\" {}").contains("not one of"));
     }
 
     #[test]
-    fn dns_and_ntp_probes_parse_and_validate() {
-        let cfg = pool_with("      type: dns\n      query: example.com\n      record: AAAA\n      transport: tcp\n      expect: '2001:db8::1'\n");
+    fn dns_ntp_icmp_and_tls_probes_parse_and_validate() {
+        let cfg = health("health_check \"dns\" {\n    query     = \"example.com\"\n    record    = \"AAAA\"\n    transport = \"tcp\"\n    expect    = \"2001:db8::1\"\n  }");
         match &cfg.pools["p"].health_check.as_ref().unwrap().probe {
             ProbeConfig::Dns { query, record, transport, expect } => {
                 assert_eq!(query, "example.com");
@@ -1818,81 +1855,67 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         cfg.validate().expect("valid");
-        let cfg = pool_with("      type: ntp\n");
-        assert!(matches!(cfg.pools["p"].health_check.as_ref().unwrap().probe, ProbeConfig::Ntp));
-        cfg.validate().expect("valid");
-        let cfg = pool_with("      type: icmp\n      timeout: 500ms\n");
+        assert!(matches!(health("health_check \"ntp\" {}").pools["p"].health_check.as_ref().unwrap().probe, ProbeConfig::Ntp));
+        let cfg = health("health_check \"icmp\" {\n    timeout = \"1s\"\n  }");
         assert!(matches!(cfg.pools["p"].health_check.as_ref().unwrap().probe, ProbeConfig::Icmp));
-        cfg.validate().expect("valid");
-        let cfg = pool_with("      type: tls\n      sni: db.example.com\n      min_days_valid: 14\n");
+        let cfg = health("health_check \"tls\" {\n    sni       = \"db.example.com\"\n    min_valid = \"14d\"\n  }");
         match &cfg.pools["p"].health_check.as_ref().unwrap().probe {
-            ProbeConfig::Tls { sni, min_days_valid } => {
+            ProbeConfig::Tls { sni, min_valid } => {
                 assert_eq!(sni.as_deref(), Some("db.example.com"));
-                assert_eq!(*min_days_valid, Some(14));
+                assert_eq!(*min_valid, Some(Duration::from_secs(14 * 86_400)));
             }
             other => panic!("unexpected {other:?}"),
         }
         cfg.validate().expect("valid");
-        assert!(pool_with("      type: tls\n      sni: 'a..b'\n").validate().unwrap_err().to_string().contains("not a valid host name"));
-        assert!(parse_err("      type: tls\n      path: /\n").contains("'path' is not valid for type 'tls'"));
+        assert!(err(&health("health_check \"tls\" {\n    sni = \"a..b\"\n  }")).contains("not a valid host name"));
+        assert!(health_err("health_check \"tls\" {\n    path = \"/\"\n  }").contains("'path' is not valid for type 'tls'"));
 
-        let err = |hc: &str| pool_with(hc).validate().expect_err("invalid").to_string();
-        assert!(err("      type: dns\n      query: ''\n").contains("not a valid DNS name"));
-        assert!(err("      type: dns\n      query: a..b\n").contains("not a valid DNS name"));
-        assert!(err("      type: dns\n      query: example.com\n      expect: nope\n").contains("not an IP address"));
-        assert!(err("      type: dns\n      query: example.com\n      expect: '::1'\n").contains("does not match record type"));
-        assert!(parse_err("      type: dns\n").contains("query"));
-        assert!(parse_err("      type: ntp\n      query: x\n").contains("'query' is not valid for type 'ntp'"));
+        let e = |hc: &str| err(&health(hc));
+        assert!(e("health_check \"dns\" {\n    query = \"\"\n  }").contains("not a valid DNS name"));
+        assert!(e("health_check \"dns\" {\n    query = \"a..b\"\n  }").contains("not a valid DNS name"));
+        assert!(e("health_check \"dns\" {\n    query  = \"example.com\"\n    expect = \"nope\"\n  }").contains("not an IP address"));
+        assert!(e("health_check \"dns\" {\n    query  = \"example.com\"\n    expect = \"::1\"\n  }").contains("does not match record type"));
+        assert!(health_err("health_check \"dns\" {}").contains("query"));
+        assert!(health_err("health_check \"ntp\" {\n    query = \"x\"\n  }").contains("'query' is not valid for type 'ntp'"));
     }
 
     #[test]
-    fn passive_defaults_and_validation() {
-        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
-        let p = &cfg.pools["p"].passive;
-        assert!(p.enabled);
-        assert_eq!(p.failures, 5);
-        assert_eq!(p.eject_for, "30s");
-        cfg.validate().expect("valid");
-
-        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    passive:\n      enabled: false\n      failures: 0\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
-        assert!(cfg.validate().unwrap_err().to_string().contains("passive.failures"));
-        let cfg: Config = serde_yml::from_str("pools:\n  p:\n    passive:\n      eject_for: forever\n    backends:\n      - address: 10.0.0.1:80\n").unwrap();
-        assert!(cfg.validate().unwrap_err().to_string().contains("passive.eject_for"));
-    }
-
-    #[test]
-    fn health_check_validates_values() {
-        let err = |hc: &str| pool_with(hc).validate().expect_err("invalid").to_string();
-        assert!(err("      type: tcp\n      interval: soon\n").contains("health_check.interval"));
-        assert!(err("      type: tcp\n      timeout: 0s\n").contains("greater than zero"));
-        assert!(err("      type: tcp\n      healthy_threshold: 0\n").contains("thresholds"));
-        assert!(err("      type: http\n      path: health\n").contains("start with '/'"));
-        assert!(err("      type: http\n      expect_status: [42]\n").contains("not an HTTP status"));
+    fn health_check_and_passive_validate_values() {
+        assert!(health_err("health_check \"tcp\" {\n    interval = \"soon\"\n  }").contains("'soon' is not a duration"));
+        assert!(health_err("health_check \"tcp\" {\n    timeout = \"500ms\"\n  }").contains("'500ms' is not a duration"));
+        assert!(health_err("health_check \"tcp\" {\n    timeout = \"0s\"\n  }").contains("at least 1s"));
+        let e = |hc: &str| err(&health(hc));
+        assert!(e("health_check \"tcp\" {\n    healthy_threshold = 0\n  }").contains("thresholds"));
+        assert!(e("health_check \"http\" {\n    path = \"health\"\n  }").contains("start with '/'"));
+        assert!(e("health_check \"http\" {\n    expect_status = [42]\n  }").contains("not an HTTP status"));
+        assert!(e("passive {\n    failures = 0\n  }").contains("passive.failures"));
+        assert!(health_err("passive {\n    eject_for = \"forever\"\n  }").contains("'forever' is not a duration"));
     }
 
     #[test]
     fn durations_parse_strictly() {
-        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("1s").unwrap(), Duration::from_secs(1));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-        assert!(parse_duration("10").is_err());
-        assert!(parse_duration("fast").is_err());
-        assert!(parse_duration("0s").is_err());
+        assert_eq!(parse_duration("30d").unwrap(), Duration::from_secs(30 * 86_400));
+        assert_eq!(parse_duration("2w").unwrap(), Duration::from_secs(14 * 86_400));
+        assert_eq!(parse_duration("1y").unwrap(), Duration::from_secs(365 * 86_400));
+        for bad in ["10", "fast", "0s", "500ms", "1.5s", " 1s", "1 s", "-1s"] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+        assert_eq!(RenewBefore::parse("20d").unwrap(), RenewBefore::Before(Duration::from_secs(20 * 86_400)));
+        assert!(RenewBefore::parse("20").is_err());
     }
 
-    fn tcp_tls(listener_fields: &str, certificates: &str) -> Config {
-        serde_yml::from_str(&format!(
-            "{POOL}listeners:\n  - address: 0.0.0.0:6379\n    tcp_pool: dns\n{listener_fields}certificates:\n{certificates}"
-        ))
-        .expect("yaml parses")
+    fn tcp_tls(listener: &str, certificate: &str) -> Config {
+        with_pool(&format!("listener \"tcp\" \"0.0.0.0:6379\" {{\n  pool = \"dns\"\n{listener}}}\ncertificate \"cache.example.com\" {{\n{certificate}}}\n"))
     }
 
     #[test]
     fn tcp_tls_modes_validate() {
-        let byo = "  - host: cache.example.com\n    cert: /c.pem\n    key: /k.pem\n";
-        tcp_tls("    tls_mode: terminate\n    tls_host: cache.example.com\n", byo).validate().expect("terminate ok");
-        tcp_tls("    tls_mode: reencrypt\n    tls_host: cache.example.com\n    tls_verify: true\n    tls_ca: /ca.pem\n", byo)
+        let byo = "  cert = \"/c.pem\"\n  key  = \"/k.pem\"\n";
+        tcp_tls("  tls_mode = \"terminate\"\n  tls_host = \"cache.example.com\"\n", byo).validate().expect("terminate ok");
+        tcp_tls("  tls_mode   = \"reencrypt\"\n  tls_host   = \"cache.example.com\"\n  tls_verify = true\n  tls_ca     = \"/ca.pem\"\n", byo)
             .validate()
             .expect("reencrypt ok");
         let cfg = tcp_tls("", byo);
@@ -1900,30 +1923,18 @@ mod tests {
         assert!(!cfg.certificates[0].is_acme());
         cfg.validate().expect("passthrough default ok");
 
-        let e = |l: &str, c: &str| tcp_tls(l, c).validate().expect_err("invalid").to_string();
-        assert!(e("    tls_mode: terminate\n", byo).contains("needs tls_host"));
-        assert!(e("    tls_mode: terminate\n    tls_host: other.example.com\n", byo).contains("matches no certificates"));
-        assert!(e("    tls_host: cache.example.com\n", byo).contains("need tls_mode terminate or reencrypt"));
-        assert!(e("    tls_mode: terminate\n    tls_host: cache.example.com\n    tls_verify: true\n", byo).contains("reencrypt only"));
-        assert!(e("    tls_mode: reencrypt\n    tls_host: cache.example.com\n    tls_ca: /ca.pem\n", byo).contains("needs tls_verify"));
-        assert!(e("", "  - host: cache.example.com\n    cert: /c.pem\n").contains("set together"));
-        let cfg = parse("  - address: 0.0.0.0:80\n    tls_mode: terminate\n");
-        assert!(err(&cfg).contains("tcp_pool listeners only"));
-    }
-
-    #[test]
-    fn proxy_protocol_allowed_on_every_listener_kind() {
-        parse("  - address: 0.0.0.0:80\n    proxy_protocol: true\n").validate().expect("http listener");
-        parse("  - address: 0.0.0.0:443\n    tls: true\n    proxy_protocol: true\n").validate().expect("tls listener");
-        parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n    proxy_protocol: true\n").validate().expect("udp listener");
-        parse("  - address: 0.0.0.0:5353\n    tcp_pool: dns\n    tls_mode: terminate\n    tls_host: x\n    proxy_protocol: true\n")
-            .validate()
-            .expect_err("tls_host x unknown, but proxy_protocol itself is fine on tcp listeners");
+        let e = |l: &str, c: &str| err(&tcp_tls(l, c));
+        assert!(e("  tls_mode = \"terminate\"\n", byo).contains("needs tls_host"));
+        assert!(e("  tls_mode = \"terminate\"\n  tls_host = \"other.example.com\"\n", byo).contains("matches no certificate"));
+        assert!(e("  tls_host = \"cache.example.com\"\n", byo).contains("need tls_mode terminate or reencrypt"));
+        assert!(e("  tls_mode   = \"terminate\"\n  tls_host   = \"cache.example.com\"\n  tls_verify = true\n", byo).contains("reencrypt only"));
+        assert!(e("  tls_mode = \"reencrypt\"\n  tls_host = \"cache.example.com\"\n  tls_ca   = \"/ca.pem\"\n", byo).contains("needs tls_verify"));
+        assert!(e("", "  cert = \"/c.pem\"\n").contains("set together"));
     }
 
     #[test]
     fn backend_weight_must_be_1_to_1000() {
-        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+        let mut cfg = with_pool("");
         for weight in [1, 1000] {
             cfg.pools.get_mut("dns").unwrap().backends[0].weight = weight;
             cfg.validate().expect("weight in range");
@@ -1935,12 +1946,10 @@ mod tests {
     }
 
     #[test]
-    fn udp_flow_timeout_zero_is_rejected() {
-        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
-        cfg.keel.udp_flow_timeout_seconds = 0;
-        assert!(err(&cfg).contains("udp_flow_timeout_seconds"));
-        let mut cfg = parse("  - address: 0.0.0.0:53\n    udp_pool: dns\n");
+    fn udp_limits() {
+        let mut cfg = with_pool("");
         cfg.keel.udp_max_flows = 0;
         assert!(err(&cfg).contains("udp_max_flows"));
+        assert!(parse_err("keel {\n  udp_flow_timeout = \"0s\"\n}\n").contains("at least 1s"));
     }
 }

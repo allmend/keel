@@ -1,10 +1,10 @@
 //! L4 UDP load balancing.
 //!
-//! A listener with `udp_pool` forwards datagrams to a backend selected from
+//! A `udp` listener forwards datagrams to a backend selected from
 //! the named pool. UDP has no connection, so Keel tracks *flows*: one per
 //! client `ip:port`, pinned to a backend for as long as datagrams keep
 //! arriving. A flow ends when it has been idle for
-//! `keel.udp_flow_timeout_seconds` (or on shutdown / a socket error) — there
+//! `keel.udp_flow_timeout` (or on shutdown / a socket error) — there
 //! is no close handshake to observe.
 //!
 //! Each flow owns a dedicated upstream socket connected to its backend, so

@@ -2,7 +2,7 @@
 
 ## One node or many
 
-A node is always a cluster. A single node is a cluster of one: it runs the same processes, commits its changes (pushes, drains, ACME certificates) to its own Raft log, and keeps them across restarts. Commands and their output are the same for one node and for many. A node opens no peer port until its `node.yaml` has a `cluster:` section.
+A node is always a cluster. A single node is a cluster of one: it runs the same processes, commits its changes (pushes, drains, ACME certificates) to its own Raft log, and keeps them across restarts. Commands and their output are the same for one node and for many. A node opens no peer port until its `node.hcl` has a `cluster` block.
 
 Add nodes when you need:
 - Fault tolerance — traffic continues if a node fails
@@ -29,21 +29,22 @@ A leader is elected by majority vote only; a node never promotes itself. When th
 
 ## Starting a cluster
 
-The first node has a `cluster:` section without `join`:
+The first node has a `cluster` block without `join`:
 
-```yaml
-# /etc/keel/node.yaml on 10.0.0.1
-cluster:
-  addr: 0.0.0.0:7654
-  advertise: 10.0.0.1:7654
-  secret: mysecret
+```hcl
+# /etc/keel/node.hcl on 10.0.0.1
+cluster {
+  addr      = "0.0.0.0:7654"
+  advertise = "10.0.0.1:7654"
+  secret    = "mysecret"
+}
 ```
 
 Started with no stored state, it creates the cluster: generates the cluster CA, issues its own node certificate, commits the CA to Raft so every member holds it, and commits its config directory as version 1. All inter-node communication uses mTLS with this CA.
 
 A non-empty `secret` is required. The join listener would otherwise hand a cluster identity to any peer that can reach the port. Use a high-entropy token, e.g. `openssl rand -hex 32`: a weak secret can be brute-forced offline from a captured join exchange.
 
-A single node that grows into a cluster gets this section added to its `node.yaml` and is restarted; it keeps its state and moves to the announced address.
+A single node that grows into a cluster gets this block added to its `node.hcl` and is restarted; it keeps its state and moves to the announced address.
 
 ---
 
@@ -51,13 +52,14 @@ A single node that grows into a cluster gets this section added to its `node.yam
 
 The other nodes list members to join through:
 
-```yaml
-# /etc/keel/node.yaml on 10.0.0.2
-cluster:
-  addr: 0.0.0.0:7654
-  advertise: 10.0.0.2:7654
-  secret: mysecret
-  join: [10.0.0.1:7654]
+```hcl
+# /etc/keel/node.hcl on 10.0.0.2
+cluster {
+  addr      = "0.0.0.0:7654"
+  advertise = "10.0.0.2:7654"
+  secret    = "mysecret"
+  join      = ["10.0.0.1:7654"]
+}
 ```
 
 A node with no stored state and a `join` list only ever joins: it contacts a listed member, authenticates with the shared secret, receives a node certificate from the cluster CA, and joins the Raft group. It never starts a cluster of its own. Its own address in the list is skipped, so one node file can serve every node except the first.
@@ -74,7 +76,7 @@ on the wire — the join request and the response (which carries the new node's 
 key and the CA) are both AEAD-encrypted. A passive eavesdropper on the network
 segment cannot read them, and a peer without the secret cannot decrypt or forge them.
 
-The `--cluster`, `--bootstrap`, `--join` and `--secret` flags are gone. Given one, `keel` refuses to start and names the `node.yaml` field that replaced it.
+The `--cluster`, `--bootstrap`, `--join` and `--secret` flags are gone. Given one, `keel` refuses to start and names the `node.hcl` attribute that replaced it.
 
 ### Restarts
 
@@ -83,7 +85,7 @@ Each node stores its Raft state in `raft/store.redb` under `keel.state_dir` (def
 A node with stored state restarts from it:
 
 - It recovers its membership, catches up from the leader and takes part in a normal election.
-- `cluster.join` is not used. One exception is refused instead: a node alone in its stored cluster whose `node.yaml` lists `join` started a cluster of its own earlier. It does not start, and names the fix: stop it, remove `raft/` from the state directory, start it again.
+- `cluster.join` is not used. One exception is refused instead: a node alone in its stored cluster whose `node.hcl` lists `join` started a cluster of its own earlier. It does not start, and names the fix: stop it, remove `raft/` from the state directory, start it again.
 - After a full cluster restart the nodes elect a leader and serve the committed config.
 
 The state directory also holds `node_id`, `node.crt`, `node.key` (`0600`), `cluster-ca.crt` and `members.yaml`, the last known members, rewritten on every membership change.
@@ -116,24 +118,25 @@ Use it only for members that will not return. A returning member still holds the
 
 ---
 
-## Cluster configuration in node.yaml
+## Cluster configuration in node.hcl
 
-```yaml
-cluster:
-  addr: 0.0.0.0:7654         # bind address for Raft peer connections
-  advertise: 10.0.0.1:7654   # address the other nodes connect to
-  secret: change-me-in-production
-  join: [10.0.0.2:7654]      # omit on the node that starts the cluster
+```hcl
+cluster {
+  addr      = "0.0.0.0:7654"  # bind address for Raft peer connections
+  advertise = "10.0.0.1:7654" # address the other nodes connect to
+  secret    = "change-me-in-production"
+  join      = ["10.0.0.2:7654"] # omit on the node that starts the cluster
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
-| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections; must not be a `listeners:` address |
+| `addr` | `0.0.0.0:7654` | Bind address for Raft peer connections; must not be a listener's address |
 | `advertise` | `addr` | Address this node announces to the other nodes |
 | `secret` | none | Shared secret for join authentication; required |
 | `join` | none | Members to join through on first start |
 
-The other nodes connect to `advertise`, or to `addr` when `advertise` is not set, so that address must be reachable from them. An unspecified address (`0.0.0.0`, `::`) can be bound but not reached: a node refuses to start when the announced address is unspecified, naming `cluster.advertise`. Unknown keys under `cluster:` are refused.
+The other nodes connect to `advertise`, or to `addr` when `advertise` is not set, so that address must be reachable from them. An unspecified address (`0.0.0.0`, `::`) can be bound but not reached: a node refuses to start when the announced address is unspecified, naming `cluster.advertise`.
 
 ---
 
@@ -167,7 +170,7 @@ Bringing your own CA is not supported: `--ca-cert`, `--ca-key`, `cluster.ca_cert
 
 ## Config replication
 
-The config directory, `/etc/keel/config/`, is identical on every node. Each change is a new version, committed through Raft. `/etc/keel/node.yaml` is never replicated. See [In a cluster](configuration.md#in-a-cluster).
+The config directory, `/etc/keel/config/`, is identical on every node. Each change is a new version, committed through Raft. `/etc/keel/node.hcl` is never replicated. See [In a cluster](configuration.md#in-a-cluster).
 
 ```bash
 keel config push /etc/keel/config
@@ -175,7 +178,7 @@ config version 42 committed; every node applies it
 ```
 
 - Any node accepts a push. A follower forwards it to the leader.
-- A push carries every file by relative path, certificates included. A single file is pushed as `keel.yaml`. Files missing from a version are deleted on every node.
+- A push carries every file by relative path, certificates included. A single file is pushed as `keel.hcl`. Files missing from a version are deleted on every node.
 - The set is validated before commit, on the receiving node and on the leader. An invalid set is refused with the reason.
 - Without a reachable majority the push fails at once, naming how many members answered.
 - A node writes the files only after it applied the version. A version that fails on a node leaves it on the previous one, files unchanged.

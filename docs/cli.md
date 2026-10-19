@@ -10,20 +10,20 @@ These flags are used when starting Keel as a server (no subcommand).
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--config <path>` | `/etc/keel/node.yaml` | The node file; it names the config directory (`keel.config_dir`). Missing at the default path = every node setting at its default. See [Files and layout](configuration.md#files-and-layout) |
+| `--config <path>` | `/etc/keel/node.hcl` | The node file; it names the config directory (`keel.config_dir`). Missing at the default path = every node setting at its default. See [Files and layout](configuration.md#files-and-layout) |
 | `--socket <path>` | `/var/run/keel/keel.sock` | Control socket path |
 | `--force-new-cluster` | false | Forced recovery: keep this node's Raft state and make it the only member; see [Forced recovery](cluster.md#forced-recovery) |
 
-Whether a node starts a cluster or joins one is set in `node.yaml` (`cluster.join`), not by flags; see [Cluster](cluster.md#starting-a-cluster). `--cluster`, `--bootstrap`, `--join` and `--secret` are refused, with the field that replaced them.
+Whether a node starts a cluster or joins one is set in `node.hcl` (`cluster.join`), not by flags; see [Cluster](cluster.md#starting-a-cluster). `--cluster`, `--bootstrap`, `--join` and `--secret` are refused, with the field that replaced them.
 
 Examples:
 
 ```bash
-# /etc/keel/node.yaml and /etc/keel/config/
+# /etc/keel/node.hcl and /etc/keel/config/
 keel
 
 # Another node file
-keel --config /srv/keel/node.yaml
+keel --config /srv/keel/node.hcl
 ```
 
 ---
@@ -177,13 +177,49 @@ keel config push /etc/keel/config
 config version 42 committed; every node applies it
 ```
 
-- A directory is pushed with every file by relative path, certificates included. A single file is pushed as `keel.yaml`, alone.
+- A directory is pushed with every file by relative path, certificates included. A single file is pushed as `keel.hcl`, alone.
 - The set replaces the current version. Files it no longer has are deleted on every node.
 - It is validated before commit. An invalid set is refused with the reason (`config not pushed: …`).
 - Any node accepts it. A follower forwards it to the leader.
 - Without a reachable majority it fails at once: `no quorum: 1 of 3 members reachable; config not pushed`.
 
 See [Config replication](cluster.md#config-replication).
+
+---
+
+## keel config validate
+
+Load the node file and a config directory as Keel would, without a running node.
+
+```bash
+keel config validate [dir] [--write]
+```
+
+```
+$ keel config validate
+/etc/keel/config/pools/web.hcl:4:3: unknown attribute `algorithmn`
+```
+
+- `dir` defaults to the node file's `keel.config_dir`; the node file is `--config`.
+- Prints suggested changes as a diff: the canonical format, and units on bare durations. `--write` applies them first.
+- Exits 1 when the configuration is not valid, 0 when it is.
+
+See [Checking and formatting](configuration.md#checking-and-formatting).
+
+---
+
+## keel config fmt
+
+Rewrite HCL files in the canonical format.
+
+```bash
+keel config fmt [paths...] [--write=false] [--list=false] [--diff] [--check]
+```
+
+- Without paths: the node file and the config directory. A directory is read recursively.
+- Prints the files it changes. `--diff` also prints the changes; `--check` writes nothing and exits 3 when a file is not formatted.
+
+See [Checking and formatting](configuration.md#checking-and-formatting).
 
 ---
 
@@ -305,4 +341,5 @@ In a cluster the new CA is committed through Raft (a follower forwards the reque
 | Code | Meaning |
 |---|---|
 | `0` | Success |
+| `3` | `keel config fmt --check`: a file is not formatted |
 | non-zero | Error (message printed to stderr) |

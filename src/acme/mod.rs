@@ -709,7 +709,7 @@ fn needs_issuance(storage: &str, host: &str, renew: RenewBefore) -> bool {
         Some((remaining, lifetime)) => {
             let threshold = match renew {
                 RenewBefore::Percent(p) => lifetime * i64::from(p) / 100,
-                RenewBefore::Days(d) => i64::from(d) * 86_400,
+                RenewBefore::Before(d) => d.as_secs() as i64,
             };
             remaining < threshold
         }
@@ -813,7 +813,7 @@ mod tests {
     fn renew_before_parsing() {
         assert_eq!(RenewBefore::parse("30%").unwrap(), RenewBefore::Percent(30));
         assert_eq!(RenewBefore::parse(" 15% ").unwrap(), RenewBefore::Percent(15));
-        assert_eq!(RenewBefore::parse("20d").unwrap(), RenewBefore::Days(20));
+        assert_eq!(RenewBefore::parse("20d").unwrap(), RenewBefore::Before(std::time::Duration::from_secs(20 * 86_400)));
         assert!(RenewBefore::parse("0%").is_err());
         assert!(RenewBefore::parse("95%").is_err());
         assert!(RenewBefore::parse("0d").is_err());

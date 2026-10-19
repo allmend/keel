@@ -25,7 +25,7 @@ services:
     image: {{image}}
     init: true
     environment: [NO_COLOR=1]
-    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config"]
+    volumes: ["./node.hcl:/etc/keel/node.hcl:ro", "./config:/etc/keel/config"]
     ports: ["80", "443"]
     networks: {{ net: {{ ipv4_address: 172.29.83.10 }} }}
 "#,
@@ -34,36 +34,37 @@ services:
 }
 
 const NODE: &str = r#"
-keel:
-  workers: 2
-  user: nobody
-  group: nogroup
+keel {
+  workers = 2
+  user    = "nobody"
+  group   = "nogroup"
+}
 "#;
 
-/// The config directory's `keel.yaml` with `vhosts` before the catch-all.
+/// The config directory's `keel.hcl` with `vhosts` before the catch-all.
 fn config(vhosts: &str) -> String {
     format!(
         r#"
-listeners:
-  - address: 0.0.0.0:80
-  - address: 0.0.0.0:443
-    tls: true
-pools:
-  web:
-    backends:
-      - address: 172.29.83.20:80
-vhosts:
-{vhosts}  - host: "*"
-    pool: web
+listener "http" "0.0.0.0:80" {{}}
+
+listener "https" "0.0.0.0:443" {{}}
+
+pool "web" {{
+  backend "172.29.83.20:80" {{}}
+}}
+{vhosts}
+vhost "*" {{
+  pool = "web"
+}}
 {PEBBLE_ACME}"#
     )
 }
 
 fn byo(host: &str) -> String {
-    format!("  - host: {host}\n    pool: web\n    tls:\n      cert: certs/{host}.crt\n      key: certs/{host}.key\n")
+    format!("\nvhost \"{host}\" {{\n  pool = \"web\"\n\n  tls {{\n    cert = \"certs/{host}.crt\"\n    key  = \"certs/{host}.key\"\n  }}\n}}\n")
 }
 
-const ACME_VHOST: &str = "  - host: acme.test\n    pool: web\n    tls: { acme: test }\n";
+const ACME_VHOST: &str = "\nvhost \"acme.test\" {\n  pool = \"web\"\n\n  tls {\n    acme = \"test\"\n  }\n}\n";
 
 /// A self-signed certificate for `host`: (cert PEM, key PEM, leaf DER).
 fn cert(host: &str) -> Result<(String, String, Vec<u8>)> {
@@ -87,8 +88,8 @@ fn acme_follows_a_reload_and_renewals_keep_it() -> Result<()> {
         "acme-reload",
         &compose(),
         &[
-            ("node.yaml", NODE.to_owned()),
-            ("config/keel.yaml", config(&byo("gone.test"))),
+            ("node.hcl", NODE.to_owned()),
+            ("config/keel.hcl", config(&byo("gone.test"))),
             ("config/certs/gone.test.crt", gone_crt),
             ("config/certs/gone.test.key", gone_key),
             ("config/certs/pebble.minica.pem", root),
@@ -106,7 +107,7 @@ fn acme_follows_a_reload_and_renewals_keep_it() -> Result<()> {
     // removes gone.test.
     stack.write_node_file("config/certs/byo.test.crt", &byo_crt)?;
     stack.write_node_file("config/certs/byo.test.key", &byo_key)?;
-    stack.write_node_file("config/keel.yaml", &config(&format!("{}{ACME_VHOST}", byo("byo.test"))))?;
+    stack.write_node_file("config/keel.hcl", &config(&format!("{}{ACME_VHOST}", byo("byo.test"))))?;
     stack.signal("keel", "HUP")?;
 
     let first = wait_until("acme.test issued without a restart", Duration::from_secs(120), || {

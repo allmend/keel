@@ -103,25 +103,25 @@ mod tests {
 
     #[test]
     fn the_hash_depends_on_paths_and_contents() {
-        let a = set(&[("keel.yaml", "x"), ("pools/a.yaml", "y")]);
+        let a = set(&[("keel.hcl", "x"), ("pools/a.hcl", "y")]);
         assert_eq!(hash(&a), hash(&a.clone()));
-        assert_ne!(hash(&a), hash(&set(&[("keel.yaml", "x"), ("pools/b.yaml", "y")])));
-        assert_ne!(hash(&a), hash(&set(&[("keel.yaml", "xy"), ("pools/a.yaml", "")])));
+        assert_ne!(hash(&a), hash(&set(&[("keel.hcl", "x"), ("pools/b.hcl", "y")])));
+        assert_ne!(hash(&a), hash(&set(&[("keel.hcl", "xy"), ("pools/a.hcl", "")])));
     }
 
     #[test]
     fn the_config_directory_ends_up_holding_exactly_the_set() {
         let dir = std::env::temp_dir().join(format!("keel-applied-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        write_config_dir(&dir, &set(&[("keel.yaml", "v1"), ("pools/a.yaml", "a"), ("old.yaml", "gone soon")])).unwrap();
-        let next = set(&[("keel.yaml", "v2"), ("pools/a.yaml", "a"), ("certs/b.crt", "pem")]);
+        write_config_dir(&dir, &set(&[("keel.hcl", "v1"), ("pools/a.hcl", "a"), ("old.hcl", "gone soon")])).unwrap();
+        let next = set(&[("keel.hcl", "v2"), ("pools/a.hcl", "a"), ("certs/b.crt", "pem")]);
         write_config_dir(&dir, &next).unwrap();
         assert_eq!(keel_control::read_file_set(&dir).unwrap(), next);
 
         let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777;
-        write_config_dir(&dir, &set(&[("keel.yaml", "v2"), ("certs/b.key", "-----BEGIN PRIVATE KEY-----\nx\n")])).unwrap();
+        write_config_dir(&dir, &set(&[("keel.hcl", "v2"), ("certs/b.key", "-----BEGIN PRIVATE KEY-----\nx\n")])).unwrap();
         assert_eq!(mode("certs/b.key"), 0o600, "a private key is private");
-        assert_eq!(mode("keel.yaml"), 0o644);
+        assert_eq!(mode("keel.hcl"), 0o644);
         assert_eq!(mode("certs"), 0o700, "directories Keel creates hold keys");
         write_config_dir(&dir, &next).unwrap();
 

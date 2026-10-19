@@ -18,9 +18,6 @@ openraft::declare_raft_types!(
 /// Commands that flow through the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
-    /// A config as one document, from logs written before file sets; read
-    /// back as a set holding only `keel.yaml`.
-    SetConfig { yaml: String },
     /// A new config version: the whole file set of the config directory.
     SetConfigFiles { files: crate::config::FileSet },
     /// Drain a backend address in every pool, on every node.

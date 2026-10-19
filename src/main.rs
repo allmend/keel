@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long)]
     force_new_cluster: bool,
 
-    // Removed: node.yaml decides. Accepted only to say what replaces them.
+    // Removed: node.hcl decides. Accepted only to say what replaces them.
     #[arg(long, hide = true)]
     cluster: bool,
     #[arg(long, hide = true)]
@@ -147,9 +147,35 @@ enum BackendCommand {
 enum ConfigCommand {
     /// Push the node's config directory as the next version (same as SIGHUP)
     Reload,
-    /// Push a config directory (or a single file, as its keel.yaml) as the next version
+    /// Push a config directory (or a single file, as its keel.hcl) as the next version
     Push {
         file: String,
+    },
+    /// Rewrite HCL files in the canonical format and list the ones changed
+    /// (default: the node file and the config directory)
+    Fmt {
+        /// Files or directories (read recursively)
+        paths: Vec<std::path::PathBuf>,
+        /// Write the formatted files
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        write: bool,
+        /// List the files that are not formatted
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        list: bool,
+        /// Show what would change, as a diff
+        #[arg(long)]
+        diff: bool,
+        /// Change nothing; exit 3 when a file is not formatted
+        #[arg(long)]
+        check: bool,
+    },
+    /// Load the node file and a config directory (default: the node's) as
+    /// Keel would, print suggested changes, and exit 1 if it is not valid
+    Validate {
+        dir: Option<std::path::PathBuf>,
+        /// Apply the suggested changes: formatting, and units on bare durations
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -175,9 +201,9 @@ fn removed_flag(cli: &Cli) -> Option<&'static str> {
     if cli.cluster || cli.bootstrap {
         Some("--cluster and --bootstrap are gone: a node with no stored state starts a cluster of its own")
     } else if cli.join.is_some() {
-        Some("--join is gone: list the members to join in node.yaml, cluster.join")
+        Some("--join is gone: list the members to join in node.hcl, cluster.join")
     } else if cli.secret.is_some() {
-        Some("--secret is gone: set it in node.yaml, cluster.secret")
+        Some("--secret is gone: set it in node.hcl, cluster.secret")
     } else {
         None
     }
@@ -207,6 +233,21 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
         Command::Backend { command: BackendCommand::Add { address, pool } } => {
             return cli_backend_add(address, pool);
         }
+        Command::Config { command: ConfigCommand::Fmt { paths, write, list, diff, check } } => {
+            let mut paths = paths.clone();
+            if paths.is_empty() {
+                let node_file = config::read_node_file(&cli.config)?;
+                if std::path::Path::new(&cli.config).exists() {
+                    paths.push(cli.config.clone().into());
+                }
+                paths.push(config::config_dir(&cli.config, &node_file)?);
+            }
+            let opts = config::fmt::FmtOptions { write: *write, list: *list, diff: *diff, check: *check };
+            std::process::exit(config::fmt::fmt_command(&paths, &opts)?);
+        }
+        Command::Config { command: ConfigCommand::Validate { dir, write } } => {
+            std::process::exit(config::fmt::validate_command(&cli.config, dir.as_deref(), *write)?);
+        }
         _ => {}
     }
 
@@ -226,6 +267,7 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
                 let files = keel_control::push_file_set(std::path::Path::new(file))?;
                 client::message(&mut stream, &ControlRequest::ConfigPush { files })
             }
+            ConfigCommand::Fmt { .. } | ConfigCommand::Validate { .. } => unreachable!(),
         },
         Command::Cluster { command: ClusterCommand::Status } => client::cluster_status(&mut stream),
         Command::Cluster { command: ClusterCommand::Demote } => {
@@ -283,7 +325,7 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
 fn cli_backend_add(address: &str, pool: &str) -> Result<()> {
     Err(anyhow::anyhow!(
         "Live backend addition is not supported.\n\
-         Add '{address}' to pool '{pool}' in keel.yaml and run 'keel config reload'."
+         Add '{address}' to pool '{pool}' in the config directory and run 'keel config reload'."
     ))
 }
 

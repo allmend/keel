@@ -1,0 +1,33 @@
+# /etc/keel/node.hcl: this node, how it runs and how it is reached.
+# Never replicated. The load balancer itself (listeners, pools, vhosts) lives
+# in the config directory, /etc/keel/config/ (see keel.hcl).
+
+keel {
+  workers = 4      # worker processes; default: CPU count (max 16)
+  user    = "keel" # workers drop to this user
+  group   = "keel"
+  # control_user = "keel-control"   # the control worker: Raft, control listeners, ACME
+  # state_dir    = "/var/lib/keel"  # node ID, certificates, Raft store, control CA
+  # config_dir   = "/etc/keel/config"
+}
+
+metrics {
+  address = "0.0.0.0:10790"
+}
+
+# Remote control (keelctl) over mTLS:
+# control {
+#   remote {
+#     address = "0.0.0.0:10789"
+#     allow   = ["10.1.2.0/24"]
+#   }
+# }
+
+# A node is a cluster of one until others join it. Peers need this block:
+# cluster {
+#   addr      = "0.0.0.0:7654"   # bind address for peer connections
+#   advertise = "10.0.0.1:7654"  # address the other nodes connect to
+#   secret    = "change-me"      # use a high-entropy token: openssl rand -hex 32
+#   join      = ["10.0.0.1:7654"] # members to join through on first start;
+#                                 # omit on the node that starts the cluster
+# }

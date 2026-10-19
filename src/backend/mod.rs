@@ -91,7 +91,7 @@ pub struct BackendEntry {
     pub drain_state: AtomicU8,
     pub connections: AtomicI64,
     pub health: HealthState,
-    /// The address as written in `keel.yaml`, which is what a later reload is
+    /// The address as written in the config, which is what a later reload is
     /// compared against. The map is keyed by the resolved address, so without
     /// this a hostname-configured backend could not be matched back to its
     /// config entry without resolving it again.
@@ -642,7 +642,7 @@ mod tests {
         let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
 
         let cfg: crate::config::Config =
-            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: backend1:80\n")
+            crate::config::parse("pool \"web\" {\n  backend \"backend1:80\" {}\n}\n")
                 .expect("config parses");
         reg.sync_from_config(&cfg);
 
@@ -662,7 +662,7 @@ mod tests {
         let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
 
         let cfg: crate::config::Config =
-            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: backend1:80\n")
+            crate::config::parse("pool \"web\" {\n  backend \"backend1:80\" {}\n}\n")
                 .expect("config parses");
         reg.sync_from_config(&cfg);
         assert_eq!(
@@ -685,7 +685,7 @@ mod tests {
         let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
 
         let cfg: crate::config::Config =
-            serde_yml::from_str("pools:\n  web:\n    backends:\n      - address: 127.0.0.1:8080\n")
+            crate::config::parse("pool \"web\" {\n  backend \"127.0.0.1:8080\" {}\n}\n")
                 .expect("config parses");
         reg.sync_from_config(&cfg);
 

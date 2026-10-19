@@ -20,30 +20,33 @@ services:
     image: {image}
     init: true
     environment: [NO_COLOR=1]
-    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config:ro"]
+    volumes: ["./node.hcl:/etc/keel/node.hcl:ro", "./config:/etc/keel/config:ro"]
     ports: ["80", "10790"]
     networks: { net: { ipv4_address: 172.29.87.10 } }
 "#;
 
 const NODE: &str = r#"
-keel:
-  workers: 2
-  user: nobody
-  group: nogroup
-metrics:
-  address: 0.0.0.0:10790
+keel {
+  workers = 2
+  user    = "nobody"
+  group   = "nogroup"
+}
+
+metrics {
+  address = "0.0.0.0:10790"
+}
 "#;
 
 const CONFIG: &str = r#"
-listeners:
-  - address: 0.0.0.0:80
-pools:
-  web:
-    backends:
-      - address: 172.29.87.20:80
-vhosts:
-  - host: "*"
-    pool: web
+listener "http" "0.0.0.0:80" {}
+
+pool "web" {
+  backend "172.29.87.20:80" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
 "#;
 
 /// The value of the first sample line starting with `series`.
@@ -75,7 +78,7 @@ fn requests_reach(stack: &Stack, want: f64) -> Result<()> {
 #[test]
 #[ignore = "needs Docker"]
 fn one_endpoint_counts_every_worker_and_outlives_a_killed_one() -> Result<()> {
-    let stack = Stack::up("metrics", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("metrics", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     let addr = stack.addr("keel", 80)?;
     wait_until("HTTP 200 through keel", Duration::from_secs(60), || {
         Ok(http_get(addr, "e2e.test", "/").ok().filter(|(status, _)| *status == 200))

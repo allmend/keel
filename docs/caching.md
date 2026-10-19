@@ -8,9 +8,10 @@ Storage is configured once at the root level and shared across all vhosts.
 
 ### Memory only
 
-```yaml
-cache:
-  memory: 256M
+```hcl
+cache {
+  memory = "256M"
+}
 ```
 
 Stores objects in process memory using LRU eviction. Fast, no I/O, lost on restart.
@@ -19,11 +20,13 @@ Each worker process has its own memory cache of the configured size, so total me
 
 ### Disk only
 
-```yaml
-cache:
-  disk:
-    path: /var/cache/keel
-    size: 10G
+```hcl
+cache {
+  disk {
+    path = "/var/cache/keel"
+    size = "10G"
+  }
+}
 ```
 
 Stores objects as files. Layout: `{path}/{hash[0:2]}/{hash}.keel`. The directory is created on first write. Every worker reads the same directory, so an object written by one worker is a hit in all of them.
@@ -32,12 +35,15 @@ Eviction is tracked per worker process: each worker counts only the objects it w
 
 ### Tiered (memory + disk)
 
-```yaml
-cache:
-  memory: 256M
-  disk:
-    path: /var/cache/keel
-    size: 10G
+```hcl
+cache {
+  memory = "256M"
+
+  disk {
+    path = "/var/cache/keel"
+    size = "10G"
+  }
+}
 ```
 
 When both tiers are configured:
@@ -66,61 +72,65 @@ Rules control *which* responses are cached and for how long. They live on the vh
 
 ### Vhost-level rules
 
-```yaml
-vhosts:
-  - host: example.com
-    pool: web
-    cache:
-      enabled: true
-      ttl: 60
-      statuses: [200, 301]
-      content_types:
-        - text/html
-        - text/css
-        - application/javascript
-        - image/*
-        - font/*
+```hcl
+vhost "example.com" {
+  pool = "web"
+
+  cache {
+    enabled  = true
+    ttl      = "1m"
+    statuses = [200, 301]
+    content_types = [
+      "text/html",
+      "text/css",
+      "application/javascript",
+      "image/*",
+      "font/*",
+    ]
+  }
+}
 ```
 
-| Field | Type | Default | Notes |
+| Attribute | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Must be `true` to cache any response for this vhost |
-| `ttl` | integer | none | Fallback TTL in seconds when the origin gives no freshness; see [How responses are evaluated](#how-responses-are-evaluated) |
-| `statuses` | list of integers | `[200]` | HTTP status codes to cache |
+| `ttl` | duration | none | Fallback TTL when the origin gives no freshness; see [How responses are evaluated](#how-responses-are-evaluated) |
+| `statuses` | list of numbers | `[200]` | HTTP status codes to cache |
 | `content_types` | list of strings | *(all)* | Content-type patterns to cache; empty means no restriction |
 
 ### Route-level rules
 
 Routes inherit the vhost-level cache config. A route can override it, restrict it, or disable it entirely.
 
-```yaml
-vhosts:
-  - host: example.com
-    cache:
-      enabled: true
-      ttl: 60                  # default for all routes
+```hcl
+vhost "example.com" {
+  cache {
+    enabled = true
+    ttl     = "1m" # default for all routes
+  }
 
-    routes:
-      - path: /static/
-        pool: assets
-        cache:
-          enabled: true
-          ttl: 86400           # static files: cache for 24h
-          statuses: [200, 301]
-          content_types:
-            - image/*
-            - text/css
-            - application/javascript
-            - font/*
+  route "/static/" {
+    pool = "assets"
 
-      - path: /api/
-        pool: api
-        cache:
-          enabled: false       # API responses: never cache
+    cache {
+      enabled       = true
+      ttl           = "24h" # static files: cache for a day
+      statuses      = [200, 301]
+      content_types = ["image/*", "text/css", "application/javascript", "font/*"]
+    }
+  }
 
-      - path: /
-        pool: web
-        # no cache block — inherits vhost default (ttl: 60, all statuses/content_types)
+  route "/api/" {
+    pool = "api"
+
+    cache {
+      enabled = false # API responses: never cache
+    }
+  }
+
+  # No cache block: inherits the vhost default (ttl 1m, all statuses/content_types)
+  route "/" { pool = "web" }
+}
 ```
 
 Resolution order for a request: **route-level → vhost-level**. If a route defines a `cache` block, it is used in full — it does not merge with the vhost-level config. If the route has no `cache` block, the vhost-level config applies.

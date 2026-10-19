@@ -8,6 +8,42 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the configuration is HCL.** The node file is
+  `/etc/keel/node.hcl`, the config directory holds `keel.hcl` and other
+  `*.hcl` files, and a `*.yaml` file there is a load error. Named things are
+  labeled blocks: `listener "<protocol>" "<address>"`, `pool "<name>"` with
+  `backend "<address>"` blocks, `vhost "<host>"` with `route "<path>"`
+  blocks, `health_check "<type>"`, `certificate "<host>"`, ACME
+  `issuer "<name>"`. Values are literals, `local.<name>` references from
+  `locals` blocks and string templates; functions, operators, conditionals
+  and `for` expressions are refused. See
+  [Configuration](docs/configuration.md#the-language). There is no
+  conversion tool and no upgrade path for stored state.
+- Listeners name their protocol: `http`, `https` (was `tls: true`), `tcp`
+  and `udp` with `pool` (were `tcp_pool` and `udp_pool`).
+- Every time setting is a duration string from `1s` up (`s`, `m`, `h`, `d`,
+  `w`, `y`): `keel.grace_period` and `keel.udp_flow_timeout` (were
+  `*_seconds` numbers), vhost and route `cache.ttl` (was seconds), the `tls`
+  health check's `min_valid` (was `min_days_valid`). `ms` is gone: health
+  checks run at most once a second.
+- Unknown attributes are refused everywhere, as are a vhost with both
+  `pool` and `route` blocks, a path routed twice in one vhost, two
+  listeners on one address, and an HTTP listener with a pool. Load errors
+  name the file, line and column.
+
+### Added
+
+- `keel config validate [dir]`: load a node file and config directory as
+  Keel would, without a running node; prints suggested changes and exits 1
+  when the configuration is not valid. `--write` applies the suggestions:
+  canonical formatting and units on bare durations.
+- `keel config fmt`: rewrite `*.hcl` files in canonical HCL format (the
+  output of `terraform fmt`), with `--write=false`, `--list=false`, `--diff`
+  and `--check` (exit 3 when a file is not formatted). See
+  [Checking and formatting](docs/configuration.md#checking-and-formatting).
+
 ---
 
 ## [0.25.0] — 2026-10-17

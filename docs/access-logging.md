@@ -4,18 +4,19 @@ Keel writes one NDJSON access log file per virtual host. Each line is a complete
 
 ## Configuration
 
-```yaml
-access_log:
-  enabled: true
-  dir: /var/log/keel
+```hcl
+access_log {
+  enabled = true
+  dir     = "/var/log/keel"
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
 | `enabled` | `true` | Set to `false` to disable access logging entirely |
 | `dir` | `/var/log/keel` | Directory for log files; set to `-` for stdout |
 
-Access logging is enabled by default. Set `dir: "-"` to write all access logs to stdout instead of files.
+Access logging is enabled by default. Set `dir = "-"` to write all access logs to stdout instead of files.
 
 ---
 

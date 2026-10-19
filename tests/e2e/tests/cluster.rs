@@ -5,7 +5,7 @@
 //! bootstrap node and node3 through node2, so every stack admits one node
 //! through a follower, which holds the replicated cluster CA.
 //!
-//! Each node's `node.yaml` names the member it joins through (node1 has none:
+//! Each node's `node.hcl` names the member it joins through (node1 has none:
 //! it starts the cluster). A node reads extra flags from `nodeN.args` (so a
 //! test can restart it with `--force-new-cluster`), keeps `/var/lib/keel` on a
 //! named volume (so a test can reach a stopped node's Raft store), and has its
@@ -45,7 +45,7 @@ fn joins_through(node: &str) -> Option<&'static str> {
 }
 
 fn node_file(node: &str, advertise_ip: &str) -> String {
-    node_yaml(advertise_ip, joins_through(node))
+    node_hcl(advertise_ip, joins_through(node))
 }
 
 /// The stack; `extra` is appended to `services:`.
@@ -70,7 +70,7 @@ services:
     init: true
     entrypoint: ["sh", "-c", "exec /usr/local/bin/keel $$(cat /etc/keel/args)"]
     environment: [NO_COLOR=1]
-    volumes: ["./{node}.yaml:/etc/keel/node.yaml:ro", "./{node}-config:/etc/keel/config", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
+    volumes: ["./{node}.hcl:/etc/keel/node.hcl:ro", "./{node}-config:/etc/keel/config", "./{node}.args:/etc/keel/args:ro", "{node}-state:/var/lib/keel"]
     ports: ["80", "443", "10789"]
     networks: {{ net: {{ ipv4_address: {ip} }} }}
 "#,
@@ -85,7 +85,7 @@ services:
     init: true
     entrypoint: ["sh", "-c", "while [ ! -s {NODE_ID_FILE} ]; do sleep 0.2; done; exec /usr/local/bin/keel"]
     environment: [NO_COLOR=1]
-    volumes: ["./node4.yaml:/etc/keel/node.yaml:ro", "./node4-config:/etc/keel/config"]
+    volumes: ["./node4.hcl:/etc/keel/node.hcl:ro", "./node4-config:/etc/keel/config"]
     networks: {{ net: {{ ipv4_address: 172.29.83.14 }} }}
 volumes:
   node1-state: {{}}
@@ -98,45 +98,56 @@ volumes:
 
 /// The node file: binds the unspecified address and announces the node's own
 /// IP, so every test exercises the difference between `addr` and `advertise`.
-fn node_yaml(advertise_ip: &str, join: Option<&str>) -> String {
-    let join = join.map(|n| format!("  join: [\"{}:7654\"]\n", ip(n))).unwrap_or_default();
+fn node_hcl(advertise_ip: &str, join: Option<&str>) -> String {
+    let join = join.map(|n| format!("  join      = [\"{}:7654\"]\n", ip(n))).unwrap_or_default();
     format!(
         r#"
-keel:
-  workers: 2
-  user: nobody
-  group: nogroup
-control:
-  remote:
-    address: 0.0.0.0:10789
-cluster:
-  addr: 0.0.0.0:7654
-  advertise: {advertise_ip}:7654
-  secret: {SECRET}
-{join}"#
-    )
-}
+keel {{
+  workers = 2
+  user    = "nobody"
+  group   = "nogroup"
+}}
 
-/// The replicated config's `keel.yaml`, with `extra_vhosts` before the catch-all.
-fn lb_config(extra_vhosts: &str) -> String {
-    format!(
-        r#"
-listeners:
-  - address: 0.0.0.0:80
-  - address: 0.0.0.0:443
-    tls: true
-pools:
-  web:
-    backends:
-      - address: 172.29.83.20:80
-vhosts:
-{extra_vhosts}  - host: "*"
-    pool: web
+control {{
+  remote {{
+    address = "0.0.0.0:10789"
+  }}
+}}
+
+cluster {{
+  addr      = "0.0.0.0:7654"
+  advertise = "{advertise_ip}:7654"
+  secret    = "{SECRET}"
+{join}}}
 "#
     )
 }
 
-const MARKER_VHOST: &str = "  - host: pushed.test\n    default_action:\n      status: 418\n      body: pushed\n";
+/// The replicated config's `keel.hcl`, with `extra_vhosts` before the catch-all.
+fn lb_config(extra_vhosts: &str) -> String {
+    format!(
+        r#"
+listener "http" "0.0.0.0:80" {{}}
+
+listener "https" "0.0.0.0:443" {{}}
+
+pool "web" {{
+  backend "172.29.83.20:80" {{}}
+}}
+{extra_vhosts}
+vhost "*" {{
+  pool = "web"
+}}
+"#
+    )
+}
+
+/// A vhost serving `pool` "web" with `tls` as its tls block's body.
+fn tls_vhost(host: &str, tls: &str) -> String {
+    format!("\nvhost \"{host}\" {{\n  pool = \"web\"\n\n  tls {{\n{tls}  }}\n}}\n")
+}
+
+const MARKER_VHOST: &str = "\nvhost \"pushed.test\" {\n  default_action {\n    status = 418\n    body   = \"pushed\"\n  }\n}\n";
 
 fn file_set(entries: &[(&str, String)]) -> keel_control::FileSet {
     entries.iter().map(|(p, t)| (p.to_string(), t.clone())).collect()
@@ -153,16 +164,16 @@ impl Cluster {
     /// Three nodes up, every one a voter, and operator credentials that work
     /// against any node.
     fn up(name: &str) -> Result<Cluster> {
-        Cluster::up_with(name, "", &[("keel.yaml", lb_config(""))])
+        Cluster::up_with(name, "", &[("keel.hcl", lb_config(""))])
     }
 
     /// [`Cluster::up`] with `extra` services and `config` as every node's
     /// config directory.
     fn up_with(name: &str, extra: &str, config: &[(&str, String)]) -> Result<Cluster> {
         let mut files: Vec<(String, String)> =
-            vec![("node4.yaml".into(), node_file("node4", "172.29.83.14")), ("node4-config/keel.yaml".into(), lb_config(""))];
+            vec![("node4.hcl".into(), node_file("node4", "172.29.83.14")), ("node4-config/keel.hcl".into(), lb_config(""))];
         for node in NODES {
-            files.push((format!("{node}.yaml"), node_file(node, &ip(node))));
+            files.push((format!("{node}.hcl"), node_file(node, &ip(node))));
             files.push((format!("{node}.args"), String::new()));
             files.extend(config.iter().map(|(f, text)| (format!("{node}-config/{f}"), text.clone())));
         }
@@ -268,7 +279,7 @@ impl Cluster {
     /// Push a config with a `pushed.test` vhost answering 418, through the leader.
     fn push_marker(&self) -> Result<()> {
         let leader = self.leader()?;
-        self.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
+        self.push(&leader, file_set(&[("keel.hcl", lb_config(MARKER_VHOST))]))?;
         Ok(())
     }
 
@@ -339,7 +350,7 @@ fn config_pushed_to_the_leader_reaches_every_node() -> Result<()> {
     let cluster = Cluster::up("cluster-push")?;
     let leader = cluster.leader()?;
 
-    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
+    cluster.push(&leader, file_set(&[("keel.hcl", lb_config(MARKER_VHOST))]))?;
 
     for node in NODES {
         let addr = cluster.stack.addr(node, 80)?;
@@ -474,7 +485,7 @@ fn a_removed_member_stays_out() -> Result<()> {
     cluster.stack.start(gone)?;
     std::thread::sleep(Duration::from_secs(5));
     assert_eq!(cluster.voters(&leader)?, { let mut v = rest.to_vec(); v.sort(); v }, "it is not let back in");
-    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))]))?;
+    cluster.push(&leader, file_set(&[("keel.hcl", lb_config(MARKER_VHOST))]))?;
 
     // It lost its state and tries to join under its old ID: refused, naming the fix.
     cluster.stack.stop(gone)?;
@@ -510,7 +521,7 @@ fn a_node_that_moves_to_a_new_address_keeps_its_id() -> Result<()> {
     let new_ip = "172.29.83.23";
 
     cluster.stack.stop("node3")?;
-    cluster.stack.write_file("node3.yaml", &node_yaml(new_ip, joins_through("node3")))?;
+    cluster.stack.write_file("node3.hcl", &node_hcl(new_ip, joins_through("node3")))?;
     cluster.stack.set_ip("node3", new_ip)?;
     cluster.stack.start("node3")?;
 
@@ -582,7 +593,7 @@ fn members_file_lists_the_cluster() -> Result<()> {
 fn a_node_restarts_from_its_stored_state_without_join() -> Result<()> {
     let cluster = Cluster::up("cluster-restore")?;
     cluster.stack.stop("node3")?;
-    cluster.stack.write_file("node3.yaml", &node_yaml(&ip("node3"), None))?;
+    cluster.stack.write_file("node3.hcl", &node_hcl(&ip("node3"), None))?;
     cluster.stack.start("node3")?;
     wait_until("node3 restored", Duration::from_secs(60), || Ok(cluster.logged("node3", "restarting from stored state")?.then_some(())))?;
     cluster.wait_for_voters("node1", &cluster.all_ids())?;
@@ -660,7 +671,7 @@ fn forced_recovery_makes_the_survivor_the_only_member() -> Result<()> {
     assert_eq!(cluster.members("node1")?, vec![id], "the others are gone from the membership");
     cluster.serves_marker("node1")?;
     // Writes commit again.
-    cluster.push("node1", file_set(&[("keel.yaml", lb_config(""))]))?;
+    cluster.push("node1", file_set(&[("keel.hcl", lb_config(""))]))?;
     Ok(())
 }
 
@@ -672,22 +683,22 @@ fn a_pushed_file_set_is_written_to_every_config_directory_and_replaces_it() -> R
     let follower = NODES.iter().find(|n| **n != leader).expect("a follower").to_string();
 
     // Pushed through a follower: forwarded to the leader.
-    let marker = format!("vhosts:\n{MARKER_VHOST}");
-    let reply = cluster.push(&follower, file_set(&[("keel.yaml", lb_config("")), ("vhosts/pushed.yaml", marker.clone())]))?;
+    let marker = MARKER_VHOST.to_owned();
+    let reply = cluster.push(&follower, file_set(&[("keel.hcl", lb_config("")), ("vhosts/pushed.hcl", marker.clone())]))?;
     assert!(reply["version"].as_u64().is_some(), "a version comes back: {reply}");
     for node in NODES {
         cluster.serves_marker(node)?;
         wait_until(&format!("{node} wrote the pushed file"), Duration::from_secs(30), || {
-            Ok((cluster.config_file(node, "vhosts/pushed.yaml")?.as_deref() == Some(marker.as_str())).then_some(()))
+            Ok((cluster.config_file(node, "vhosts/pushed.hcl")?.as_deref() == Some(marker.as_str())).then_some(()))
         })?;
     }
 
     // A set without the file removes it everywhere.
-    cluster.push(&leader, file_set(&[("keel.yaml", lb_config(""))]))?;
+    cluster.push(&leader, file_set(&[("keel.hcl", lb_config(""))]))?;
     for node in NODES {
         cluster.not_serving_marker(node)?;
         wait_until(&format!("{node} deleted the file"), Duration::from_secs(30), || {
-            Ok(cluster.config_file(node, "vhosts/pushed.yaml")?.is_none().then_some(()))
+            Ok(cluster.config_file(node, "vhosts/pushed.hcl")?.is_none().then_some(()))
         })?;
     }
     Ok(())
@@ -698,11 +709,11 @@ fn a_pushed_file_set_is_written_to_every_config_directory_and_replaces_it() -> R
 fn an_invalid_push_is_refused_and_changes_nothing() -> Result<()> {
     let cluster = Cluster::up("config-invalid")?;
     let leader = cluster.leader()?;
-    let broken = lb_config("  - host: broken.test\n    pool: nowhere\n");
-    let err = cluster.push(&leader, file_set(&[("keel.yaml", broken)])).expect_err("must be refused").to_string();
+    let broken = lb_config("\nvhost \"broken.test\" {\n  pool = \"nowhere\"\n}\n");
+    let err = cluster.push(&leader, file_set(&[("keel.hcl", broken)])).expect_err("must be refused").to_string();
     assert!(err.contains("config not pushed") && err.contains("nowhere"), "{err}");
     for node in NODES {
-        assert_eq!(cluster.config_file(node, "keel.yaml")?, Some(lb_config("")), "{node} files unchanged");
+        assert_eq!(cluster.config_file(node, "keel.hcl")?, Some(lb_config("")), "{node} files unchanged");
     }
     Ok(())
 }
@@ -716,7 +727,7 @@ fn a_push_without_quorum_fails_at_once() -> Result<()> {
         cluster.stack.stop(node)?;
     }
     let started = std::time::Instant::now();
-    let err = cluster.push(&leader, file_set(&[("keel.yaml", lb_config(MARKER_VHOST))])).expect_err("no quorum").to_string();
+    let err = cluster.push(&leader, file_set(&[("keel.hcl", lb_config(MARKER_VHOST))])).expect_err("no quorum").to_string();
     assert!(err.contains("no quorum: 1 of 3 members reachable"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10), "failed at once, not after a commit timeout");
     let (status, _) = http_get(cluster.stack.addr(&leader, 80)?, "e2e.test", "/")?;
@@ -728,7 +739,7 @@ fn a_push_without_quorum_fails_at_once() -> Result<()> {
 #[ignore = "needs Docker"]
 fn sighup_pushes_the_node_config_directory() -> Result<()> {
     let cluster = Cluster::up("config-sighup")?;
-    cluster.stack.write_node_file("node2-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.write_node_file("node2-config/keel.hcl", &lb_config(MARKER_VHOST))?;
     cluster.stack.signal("node2", "HUP")?;
     for node in NODES {
         cluster.serves_marker(node)?;
@@ -745,7 +756,7 @@ fn files_edited_while_a_node_was_stopped_become_the_next_version() -> Result<()>
         Ok(cluster.stack.on_volume("node3-state", "cat /state/applied_config.json").ok())
     })?;
     cluster.stack.stop("node3")?;
-    cluster.stack.write_node_file("node3-config/keel.yaml", &lb_config(MARKER_VHOST))?;
+    cluster.stack.write_node_file("node3-config/keel.hcl", &lb_config(MARKER_VHOST))?;
     cluster.stack.start("node3")?;
     for node in NODES {
         cluster.serves_marker(node)?;
@@ -785,13 +796,13 @@ fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -
     let cluster = Cluster::up("config-cert-file")?;
     let key = rcgen::KeyPair::generate()?;
     let cert = rcgen::CertificateParams::new(vec!["tls.test".to_owned()])?.self_signed(&key)?;
-    let vhost = "  - host: tls.test\n    pool: web\n    tls:\n      cert: certs/tls.crt\n      key: certs/tls.key\n";
+    let vhost = &tls_vhost("tls.test", "    cert = \"certs/tls.crt\"\n    key  = \"certs/tls.key\"\n");
 
     // The certificate exists only in the pushed set; no node has it on disk.
     cluster.push(
         &cluster.leader()?,
         file_set(&[
-            ("keel.yaml", lb_config(vhost)),
+            ("keel.hcl", lb_config(vhost)),
             ("certs/tls.crt", cert.pem()),
             ("certs/tls.key", key.serialize_pem()),
         ]),
@@ -805,7 +816,7 @@ fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -
     }
 
     // A set without the vhost and the files removes both everywhere.
-    cluster.push(&cluster.leader()?, file_set(&[("keel.yaml", lb_config(""))]))?;
+    cluster.push(&cluster.leader()?, file_set(&[("keel.hcl", lb_config(""))]))?;
     for node in NODES {
         wait_until(&format!("{node} dropped the certificate files"), Duration::from_secs(60), || {
             Ok(cluster.config_file(node, "certs/tls.key")?.is_none().then_some(()))
@@ -819,9 +830,9 @@ fn a_certificate_pushed_as_a_file_is_served_on_every_node_and_leaves_with_it() -
 fn every_leader_uses_the_one_acme_account_the_cluster_holds() -> Result<()> {
     // The leader renews on every check (PEBBLE_ACME), so a new leader needs
     // the account without anyone restarting it.
-    let vhost = "  - host: acme.test\n    pool: web\n    tls: { acme: test }\n";
+    let vhost = &tls_vhost("acme.test", "    acme = \"test\"\n");
     let config = [
-        ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(vhost))),
+        ("keel.hcl", format!("{}{PEBBLE_ACME}", lb_config(vhost))),
         ("certs/pebble.minica.pem", pebble_root()?),
     ];
     let cluster = Cluster::up_with("acme-account", &pebble_service(PEBBLE_IP), &config)?;
@@ -870,9 +881,8 @@ fn every_leader_uses_the_one_acme_account_the_cluster_holds() -> Result<()> {
 #[test]
 #[ignore = "needs Docker"]
 fn acme_follows_pushed_config_and_a_vhost_switches_to_acme_live() -> Result<()> {
-    let tls_vhost = |host: &str, tls: &str| format!("  - host: {host}\n    pool: web\n    tls: {tls}\n");
-    let byo = |host: &str| tls_vhost(host, &format!("{{ cert: certs/{host}.crt, key: certs/{host}.key }}"));
-    let acme = |host: &str| tls_vhost(host, "{ acme: test }");
+    let byo = |host: &str| tls_vhost(host, &format!("    cert = \"certs/{host}.crt\"\n    key  = \"certs/{host}.key\"\n"));
+    let acme = |host: &str| tls_vhost(host, "    acme = \"test\"\n");
     let cert = |host: &str| -> Result<(String, String, Vec<u8>)> {
         let key = rcgen::KeyPair::generate()?;
         let cert = rcgen::CertificateParams::new(vec![host.to_owned()])?.self_signed(&key)?;
@@ -887,7 +897,7 @@ fn acme_follows_pushed_config_and_a_vhost_switches_to_acme_live() -> Result<()> 
         "acme-live",
         &pebble_service(PEBBLE_IP),
         &[
-            ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(&byo("gone.test")))),
+            ("keel.hcl", format!("{}{PEBBLE_ACME}", lb_config(&byo("gone.test")))),
             ("certs/gone.test.crt", gone_crt),
             ("certs/gone.test.key", gone_key),
             ("certs/pebble.minica.pem", root.clone()),
@@ -898,7 +908,7 @@ fn acme_follows_pushed_config_and_a_vhost_switches_to_acme_live() -> Result<()> 
     // Push: gone.test leaves, byo.test and the ACME host acme.test arrive.
     let set = |vhosts: String| {
         file_set(&[
-            ("keel.yaml", format!("{}{PEBBLE_ACME}", lb_config(&vhosts))),
+            ("keel.hcl", format!("{}{PEBBLE_ACME}", lb_config(&vhosts))),
             ("certs/byo.test.crt", byo_crt.clone()),
             ("certs/byo.test.key", byo_key.clone()),
             ("certs/pebble.minica.pem", root.clone()),
@@ -1007,16 +1017,16 @@ fn a_single_node_grows_into_a_cluster_and_keeps_its_state() -> Result<()> {
     // node1 starts alone: no cluster section, so no peer port. node2 and
     // node3 keep trying to join it meanwhile.
     let mut files: Vec<(String, String)> = vec![
-        ("node4.yaml".into(), node_file("node4", "172.29.83.14")),
-        ("node4-config/keel.yaml".into(), lb_config("")),
-        ("node1.yaml".into(), "keel:\n  workers: 2\n  user: nobody\n  group: nogroup\n".into()),
+        ("node4.hcl".into(), node_file("node4", "172.29.83.14")),
+        ("node4-config/keel.hcl".into(), lb_config("")),
+        ("node1.hcl".into(), "keel {\n  workers = 2\n  user    = \"nobody\"\n  group   = \"nogroup\"\n}\n".into()),
     ];
     for node in NODES {
         if node != "node1" {
-            files.push((format!("{node}.yaml"), node_file(node, &ip(node))));
+            files.push((format!("{node}.hcl"), node_file(node, &ip(node))));
         }
         files.push((format!("{node}.args"), String::new()));
-        files.push((format!("{node}-config/keel.yaml"), lb_config("")));
+        files.push((format!("{node}-config/keel.hcl"), lb_config("")));
     }
     let files: Vec<(&str, String)> = files.iter().map(|(f, t)| (f.as_str(), t.clone())).collect();
     let stack = Stack::up("grow", &compose(""), &files)?;
@@ -1037,7 +1047,7 @@ fn a_single_node_grows_into_a_cluster_and_keeps_its_state() -> Result<()> {
 
     // node1 gets its cluster section and a restart; the others join it.
     stack.stop("node1")?;
-    stack.write_file("node1.yaml", &node_file("node1", &ip("node1")))?;
+    stack.write_file("node1.hcl", &node_file("node1", &ip("node1")))?;
     stack.start("node1")?;
     let grown = wait_until("three voters", Duration::from_secs(120), || {
         Ok(local("node1", &["cluster", "status"]).ok().filter(|s| s.matches("(voter)").count() == 3))

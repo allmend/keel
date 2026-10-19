@@ -68,7 +68,7 @@ impl HealthService {
         addrs: &[String],
         pools: Arc<PoolRegistry>,
     ) -> anyhow::Result<Self> {
-        let timeout = parse_duration(&cfg.timeout);
+        let timeout = cfg.timeout;
         let probe: Arc<dyn Probe> = match &cfg.probe {
             ProbeConfig::Tcp => Arc::new(TcpProbe),
             ProbeConfig::Udp => Arc::new(UdpProbe { timeout }),
@@ -90,7 +90,7 @@ impl HealthService {
             )),
             ProbeConfig::Ntp => Arc::new(ntp::NtpProbe),
             ProbeConfig::Icmp => Arc::new(icmp::IcmpProbe::new(timeout)),
-            ProbeConfig::Tls { sni, min_days_valid } => Arc::new(tls::TlsProbe::new(sni.clone(), *min_days_valid)),
+            ProbeConfig::Tls { sni, min_valid } => Arc::new(tls::TlsProbe::new(sni.clone(), *min_valid)),
         };
         let targets = addrs
             .iter()
@@ -107,7 +107,7 @@ impl HealthService {
             pool: pool.to_owned(),
             targets,
             probe,
-            interval: parse_duration(&cfg.interval),
+            interval: cfg.interval,
             timeout,
             healthy_after: cfg.healthy_threshold,
             unhealthy_after: cfg.unhealthy_threshold,
@@ -327,13 +327,6 @@ pub fn unspecified(target: &SocketAddr) -> SocketAddr {
     }
 }
 
-/// Parse a human duration string like "10s", "500ms", "2m" into `Duration`.
-/// Config validation rejects malformed values; the fallbacks here only guard
-/// against unvalidated callers.
-pub fn parse_duration(s: &str) -> Duration {
-    crate::config::parse_duration(s).unwrap_or(Duration::from_secs(10))
-}
-
 /// xorshift64*, seeded per pool and process. Jitter needs no more than this
 /// and it keeps `rand` out of the dependency tree.
 pub struct Rng(u64);
@@ -370,13 +363,6 @@ impl Rng {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_durations() {
-        assert_eq!(parse_duration("10s"), Duration::from_secs(10));
-        assert_eq!(parse_duration("500ms"), Duration::from_millis(500));
-        assert_eq!(parse_duration("2m"), Duration::from_secs(120));
-        assert_eq!(parse_duration("unknown"), Duration::from_secs(10));
-    }
 
     #[test]
     fn rng_stays_in_range_and_varies() {

@@ -48,9 +48,9 @@ pub enum WorkerRequest {
 pub struct Applied {
     /// The config version; 0 for the files the node started with.
     pub version: u64,
-    /// This node's `node.yaml` without its `cluster:` section (the join
+    /// This node's `node.hcl` without its `cluster` block (the join
     /// secret stays with the control worker).
-    pub node_yaml: String,
+    pub node_file: String,
     pub files: crate::config::FileSet,
     /// ACME certificates by host, which workers cannot read from storage.
     pub certs: crate::tls::Issued,

@@ -4,24 +4,27 @@ Keel can obtain and renew certificates automatically using the ACME v2 protocol 
 
 ## Quick start
 
-```yaml
-acme:
-  issuers:
-    default:
-      email: ops@example.com      # optional; the CA sends expiry warnings here
+```hcl
+acme {
+  issuer "default" {
+    email = "ops@example.com" # optional; the CA sends expiry warnings here
+  }
+}
 
-vhosts:
-  - host: example.com
-    pool: web
-    tls:
-      acme: true                  # use the issuer named "default"
+vhost "example.com" {
+  pool = "web"
+
+  tls {
+    acme = true # use the issuer named "default"
+  }
+}
 ```
 
-The `acme:` block is itself optional. `tls: { acme: true }` on its own implies a `default` issuer pointing at the public production directory above, without a contact email.
+The `acme` block is itself optional. `acme = true` in a vhost's `tls` block on its own implies a `default` issuer pointing at the public production directory above, without a contact email.
 
 On startup Keel registers an ACME account, proves control of `example.com` by answering the HTTP-01 challenge on port 80, obtains the certificate, and begins serving it. No restart is required.
 
-HTTP → HTTPS redirect is enabled automatically for ACME vhosts, with the challenge path exempted. Set `redirect_http: false` on the vhost to opt out.
+HTTP → HTTPS redirect is enabled automatically for ACME vhosts, with the challenge path exempted. Set `redirect_http = false` on the vhost to opt out.
 
 ---
 
@@ -31,37 +34,48 @@ An issuer is a named CA relationship: a directory URL, an account contact, and o
 
 Vhosts select an issuer by name:
 
-```yaml
-acme:
-  storage: /var/lib/keel/acme
-  renew_before: 30%
-  issuers:
-    default:
-      email: ops@example.com
-    internal:
-      email: infra@example.com
-      directory: https://ca.corp.internal/acme/acme/directory
-      root_ca: certs/corp-root.pem
+```hcl
+acme {
+  storage      = "/var/lib/keel/acme"
+  renew_before = "30%"
 
-vhosts:
-  - host: www.example.com
-    pool: web
-    tls: { acme: true }           # issuer "default"
+  issuer "default" {
+    email = "ops@example.com"
+  }
 
-  - host: intranet.corp.internal
-    pool: intranet
-    tls: { acme: internal }       # named issuer
+  issuer "internal" {
+    email     = "infra@example.com"
+    directory = "https://ca.corp.internal/acme/acme/directory"
+    root_ca   = "certs/corp-root.pem"
+  }
+}
+
+vhost "www.example.com" {
+  pool = "web"
+
+  tls {
+    acme = true # issuer "default"
+  }
+}
+
+vhost "intranet.corp.internal" {
+  pool = "intranet"
+
+  tls {
+    acme = "internal" # named issuer
+  }
+}
 ```
 
 Config validation rejects three cases:
 
-- `tls.acme` naming an issuer that is not defined under `acme.issuers`. Only `default` may be implicit.
+- `tls.acme` naming an issuer the `acme` block does not define. Only `default` may be implicit.
 - The same hostname assigned to two different issuers. A hostname belongs to exactly one issuer.
 - A wildcard host (`*`) with ACME. HTTP-01 cannot issue wildcards; supply a wildcard certificate with `tls.cert`/`tls.key` instead.
 
-### Issuer fields
+### Issuer attributes
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
 | `email` | none | Account contact. Optional but recommended. |
 | `directory` | `https://acme-v02.api.letsencrypt.org/directory` | Any ACME v2 directory URL. Staging: `https://acme-staging-v02.api.letsencrypt.org/directory` |
@@ -72,15 +86,16 @@ Config validation rejects three cases:
 
 ## Renewal
 
-```yaml
-acme:
-  renew_before: 30%     # global default; issuers may override
+```hcl
+acme {
+  renew_before = "30%" # global default; issuers may override
+}
 ```
 
 `renew_before` decides when a certificate is renewed. It takes one of two forms:
 
 - **Percentage** (`30%`) — renew when less than that share of the certificate's total lifetime remains. This scales with the CA's policy: a 90-day certificate renews with about 27 days left, a 6-day certificate with about 1.7 days left. This is the default.
-- **Absolute** (`20d`) — renew when fewer than that many days remain. Simpler, but wrong for short-lived certificates. Prefer the percentage form.
+- **Duration** (`20d`) — renew when less than that remains. Simpler, but wrong for short-lived certificates. Prefer the percentage form.
 
 The renewal check runs every 60 seconds, so a certificate is renewed within a minute of crossing its threshold. Renewed certificates are hot-swapped into the TLS listeners with no restart and no dropped connections.
 
@@ -94,31 +109,31 @@ Failed issuance retries with exponential backoff (1 minute, doubling to a 6-hour
 - **Resolvable DNS.** The CA resolves the hostname itself — public resolvers for a public CA, or whatever DNS an internal CA uses.
 - **No wildcards.** HTTP-01 cannot issue `*.example.com`. Use your own wildcard certificate for a wildcard vhost; a wildcard host with `tls.acme` is refused at load.
 
-DNS-01 (RFC 2136 + TSIG), which could issue wildcards, shipped in v0.10.0 and was withdrawn in v0.14.0. A leftover `challenge:` or `dns:` key on an issuer is ignored, and that issuer uses HTTP-01.
+DNS-01 (RFC 2136 + TSIG), which could issue wildcards, shipped in v0.10.0 and was withdrawn in v0.14.0.
 
 ---
 
 ## Certificates for TCP / TLS-passthrough backends
 
-Sometimes Keel is not the TLS terminator — a backend behind Keel terminates TLS itself (databases, TLS passthrough, plain TCP services). Those backends still need certificates, and Keel already owns port 80 for the domain. The top-level `certificates:` section covers this: Keel performs the HTTP-01 challenge and writes the certificate to disk without loading it into its own listeners.
+Sometimes Keel is not the TLS terminator — a backend behind Keel terminates TLS itself (databases, TLS passthrough, plain TCP services). Those backends still need certificates, and Keel already owns port 80 for the domain. A `certificate` block covers this: Keel performs the HTTP-01 challenge and writes the certificate to disk without loading it into its own listeners.
 
-```yaml
-certificates:
-  - host: db.example.com
-    issuer: default        # optional; "default" when omitted
+```hcl
+certificate "db.example.com" {
+  issuer = "default" # optional; "default" when omitted
+}
 ```
 
 Issued certificates live in `acme.storage` (default `/var/lib/keel/acme`), never in the config directory: a push replaces that directory, and the storage path must be absolute and outside it.
 
-Because `certificates:` is a top-level list, like `vhosts:`, any file of the config directory can declare its own entries alongside its pools:
+Any file of the config directory can declare `certificate` blocks alongside its pools:
 
-```yaml
-# /etc/keel/config/db-team.yaml
-pools:
-  db-frontend: { ... }
+```hcl
+# /etc/keel/config/db-team.hcl
+pool "db-frontend" {
+  backend "10.0.4.1:5432" {}
+}
 
-certificates:
-  - host: db.example.com
+certificate "db.example.com" {}
 ```
 
 Keel answers the challenge for `db.example.com` and writes:
@@ -130,16 +145,16 @@ Keel answers the challenge for `db.example.com` and writes:
 
 Point the backend at these files, or copy them out. Renewals rewrite the files atomically, so have the backend watch them or reload periodically.
 
-The same entries serve TCP listeners with `tls_mode: terminate` or `reencrypt` ([TCP proxying](tcp-proxying.md)): the listener's `tls_host` names the entry, and Keel serves the issued certificate itself, renewing it in place. An entry can also point at files Keel does not issue:
+The same blocks serve TCP listeners with `tls_mode = "terminate"` or `"reencrypt"` ([TCP proxying](tcp-proxying.md)): the listener's `tls_host` names the block, and Keel serves the issued certificate itself, renewing it in place. A block can also point at files Keel does not issue:
 
-```yaml
-certificates:
-  - host: ldap.example.com
-    cert: /etc/keel/certs/ldap.example.com.crt
-    key: /etc/keel/certs/ldap.example.com.key
+```hcl
+certificate "ldap.example.com" {
+  cert = "/etc/keel/certs/ldap.example.com.crt"
+  key  = "/etc/keel/certs/ldap.example.com.key"
+}
 ```
 
-Such an entry is not ACME-managed; `issuer` is ignored on it, and the files are re-read whenever a version is applied (a push, or `SIGHUP`).
+Such a block is not ACME-managed; `issuer` is ignored on it, and the files are re-read whenever a version is applied (a push, or `SIGHUP`).
 
 ---
 
@@ -162,7 +177,7 @@ Certificate files are flat (`{host}.crt` / `{host}.key`) regardless of issuer, b
 
 ## Reloads, restarts and persistence
 
-A reload or a pushed version applies ACME changes at once. A new `tls.acme` vhost or `certificates:` entry is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
+A reload or a pushed version applies ACME changes at once. A new `tls.acme` vhost or `certificate` block is issued right away. A vhost switched from its own certificate to `tls.acme` serves the old certificate until the issued one arrives; switching back stops renewal and leaves the issued files in `storage`.
 
 Certificates persist on disk and are not re-issued on restart, reload, or reboot. On startup Keel loads whatever is in `storage`; the CA is contacted only when a certificate is missing, expired, unparsable, or inside its renewal window. A node that restarts while the CA is unreachable keeps serving its existing certificates.
 
@@ -205,18 +220,23 @@ A request for `/.well-known/acme-challenge/<token>` where the token is unknown i
 
 For local testing, point an issuer at a self-hosted ACME test server such as Pebble and supply its trust root:
 
-```yaml
-acme:
-  storage: /tmp/keel-acme
-  issuers:
-    test:
-      directory: https://localhost:14000/dir
-      root_ca: /path/to/test-ca-root.pem
+```hcl
+acme {
+  storage = "/tmp/keel-acme"
 
-vhosts:
-  - host: test.example
-    pool: web
-    tls: { acme: test }
+  issuer "test" {
+    directory = "https://localhost:14000/dir"
+    root_ca   = "/path/to/test-ca-root.pem"
+  }
+}
+
+vhost "test.example" {
+  pool = "web"
+
+  tls {
+    acme = "test"
+  }
+}
 ```
 
 `root_ca` makes Keel trust the test server's self-signed API certificate. It is never needed for a public CA.

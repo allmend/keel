@@ -8,7 +8,7 @@ traffic, configuration, health, metrics and logs move between them.
 ## One node
 
 Every node runs the same tree of processes, standalone or in a cluster. A
-node without a `cluster:` section is a cluster of one.
+node without a `cluster` block is a cluster of one.
 
 ```
                          keel  (master)
@@ -38,7 +38,7 @@ node without a `cluster:` section is a cluster of one.
 
 | Process | Runs as | Accepts connections on | Can read |
 |---|---|---|---|
-| master | root (or the invoking user) | nothing | `node.yaml`, the config directory |
+| master | root (or the invoking user) | nothing | `node.hcl`, the config directory |
 | control worker | `keel.control_user` | control socket, `control.remote`, Raft peers, metrics | the state directory: node key, Raft store, CA keys, ACME |
 | worker | `keel.user` | proxy listeners | what the control worker hands it |
 
@@ -119,7 +119,7 @@ view.
 
 ## Configuration
 
-`node.yaml` describes the node and is read at start only. The config
+`node.hcl` describes the node and is read at start only. The config
 directory (`/etc/keel/config/`) describes the traffic and is replicated: it
 becomes a numbered version in the Raft log, and every node applies the same
 version.
@@ -136,7 +136,7 @@ version.
             |
             v
  every node's control worker:
-   build version V against this node's node.yaml
+   build version V against this node's node.hcl
             |
             v
    hand V to every worker over its socket ---> workers swap routing,
@@ -246,7 +246,7 @@ to Keel's own log. See [Access logging](access-logging.md).
 
 | What | Default | Set by |
 |---|---|---|
-| Node file | `/etc/keel/node.yaml` | `--config` |
+| Node file | `/etc/keel/node.hcl` | `--config` |
 | Config directory | `/etc/keel/config/` | `keel.config_dir` |
 | State directory (node key, Raft store, ACME) | `/var/lib/keel` | `keel.state_dir` |
 | Control socket | `/var/run/keel/keel.sock` | `keel.control_socket` |

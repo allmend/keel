@@ -4,19 +4,19 @@
 
 Set `algorithm` on a pool. Default is `round_robin`.
 
-```yaml
-pools:
-  web:
-    algorithm: round_robin
-    backends:
-      - address: 10.0.0.1:8080
-      - address: 10.0.0.2:8080
-      - address: 10.0.0.3:8080
+```hcl
+pool "web" {
+  algorithm = "round_robin"
+
+  backend "10.0.0.1:8080" {}
+  backend "10.0.0.2:8080" {}
+  backend "10.0.0.3:8080" {}
+}
 ```
 
 ### round_robin
 
-Distributes requests across all healthy backends in order. Respects weights: a backend with `weight: 2` receives twice as many requests as one with `weight: 1`.
+Distributes requests across all healthy backends in order. Respects weights: a backend with `weight = 2` receives twice as many requests as one with `weight = 1`.
 
 Use for stateless services where any backend can handle any request. This is the right default for most workloads.
 
@@ -34,7 +34,7 @@ Use for workloads where requests have variable processing time — long-lived co
 
 ### consistent_hash
 
-Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights: a backend with `weight: 2` gets about twice the share of keys.
+Hashes the client address to select a backend: the client IP for HTTP, the client `IP:port` for TCP and UDP listeners. The same key reaches the same backend as long as the pool composition doesn't change. Respects weights: a backend with `weight = 2` gets about twice the share of keys.
 
 At L4 every new TCP connection uses a new source port, so affinity holds per connection (TCP) or per flow (UDP), not per client.
 
@@ -44,19 +44,16 @@ Use when backend-side caching or session affinity matters and you cannot use coo
 
 ## Weighted backends
 
-Every algorithm honours per-backend weights. A backend with `weight: 2` receives twice as many requests as one with `weight: 1` (`round_robin` exactly, `random` and `consistent_hash` on average); `least_connections` balances connections per unit of weight.
+Every algorithm honours per-backend weights. A backend with `weight = 2` receives twice as many requests as one with `weight = 1` (`round_robin` exactly, `random` and `consistent_hash` on average); `least_connections` balances connections per unit of weight.
 
-```yaml
-pools:
-  web:
-    algorithm: round_robin
-    backends:
-      - address: 10.0.0.1:8080
-        weight: 1
-      - address: 10.0.0.2:8080
-        weight: 1
-      - address: 10.0.0.3:8080
-        weight: 2   # receives 50% of traffic
+```hcl
+pool "web" {
+  algorithm = "round_robin"
+
+  backend "10.0.0.1:8080" {}
+  backend "10.0.0.2:8080" {}
+  backend "10.0.0.3:8080" { weight = 2 } # receives 50% of traffic
+}
 ```
 
 Weight defaults to `1` if omitted and must be 1–1000. Up to v0.24.0 weights were ignored: every backend got an equal share.
@@ -71,18 +68,18 @@ backends are excluded from selection until they recover. Probe types are
 port override, and the status output are described in
 [Health checks](health-checks.md).
 
-```yaml
-pools:
-  web:
-    health_check:
-      type: http
-      path: /health
-      interval: 10s
-      timeout: 2s
-      healthy_threshold: 2
-      unhealthy_threshold: 3
-    backends:
-      - address: 10.0.0.1:8080
+```hcl
+pool "web" {
+  health_check "http" {
+    path                = "/health"
+    interval            = "10s"
+    timeout             = "2s"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  backend "10.0.0.1:8080" {}
+}
 ```
 
 Omit `health_check` to disable health checks for a pool. All backends in

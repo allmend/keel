@@ -23,33 +23,37 @@ services:
     image: {image}
     init: true
     environment: [NO_COLOR=1]
-    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config:ro"]
+    volumes: ["./node.hcl:/etc/keel/node.hcl:ro", "./config:/etc/keel/config:ro"]
     ports: ["80"]
     networks: { net: { ipv4_address: 172.29.83.10 } }
 "#;
 
 const NODE: &str = r#"
-keel:
-  workers: 2
-  user: nobody
-  group: nogroup
+keel {
+  workers = 2
+  user    = "nobody"
+  group   = "nogroup"
+}
 "#;
 
 const CONFIG: &str = r#"
-listeners:
-  - address: 0.0.0.0:80
-  - address: 0.0.0.0:53
-    udp_pool: dns
-pools:
-  web:
-    backends:
-      - address: 172.29.83.20:80
-  dns:
-    backends:
-      - address: 172.29.83.20:53
-vhosts:
-  - host: "*"
-    pool: web
+listener "http" "0.0.0.0:80" {}
+
+listener "udp" "0.0.0.0:53" {
+  pool = "dns"
+}
+
+pool "web" {
+  backend "172.29.83.20:80" {}
+}
+
+pool "dns" {
+  backend "172.29.83.20:53" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
 "#;
 
 /// uid of `nobody` in the debian image.
@@ -101,7 +105,7 @@ fn drained(stack: &Stack) -> Result<bool> {
 #[test]
 #[ignore = "needs Docker"]
 fn root_master_binds_privileged_ports_and_workers_drop_privileges() -> Result<()> {
-    let stack = Stack::up("privileges", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("privileges", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     serving(&stack)?;
 
     let logs = stack.logs("keel")?;
@@ -127,7 +131,7 @@ fn root_master_binds_privileged_ports_and_workers_drop_privileges() -> Result<()
 #[test]
 #[ignore = "needs Docker"]
 fn killed_worker_is_replaced_under_its_index() -> Result<()> {
-    let stack = Stack::up("respawn", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("respawn", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     serving(&stack)?;
 
     let logs = stack.logs("keel")?;
@@ -164,7 +168,7 @@ fn killed_worker_is_replaced_under_its_index() -> Result<()> {
 #[test]
 #[ignore = "needs Docker"]
 fn a_single_node_is_a_cluster_of_one_without_a_peer_port() -> Result<()> {
-    let stack = Stack::up("single", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("single", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     serving(&stack)?;
     let status = wait_until("the node leads its own cluster", Duration::from_secs(30), || {
         Ok(keel(&stack, &["cluster", "status"]).ok().filter(|s| s.contains("leader")))
@@ -179,7 +183,7 @@ fn a_single_node_is_a_cluster_of_one_without_a_peer_port() -> Result<()> {
 #[test]
 #[ignore = "needs Docker"]
 fn workers_cannot_read_the_state_directory() -> Result<()> {
-    let stack = Stack::up("state-private", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("state-private", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     serving(&stack)?;
     wait_until("node key written", Duration::from_secs(30), || {
         Ok(stack.exec("keel", &["test", "-f", "/var/lib/keel/node.key"])?.status.success().then_some(()))
@@ -197,7 +201,7 @@ fn workers_cannot_read_the_state_directory() -> Result<()> {
 #[test]
 #[ignore = "needs Docker"]
 fn a_drain_outlives_a_control_worker_and_a_worker_restart() -> Result<()> {
-    let stack = Stack::up("drain-restarts", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("drain-restarts", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     serving(&stack)?;
     wait_until("the node leads", Duration::from_secs(30), || {
         Ok(keel(&stack, &["cluster", "status"]).ok().filter(|s| s.contains("leader")))
@@ -255,30 +259,33 @@ services:
     init: true
     user: "65534:65534"
     environment: [NO_COLOR=1]
-    volumes: ["./node.yaml:/etc/keel/node.yaml:ro", "./config:/etc/keel/config:ro"]
+    volumes: ["./node.hcl:/etc/keel/node.hcl:ro", "./config:/etc/keel/config:ro"]
     ports: ["8080"]
     networks: { net: { ipv4_address: 172.29.85.10 } }
 "#;
     const NODE: &str = r#"
-keel:
-  workers: 2
-  state_dir: /tmp/keel/state
-  control_socket: /tmp/keel/keel.sock
+keel {
+  workers        = 2
+  state_dir      = "/tmp/keel/state"
+  control_socket = "/tmp/keel/keel.sock"
+}
 "#;
     const CONFIG: &str = r#"
-listeners:
-  - address: 0.0.0.0:8080
-access_log:
-  dir: /tmp/keel/log
-pools:
-  web:
-    backends:
-      - address: 172.29.85.20:80
-vhosts:
-  - host: "*"
-    pool: web
+listener "http" "0.0.0.0:8080" {}
+
+access_log {
+  dir = "/tmp/keel/log"
+}
+
+pool "web" {
+  backend "172.29.85.20:80" {}
+}
+
+vhost "*" {
+  pool = "web"
+}
 "#;
-    let stack = Stack::up("non-root", COMPOSE, &[("node.yaml", NODE.to_owned()), ("config/keel.yaml", CONFIG.to_owned())])?;
+    let stack = Stack::up("non-root", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", CONFIG.to_owned())])?;
     let addr = stack.addr("keel", 8080)?;
     wait_until("HTTP 200 through keel", Duration::from_secs(60), || {
         Ok(http_get(addr, "e2e.test", "/").ok().filter(|(status, _)| *status == 200))

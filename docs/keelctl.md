@@ -19,13 +19,14 @@ Kubernetes Service, so this narrows exposure but never replaces mTLS.
 
 ## Enabling the remote listener
 
-```yaml
-# /etc/keel/node.yaml
-control:
-  remote:
-    address: 0.0.0.0:10789
-    allow:                       # optional; empty = any source
-      - 10.1.2.0/24
+```hcl
+# /etc/keel/node.hcl
+control {
+  remote {
+    address = "0.0.0.0:10789"
+    allow   = ["10.1.2.0/24"] # optional; empty = any source
+  }
+}
 ```
 
 Remote control is off unless `control.remote` is configured. The local Unix

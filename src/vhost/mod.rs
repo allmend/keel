@@ -210,7 +210,7 @@ mod tests {
     fn make_config(vhosts: Vec<Vhost>, pools: HashMap<String, Pool>) -> Config {
         Config {
             path: String::new(),
-            node_yaml: String::new(),
+            node_file: String::new(),
             files: Default::default(),
             keel: KeelConfig::default(),
             listeners: vec![],
@@ -328,7 +328,7 @@ mod tests {
                         pool: "assets".into(),
                         cache: Some(VhostCacheConfig {
                             enabled: true,
-                            ttl: Some(3600),
+                            ttl: Some(std::time::Duration::from_secs(3600)),
                             statuses: vec![200],
                             content_types: vec!["image/*".into()],
                         }),
@@ -339,7 +339,7 @@ mod tests {
                 forwarded_headers: None,
                 cache: Some(VhostCacheConfig {
                     enabled: true,
-                    ttl: Some(60),
+                    ttl: Some(std::time::Duration::from_secs(60)),
                     statuses: vec![],
                     content_types: vec![],
                 }),
@@ -352,12 +352,12 @@ mod tests {
 
         // /static/ uses route-level config (ttl 3600, image/*)
         let cc = t.cache_config("example.com", "/static/logo.png").unwrap();
-        assert_eq!(cc.ttl, Some(3600));
+        assert_eq!(cc.ttl, Some(std::time::Duration::from_secs(3600)));
         assert_eq!(cc.content_types, vec!["image/*"]);
 
         // / falls back to vhost-level config (ttl 60, no content_types filter)
         let cc = t.cache_config("example.com", "/").unwrap();
-        assert_eq!(cc.ttl, Some(60));
+        assert_eq!(cc.ttl, Some(std::time::Duration::from_secs(60)));
         assert!(cc.content_types.is_empty());
     }
 
@@ -377,7 +377,7 @@ mod tests {
                 ],
                 tls: None,
                 forwarded_headers: None,
-                cache: Some(VhostCacheConfig { enabled: true, ttl: Some(60), ..Default::default() }),
+                cache: Some(VhostCacheConfig { enabled: true, ttl: Some(std::time::Duration::from_secs(60)), ..Default::default() }),
                 redirect_http: None,
                 default_action: None,
             }],

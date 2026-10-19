@@ -10,27 +10,26 @@ The binary is at `target/release/keel`.
 
 ## Minimal configuration
 
-Keel reads a node file and the config directory it names. For a local test, create both in the current directory — `node.yaml`:
+Keel reads a node file and the config directory it names. For a local test, create both in the current directory — `node.hcl`:
 
-```yaml
-keel:
-  config_dir: config
+```hcl
+keel {
+  config_dir = "config"
+}
 ```
 
-and `config/keel.yaml`:
+and `config/keel.hcl`:
 
-```yaml
-listeners:
-  - address: 0.0.0.0:8080
+```hcl
+listener "http" "0.0.0.0:8080" {}
 
-pools:
-  web:
-    backends:
-      - address: 127.0.0.1:3000
+pool "web" {
+  backend "127.0.0.1:3000" {}
+}
 
-vhosts:
-  - host: "*"
-    pool: web
+vhost "*" {
+  pool = "web"
+}
 ```
 
 This listens on port 8080 and proxies all traffic to a single backend at `127.0.0.1:3000`.
@@ -38,7 +37,7 @@ This listens on port 8080 and proxies all traffic to a single backend at `127.0.
 ## Run
 
 ```bash
-./keel --config node.yaml
+./keel --config node.hcl
 ```
 
 Started as root, Keel binds the listening ports and the control socket, then forks a control worker running as `keel-control` and worker processes running as `keel`; create both users first. Started as another user, every process runs as that user. The node is a cluster of one: see [Cluster](cluster.md) to add nodes, and [Architecture](architecture.md) for how the processes fit together.

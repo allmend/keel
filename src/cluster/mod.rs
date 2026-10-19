@@ -125,7 +125,7 @@ fn join_open(key: &ring::aead::LessSafeKey, framed: &[u8]) -> Option<Vec<u8>> {
 
 pub struct ClusterOpts {
     pub node_id: NodeId,
-    /// Peer listener bind address; `None` when `node.yaml` has no `cluster:`
+    /// Peer listener bind address; `None` when `node.hcl` has no `cluster`
     /// section, and nothing listens.
     pub cluster_addr: Option<String>,
     /// Address announced to the other nodes (`cluster.advertise`, or the bind address).
@@ -134,8 +134,8 @@ pub struct ClusterOpts {
     pub state_dir: std::path::PathBuf,
     /// Forced recovery: keep the stored state, make this node the only member.
     pub force_new_cluster: bool,
-    /// This node's `node.yaml`, which every config version is built against.
-    pub node_yaml: String,
+    /// This node's `node.hcl`, which every config version is built against.
+    pub node_file: String,
     /// The replicated config directory (`keel.config_dir`).
     pub config_dir: std::path::PathBuf,
     /// The config directory as it was when the process started, before any
@@ -156,8 +156,8 @@ pub struct ClusterHandle {
     pub acme_accounts_rx: watch::Receiver<crate::cluster::types::AcmeAccountMap>,
     /// The committed config version; fires on every new one.
     pub config_rx: watch::Receiver<Option<ConfigVersion>>,
-    /// This node's `node.yaml`, which every config version is built against.
-    pub node_yaml: Arc<String>,
+    /// This node's `node.hcl`, which every config version is built against.
+    pub node_file: Arc<String>,
     /// The replicated config directory (`keel.config_dir`).
     pub config_dir: std::path::PathBuf,
     /// Current replicated ACME certificate map; updated on commit and snapshot.
@@ -222,7 +222,7 @@ impl ClusterHandle {
         let (Some(raft), Some(tls)) = (self.raft().await, self.client_tls().await) else {
             anyhow::bail!("cluster not yet initialized");
         };
-        push_config(&raft, tls, &self.node_yaml, files).await
+        push_config(&raft, tls, &self.node_file, files).await
     }
 }
 
@@ -490,11 +490,11 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
 }
 
 /// What a peer request needs besides the Raft node: this node's client TLS
-/// (to forward) and its `node.yaml` (to check a pushed config).
+/// (to forward) and its `node.hcl` (to check a pushed config).
 #[derive(Clone)]
 struct PeerCtx {
     tls: Arc<rustls::ClientConfig>,
-    node_yaml: Arc<String>,
+    node_file: Arc<String>,
     /// Removed members, whose certificates are refused.
     retired: watch::Receiver<crate::cluster::types::RetiredSet>,
 }
@@ -586,7 +586,7 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             .unwrap(),
             Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
         },
-        Ok(RpcRequest::PushConfig { files }) => match push_config(&raft, ctx.tls, &ctx.node_yaml, files).await {
+        Ok(RpcRequest::PushConfig { files }) => match push_config(&raft, ctx.tls, &ctx.node_file, files).await {
             Ok(version) => serde_json::to_vec(&RpcResponse::<_> {
                 ok: Some(crate::cluster::network::PushReply { version }),
                 err: None,
@@ -898,7 +898,7 @@ fn open_store(opts: &ClusterOpts) -> Result<(Arc<persist::Disk>, persist::Loaded
 
 /// Stored state wins: a node with a store restarts from it and never
 /// bootstraps again. One exception is refused rather than ignored: a node
-/// alone in its stored cluster whose `node.yaml` says to join others started
+/// alone in its stored cluster whose `node.hcl` says to join others started
 /// a cluster of its own by mistake. Without a store, `cluster.join` and the
 /// members it remembers are where it joins; with neither it starts a cluster
 /// of one.
@@ -908,7 +908,7 @@ fn decide_start(opts: &ClusterOpts, loaded: &persist::Loaded) -> Result<Start> {
         let alone = loaded.membership().is_some_and(|m| m.nodes().all(|(id, _)| *id == opts.node_id));
         if alone && !join.is_empty() {
             anyhow::bail!(
-                "this node is the only member of the cluster stored in {}, but node.yaml lists cluster.join: \
+                "this node is the only member of the cluster stored in {}, but node.hcl lists cluster.join: \
                  it started a cluster of its own earlier. To join, stop keel, remove {} and start it again",
                 opts.state_dir.join("raft").display(),
                 opts.state_dir.join("raft").display()
@@ -1025,7 +1025,7 @@ impl ClusterService {
         // A non-empty shared secret is mandatory wherever peers can connect.
         // Without it the join listener would hand a CA-signed mTLS identity to
         // any peer that can reach the cluster port: a full cluster takeover.
-        // Config validation refuses a `cluster:` section without one.
+        // Config validation refuses a `cluster` block without one.
         let secret = opts.secret.as_deref().unwrap_or("").to_owned();
         if opts.cluster_addr.is_some() && secret.is_empty() {
             anyhow::bail!("cluster.secret is required; refusing to start with an open join listener");
@@ -1111,11 +1111,11 @@ impl ClusterService {
         }
         tokio::spawn(keep_members_file(Arc::clone(&raft), opts.state_dir.clone()));
         tokio::spawn(exit_when_raft_stops(Arc::clone(&raft), shutdown.clone()));
-        let node_yaml = Arc::new(opts.node_yaml.clone());
+        let node_file = Arc::new(opts.node_file.clone());
         tokio::spawn(reconcile_config(
             Arc::clone(&raft),
             Arc::clone(&client_tls),
-            Arc::clone(&node_yaml),
+            Arc::clone(&node_file),
             opts.state_dir.clone(),
             opts.startup_files.clone(),
             self.config_tx.subscribe(),
@@ -1125,7 +1125,7 @@ impl ClusterService {
         *self.raft_slot.lock().await = Some(Arc::clone(&raft));
 
         let Some(cluster_addr) = &opts.cluster_addr else {
-            // A node without a `cluster:` section has no peers to talk to.
+            // A node without a `cluster` block has no peers to talk to.
             while !*shutdown.borrow() {
                 if shutdown.changed().await.is_err() {
                     break;
@@ -1160,7 +1160,7 @@ impl ClusterService {
                             let peer_tls = Arc::clone(&client_tls);
                             let peer_ctx = PeerCtx {
                                 tls: Arc::clone(&client_tls),
-                                node_yaml: Arc::clone(&node_yaml),
+                                node_file: Arc::clone(&node_file),
                                 retired: self.retired_tx.subscribe(),
                             };
                             let retired = self.retired_tx.subscribe();
@@ -1237,7 +1237,7 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
         raft: Arc::clone(&raft_slot),
         acme_accounts_rx,
         config_rx,
-        node_yaml: Arc::new(opts.node_yaml.clone()),
+        node_file: Arc::new(opts.node_file.clone()),
         config_dir: opts.config_dir.clone(),
         certs_rx,
         challenges_rx,
@@ -1268,18 +1268,18 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
 const PUSH_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Commit `files` as the cluster's next config version and return it. The set
-/// is first built against this node's `node.yaml`, so a version that does not
+/// is first built against this node's `node.hcl`, so a version that does not
 /// load is never committed. Without a reachable majority the push fails at
 /// once instead of waiting for a commit that cannot happen; traffic is not
 /// affected either way. A follower forwards the push to the leader, which
-/// checks it again against its own `node.yaml`.
+/// checks it again against its own `node.hcl`.
 pub async fn push_config(
     raft: &ClusterRaft,
     tls: Arc<rustls::ClientConfig>,
-    node_yaml: &str,
+    node_file: &str,
     files: FileSet,
 ) -> Result<u64> {
-    crate::config::assemble(node_yaml, &files).context("config not pushed")?;
+    crate::config::assemble(node_file, &files).context("config not pushed")?;
 
     let m = raft.metrics().borrow().clone();
     let membership = m.membership_config.membership();
@@ -1317,7 +1317,7 @@ pub async fn push_config(
 async fn reconcile_config(
     raft: Arc<ClusterRaft>,
     tls: Arc<rustls::ClientConfig>,
-    node_yaml: Arc<String>,
+    node_file: Arc<String>,
     state_dir: std::path::PathBuf,
     files: FileSet,
     config: watch::Receiver<Option<ConfigVersion>>,
@@ -1352,7 +1352,7 @@ async fn reconcile_config(
         return;
     }
     loop {
-        match push_config(&raft, Arc::clone(&tls), &node_yaml, files.clone()).await {
+        match push_config(&raft, Arc::clone(&tls), &node_file, files.clone()).await {
             Ok(version) => {
                 info!(version, "cluster: config files committed as a new version");
                 return;
@@ -1698,7 +1698,7 @@ mod tests {
             advertise: "10.0.0.1:7654".into(),
             state_dir,
             force_new_cluster: false,
-            node_yaml: String::new(),
+            node_file: String::new(),
             config_dir: std::path::PathBuf::new(),
             startup_files: Default::default(),
             secret: Some("s".into()),

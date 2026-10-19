@@ -50,13 +50,13 @@ pub fn read_file_set(dir: &Path) -> anyhow::Result<FileSet> {
 }
 
 /// The file set `config push <path>` sends: a directory as it is, or a single
-/// file as the root `keel.yaml` of a set that holds nothing else.
+/// file as the root `keel.hcl` of a set that holds nothing else.
 pub fn push_file_set(path: &Path) -> anyhow::Result<FileSet> {
     if path.is_dir() {
         return read_file_set(path);
     }
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    Ok(FileSet::from([("keel.yaml".to_owned(), text)]))
+    Ok(FileSet::from([("keel.hcl".to_owned(), text)]))
 }
 
 #[derive(Deserialize, Serialize, Debug)]

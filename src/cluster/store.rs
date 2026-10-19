@@ -345,11 +345,6 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 }
                 openraft::EntryPayload::Normal(req) => {
                     let resp = match req {
-                        ClientRequest::SetConfig { yaml } => {
-                            let files = crate::config::FileSet::from([(crate::config::ROOT_FILE.to_owned(), yaml)]);
-                            d.set_config(entry.log_id.index, files);
-                            ClientResponse::ok()
-                        }
                         ClientRequest::SetConfigFiles { files } => {
                             d.set_config(entry.log_id.index, files);
                             ClientResponse::ok()

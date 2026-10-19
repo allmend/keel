@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::control::fanout::{Applied, WorkerFanout};
 use crate::control::{ControlServer, Dispatch};
 
-/// Announced by a node without a `cluster:` section. It has no peers, so
+/// Announced by a node without a `cluster` block. It has no peers, so
 /// nothing connects to it; adding the section later moves the node to its
 /// real address.
 const NO_PEERS_ADDR: &str = "127.0.0.1:7654";
@@ -115,7 +115,7 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
         advertise,
         state_dir: state_dir.clone(),
         force_new_cluster,
-        node_yaml: cfg.node_yaml.clone(),
+        node_file: cfg.node_file.clone(),
         config_dir: config_dir.clone(),
         startup_files: cfg.files.clone(),
         secret: cfg.cluster.as_ref().and_then(|c| c.secret.clone()),
@@ -139,7 +139,7 @@ async fn serve(inherited_cfg: Config, inherited: Inherited, force_new_cluster: b
     let driver = ApplyDriver {
         cluster: cluster.clone(),
         fanout: WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers),
-        node_yaml: cfg.node_yaml.clone(),
+        node_file: cfg.node_file.clone(),
         config_dir,
         state_dir,
         applied: applied_tx,
@@ -279,13 +279,13 @@ async fn master_link(
 
 /// Applies every committed config version on this node and keeps the workers
 /// serving it: the version itself, the drains and the ACME certificates.
-/// A version is built against this node's `node.yaml` first; only once it
+/// A version is built against this node's `node.hcl` first; only once it
 /// is applied are the config directory and the "last applied" record
 /// written, so the files are always the last version that worked here.
 struct ApplyDriver {
     cluster: crate::cluster::ClusterHandle,
     fanout: WorkerFanout,
-    node_yaml: String,
+    node_file: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
     /// The applied config, for the ACME service.
@@ -340,7 +340,7 @@ impl ApplyDriver {
 
     /// Apply a committed version; false when it cannot be applied here.
     async fn apply(&mut self, next: &ConfigVersion) -> bool {
-        let cfg = match crate::config::assemble(&self.node_yaml, &next.files) {
+        let cfg = match crate::config::assemble(&self.node_file, &next.files) {
             Ok(cfg) => cfg,
             Err(e) => {
                 error!(
@@ -352,7 +352,7 @@ impl ApplyDriver {
             }
         };
         let mut cfg = cfg;
-        cfg.node_yaml = self.node_yaml.clone();
+        cfg.node_file = self.node_file.clone();
         cfg.path = self.applied.borrow().path.clone();
         self.applied.send_replace(Arc::new(cfg));
         let acked = self.send_all(next.version).await;
@@ -376,7 +376,7 @@ impl ApplyDriver {
         let cfg = self.applied.borrow().clone();
         Applied {
             version,
-            node_yaml: crate::config::without_cluster_section(&self.node_yaml),
+            node_file: crate::config::without_cluster_section(&self.node_file),
             files: cfg.files.clone(),
             certs: issued_certificates(&cfg),
             drained: self.cluster.drained_rx.borrow().clone(),

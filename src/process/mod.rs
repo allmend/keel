@@ -247,7 +247,7 @@ fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<Bound
         info!(sockets = icmp4.len(), "master: opened ICMP sockets for health checks");
     }
     for l in &cfg.listeners {
-        if l.udp_pool.is_some() {
+        if l.protocol == crate::config::Protocol::Udp {
             let socks = (0..per_listener)
                 .map(|_| crate::udp::bind_reuseport(&l.address))
                 .collect::<std::io::Result<Vec<_>>>()

@@ -7,28 +7,30 @@ again. The check applies to every algorithm, including `least_connections`,
 and to HTTP, TCP, and UDP listeners alike. A pool without `health_check`
 treats every backend as healthy.
 
-`type` selects the probe. Each type accepts only its own fields on top of the
-common ones; an unknown field, or a field that belongs to a different type,
-is a validation error at startup.
+The block's label selects the probe. Each type accepts only its own
+attributes on top of the common ones; an unknown attribute, or one that
+belongs to a different type, is a load error.
 
-## Common fields
+## Common attributes
 
-```yaml
-pools:
-  web:
-    health_check:
-      type: http
-      interval: 10s            # time between rounds
-      timeout: 2s              # per-probe limit
-      healthy_threshold: 2     # consecutive successes to mark healthy
-      unhealthy_threshold: 3   # consecutive failures to mark unhealthy
-      port: 9000               # optional: probe this port instead of the traffic port
+```hcl
+pool "web" {
+  health_check "http" {
+    interval            = "10s" # time between rounds
+    timeout             = "2s"  # per-probe limit
+    healthy_threshold   = 2     # consecutive successes to mark healthy
+    unhealthy_threshold = 3     # consecutive failures to mark unhealthy
+    port                = 9000  # optional: probe this port instead of the traffic port
+  }
+
+  backend "10.0.0.1:8080" {}
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
-| `type` | required | `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, `tls` |
-| `interval` | `10s` | Time between rounds. `500ms`, `10s`, `2m`, `1h` |
+| label | required | `tcp`, `udp`, `http`, `dns`, `ntp`, `icmp`, `tls` |
+| `interval` | `10s` | Time between rounds, a [duration](configuration.md#durations): `1s` at least |
 | `timeout` | `2s` | A probe that has not finished by then fails with `timeout` |
 | `healthy_threshold` | `2` | Consecutive successes before an unhealthy backend returns to service |
 | `unhealthy_threshold` | `3` | Consecutive failures before a healthy backend is removed |
@@ -46,9 +48,8 @@ receives one probe per worker per interval.
 A TCP connection to the backend succeeds. Proves that something accepts
 connections on the port, nothing about the service behind it.
 
-```yaml
-health_check:
-  type: tcp
+```hcl
+health_check "tcp" {}
 ```
 
 ### udp
@@ -62,10 +63,10 @@ by default) makes a dead port look alive to this probe. Prefer a protocol
 probe such as `dns` where the service offers one; use `udp` for services
 without a request/response exchange.
 
-```yaml
-health_check:
-  type: udp
-  timeout: 1s
+```hcl
+health_check "udp" {
+  timeout = "1s"
+}
 ```
 
 ### http
@@ -74,20 +75,20 @@ A `GET` to `path`. Healthy when the status is 2xx, or one of `expect_status`
 when set, and when `expect_body` (if set) appears in the first 64 KiB of the
 body.
 
-```yaml
-health_check:
-  type: http
-  path: /health
-  host: app.internal        # Host header and TLS SNI; default: backend address
-  tls: false                # HTTPS to the backend
-  expect_status: [200, 204] # default: any 2xx
-  expect_body: '"ok"'       # substring match
+```hcl
+health_check "http" {
+  path          = "/health"
+  host          = "app.internal" # Host header and TLS SNI; default: backend address
+  tls           = false          # HTTPS to the backend
+  expect_status = [200, 204]     # default: any 2xx
+  expect_body   = "\"ok\""       # substring match
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
 | `path` | `/health` | Must start with `/` |
-| `host` | backend `ip:port` | Sent as the Host header and, with `tls: true`, as SNI |
+| `host` | backend `ip:port` | Sent as the Host header and, with `tls = true`, as SNI |
 | `tls` | `false` | Connect with TLS. The backend certificate is not verified: the probe tests liveness, not identity |
 | `expect_status` | any 2xx | Exact list of acceptable codes |
 | `expect_body` | none | Substring the body must contain |
@@ -101,18 +102,18 @@ reply, or no reply within `timeout` fails the probe. Choose a name the
 resolver is expected to resolve; for an authoritative server, a name in one
 of its zones.
 
-```yaml
-health_check:
-  type: dns
-  query: example.com
-  record: A              # A or AAAA; default A
-  transport: udp         # udp or tcp; default udp
-  expect: 93.184.216.34  # optional; must match the record family
-  interval: 5s
-  timeout: 1s
+```hcl
+health_check "dns" {
+  query     = "example.com"
+  record    = "A"             # A or AAAA; default A
+  transport = "udp"           # udp or tcp; default udp
+  expect    = "93.184.216.34" # optional; must match the record family
+  interval  = "5s"
+  timeout   = "1s"
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
 | `query` | required | Name to resolve. Validated as a DNS name |
 | `record` | `A` | `A` or `AAAA` |
@@ -129,11 +130,11 @@ originate timestamp matches the request and whose stratum is not zero.
 Stratum zero is a kiss-o'-death packet: the server answered but refuses to
 serve time, and the reason shows its code, for example `kiss-of-death RATE`.
 
-```yaml
-health_check:
-  type: ntp
-  interval: 30s
-  timeout: 2s
+```hcl
+health_check "ntp" {
+  interval = "30s"
+  timeout  = "2s"
+}
 ```
 
 Probing at short intervals from many workers can itself trigger `RATE`
@@ -148,11 +149,11 @@ daemon has died still answers ping. Use it for pools where nothing else is
 possible, such as one-way UDP services (syslog collectors), or as a coarse
 check alongside passive detection.
 
-```yaml
-health_check:
-  type: icmp
-  interval: 5s
-  timeout: 1s
+```hcl
+health_check "icmp" {
+  interval = "5s"
+  timeout  = "1s"
+}
 ```
 
 Keel uses ICMP datagram sockets, not raw sockets. On Linux the master opens
@@ -167,32 +168,32 @@ service. Reasons: `no echo reply within 1000ms`, `unreachable`.
 
 ### tls
 
-Completes a TLS handshake with the backend. With `min_days_valid`, the
+Completes a TLS handshake with the backend. With `min_valid`, the
 certificate the backend presented must also stay valid for at least that
-many days. The chain is not verified: the probe answers "does this backend
+long. The chain is not verified: the probe answers "does this backend
 speak TLS, and is its certificate about to expire", not whether the
 certificate is trusted — in passthrough mode that is the client's decision.
 Meant for TLS-on-connect services behind `tcp_pool` listeners (Redis
 `tls-port`, LDAPS, MQTT over TLS) and for HTTPS backends where `http` is
 not wanted.
 
-```yaml
-health_check:
-  type: tls
-  sni: cache.example.com   # optional; without it no SNI is sent
-  min_days_valid: 14       # optional
+```hcl
+health_check "tls" {
+  sni       = "cache.example.com" # optional; without it no SNI is sent
+  min_valid = "14d"               # optional
+}
 ```
 
-| Field | Default | Notes |
+| Attribute | Default | Notes |
 |---|---|---|
 | `sni` | none | Server name for the handshake, needed by backends that pick their certificate by SNI |
-| `min_days_valid` | none | Fail when the presented certificate expires sooner. Also fails on an already expired certificate |
+| `min_valid` | none | A duration. Fail when the presented certificate expires sooner. Also fails on an already expired certificate |
 
 Reasons: `handshake: …` (with rustls's description), `certificate expires
 in 3 days`, `certificate expired 2 days ago`, `no certificate presented`.
 
 A certificate about to expire makes the backend unhealthy, which removes
-it from rotation. Set `min_days_valid` below the renewal lead time of the
+it from rotation. Set `min_valid` below the renewal lead time of the
 backend's certificates so a healthy renewal cycle never trips it, and read
 `keel status` for the countdown in the reason.
 
@@ -206,13 +207,16 @@ several workers a backend can be ejected in some workers and not others.
 This catches a backend that dies between probe rounds, and it works for
 pools without a `health_check` block at all. On by default.
 
-```yaml
-pools:
-  web:
-    passive:
-      enabled: true    # default
-      failures: 5      # consecutive failures that eject; default 5
-      eject_for: 30s   # default
+```hcl
+pool "web" {
+  passive {
+    enabled   = true  # default
+    failures  = 5     # consecutive failures that eject; default 5
+    eject_for = "30s" # default
+  }
+
+  backend "10.0.0.1:8080" {}
+}
 ```
 
 What counts as a failure is deliberately narrow: an upstream connection

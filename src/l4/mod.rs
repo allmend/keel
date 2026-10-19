@@ -1,6 +1,6 @@
 //! L4 TCP proxying.
 //!
-//! A listener with `tcp_pool` proxies a TCP connection to a backend selected
+//! A `tcp` listener proxies a TCP connection to a backend selected
 //! from the named pool. `tls_mode` decides what Keel does with TLS:
 //!
 //! - **passthrough** (default): bytes are spliced untouched. If the client

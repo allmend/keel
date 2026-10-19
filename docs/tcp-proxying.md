@@ -1,6 +1,6 @@
 # TCP Proxying (L4)
 
-A listener with `tcp_pool` proxies raw TCP to a backend pool. Routing is
+A `tcp` listener proxies raw TCP to a backend pool. Routing is
 listener → pool: L4 has no Host header, so vhosts and routes do not apply.
 The pool is an ordinary pool — algorithms, weights, health checks, drain, and
 connection counting behave the same as for HTTP.
@@ -19,10 +19,10 @@ In passthrough Keel splices bytes without inspecting the stream: if the
 client and backend speak TLS, the handshake, certificate, and verification
 are between them, and Keel holds no key. In the other two modes Keel serves
 a certificate from its store, selected by the client's SNI and falling back
-to the listener's `tls_host`; the certificate comes from a `certificates:`
-entry (ACME-issued or bring-your-own files) or from a vhost with `tls`.
+to the listener's `tls_host`; the certificate comes from a `certificate`
+block (ACME-issued or bring-your-own files) or from a vhost with `tls`.
 Re-encryption does not verify the backend certificate unless
-`tls_verify: true`; by default it provides wire encryption, not backend
+`tls_verify = true`; by default it provides wire encryption, not backend
 authentication, the same trade-off a cloud NLB makes.
 
 Which mode a protocol can use depends on where its TLS handshake starts:
@@ -35,41 +35,40 @@ Which mode a protocol can use depends on where its TLS handshake starts:
 
 ## Configuration
 
-```yaml
-listeners:
-  - address: 0.0.0.0:5432
-    tcp_pool: postgres      # this listener is L4; splice to this pool
+```hcl
+listener "tcp" "0.0.0.0:5432" {
+  pool = "postgres" # splice to this pool
+}
 
-pools:
-  postgres:
-    algorithm: round_robin
-    health_check:
-      type: tcp             # TCP connect probe — the natural fit at L4
-      interval: 10s
-      timeout: 2s
-    backends:
-      - address: 10.0.0.11:5432
-      - address: 10.0.0.12:5432
-      - address: 10.0.0.13:5432
+pool "postgres" {
+  algorithm = "round_robin"
+
+  health_check "tcp" { # TCP connect probe: the natural fit at L4
+    interval = "10s"
+    timeout  = "2s"
+  }
+
+  backend "10.0.0.11:5432" {}
+  backend "10.0.0.12:5432" {}
+  backend "10.0.0.13:5432" {}
+}
 ```
 
-| Listener field | Notes |
+| Listener attribute | Notes |
 |---|---|
-| `tcp_pool` | Pool to proxy to. Must exist in `pools`. Makes the listener L4-only: vhosts and routes are ignored |
+| `pool` | Pool to proxy to; required, and must be defined |
 | `tls_mode` | `passthrough` (default), `terminate`, or `reencrypt` |
-| `tls_host` | Required with `terminate` and `reencrypt`: host of a `certificates:` entry or of a vhost with `tls`. Served when the client sends no SNI or an SNI without a certificate of its own |
+| `tls_host` | Required with `terminate` and `reencrypt`: host of a `certificate` block or of a vhost with `tls`. Served when the client sends no SNI or an SNI without a certificate of its own |
 | `tls_verify` | `reencrypt` only, default `false`: verify the backend certificate against the system trust store (plus `tls_ca`) and the backend's configured hostname |
 | `tls_ca` | `reencrypt` with `tls_verify`: PEM bundle of additional trusted CAs, for backends with an internal CA |
-| `tls` | Rejected together with `tcp_pool` — that field is HTTP termination; use `tls_mode` |
 | `proxy_protocol` | Expect a PROXY Protocol header (v1 or v2) before the stream, in any `tls_mode`; the client address comes from it. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 
-Config validation fails at startup for an unknown `tcp_pool`, a
-`tcp_pool` + `tls: true` combination, `terminate`/`reencrypt` without a
-`tls_host` that names a known certificate, or `tls_verify`/`tls_ca` outside
-`reencrypt`.
+Config validation fails at startup for an unknown pool,
+`terminate`/`reencrypt` without a `tls_host` that names a known certificate,
+or `tls_verify`/`tls_ca` outside `reencrypt`.
 
 When re-encrypting, Keel sends the backend's configured hostname as SNI
-(`address: cache1.internal:6379` sends `cache1.internal`); a backend given
+(`backend "cache1.internal:6379"` sends `cache1.internal`); a backend given
 by IP receives no SNI. With `tls_verify`, that hostname is also what the
 backend certificate must match.
 
@@ -80,10 +79,10 @@ plaintext, sends an `SSLRequest` message, and only then does the TLS
 handshake start. Keel forwards all of it as opaque bytes. Each database
 server presents its own certificate and clients verify it end-to-end:
 
-```yaml
-listeners:
-  - address: 0.0.0.0:5432
-    tcp_pool: postgres
+```hcl
+listener "tcp" "0.0.0.0:5432" {
+  pool = "postgres"
+}
 ```
 
 ```bash
@@ -93,8 +92,8 @@ psql "host=db.example.com port=5432 sslmode=verify-full"
 `sslmode=verify-full` works the same as it would against the database
 directly — the client sees the backend's certificate, not Keel's.
 
-The backend certificates can be provisioned by Keel itself: the
-[`certificates:` section](acme.md#certificates-for-tcp--tls-passthrough-backends)
+The backend certificates can be provisioned by Keel itself: a
+[`certificate` block](acme.md#certificates-for-tcp--tls-passthrough-backends)
 makes Keel answer the ACME HTTP-01 challenge for `db.example.com` on port 80
 and write `db.example.com.crt`/`.key` to disk for the database servers to
 load. This produces publicly valid backend certificates that renew
@@ -104,29 +103,29 @@ automatically, while the proxy itself never terminates their TLS.
 
 Redis clients speak TLS from byte zero, so Keel can hold the certificate
 and talk plaintext to Redis on an internal network. The certificate is an
-ACME entry; Keel answers the HTTP-01 challenge on port 80 and serves the
+ACME `certificate` block; Keel answers the HTTP-01 challenge on port 80 and serves the
 issued certificate on the TCP listener:
 
-```yaml
-listeners:
-  - address: 0.0.0.0:6379
-    tcp_pool: redis
-    tls_mode: terminate
-    tls_host: cache.example.com
+```hcl
+listener "tcp" "0.0.0.0:6379" {
+  pool     = "redis"
+  tls_mode = "terminate"
+  tls_host = "cache.example.com"
+}
 
-certificates:
-  - host: cache.example.com
+certificate "cache.example.com" {}
 
-pools:
-  redis:
-    algorithm: least_connections
-    health_check:
-      type: tcp
-      interval: 5s
-      timeout: 1s
-    backends:
-      - address: 10.0.0.21:6379
-      - address: 10.0.0.22:6379
+pool "redis" {
+  algorithm = "least_connections"
+
+  health_check "tcp" {
+    interval = "5s"
+    timeout  = "1s"
+  }
+
+  backend "10.0.0.21:6379" {}
+  backend "10.0.0.22:6379" {}
+}
 ```
 
 ```bash
@@ -143,29 +142,29 @@ An OpenLDAP server with an internal CA keeps its own certificate, and Keel
 presents a public one to clients. `tls_verify` with the internal CA makes
 Keel check the backend certificate against the backend's configured name:
 
-```yaml
-listeners:
-  - address: 0.0.0.0:636
-    tcp_pool: ldap
-    tls_mode: reencrypt
-    tls_host: ldap.example.com
-    tls_verify: true
-    tls_ca: /etc/keel/internal-ca.pem
+```hcl
+listener "tcp" "0.0.0.0:636" {
+  pool       = "ldap"
+  tls_mode   = "reencrypt"
+  tls_host   = "ldap.example.com"
+  tls_verify = true
+  tls_ca     = "/etc/keel/internal-ca.pem"
+}
 
-certificates:
-  - host: ldap.example.com
-    cert: /etc/keel/certs/ldap.example.com.crt   # bring-your-own
-    key: /etc/keel/certs/ldap.example.com.key
+certificate "ldap.example.com" { # bring-your-own
+  cert = "/etc/keel/certs/ldap.example.com.crt"
+  key  = "/etc/keel/certs/ldap.example.com.key"
+}
 
-pools:
-  ldap:
-    health_check:
-      type: tls
-      sni: ldap1.internal
-      min_days_valid: 14
-    backends:
-      - address: ldap1.internal:636
-      - address: ldap2.internal:636
+pool "ldap" {
+  health_check "tls" {
+    sni       = "ldap1.internal"
+    min_valid = "14d"
+  }
+
+  backend "ldap1.internal:636" {}
+  backend "ldap2.internal:636" {}
+}
 ```
 
 ```bash
@@ -183,12 +182,12 @@ backend certificate can be listed directly only if it is not marked as a CA
 it appears as the end entity, with `upstream_tls` and the reason
 `CaUsedAsEndEntity` in the log.
 
-Plain TCP without any TLS proxies the same way in passthrough — `tcp_pool`
-makes no assumption that the stream contains TLS.
+Plain TCP without any TLS proxies the same way in passthrough — a `tcp`
+listener makes no assumption that the stream contains TLS.
 
 ## Session affinity
 
-With `algorithm: consistent_hash`, the hash key is the client `IP:port`.
+With `algorithm = "consistent_hash"`, the hash key is the client `IP:port`.
 Every new TCP connection uses a new source port, so affinity holds for the
 life of one connection; a client's next connection can reach a different
 backend. Round robin, random, and least-connections apply per connection.

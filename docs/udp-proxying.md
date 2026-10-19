@@ -1,6 +1,6 @@
 # UDP Proxying (L4)
 
-A listener with `udp_pool` forwards datagrams to a backend pool. Routing is
+A `udp` listener forwards datagrams to a backend pool. Routing is
 listener → pool: there is no Host header or path at L4, so vhosts and routes
 do not apply. The pool is an ordinary pool — algorithms, weights, health
 checks, drain, and connection counting behave the same as for HTTP and TCP.
@@ -8,52 +8,51 @@ checks, drain, and connection counting behave the same as for HTTP and TCP.
 UDP has no connection. Keel tracks a **flow** per client `ip:port`: the first
 datagram from a new client selects a backend, and every following datagram
 from that client goes to the same backend until the flow has been idle for
-`keel.udp_flow_timeout_seconds` (default 30). Replies from the backend are
+`keel.udp_flow_timeout` (default `30s`). Replies from the backend are
 sent back to the client for as long as the flow exists. A flow's end is the
 only point at which its backend is released and its log entry written.
 
 UDP is forwarded as-is. Keel does not terminate DTLS or QUIC and does not
-inspect payloads; the listener rejects `tls: true`.
+inspect payloads.
 
 ## Configuration
 
-```yaml
-keel:
-  udp_flow_timeout_seconds: 30   # idle time after which a flow expires
+```hcl
+# keel.hcl
+keel {
+  udp_flow_timeout = "30s" # idle time after which a flow expires
+}
 
-listeners:
-  - address: 0.0.0.0:53
-    udp_pool: resolvers         # name of a pool below; any UDP protocol is forwarded as-is
+listener "udp" "0.0.0.0:53" {
+  pool = "resolvers" # datagrams of any UDP protocol are forwarded as-is
+}
 
-pools:
-  resolvers:
-    algorithm: round_robin
-    health_check:
-      type: dns                 # a real query; see health-checks.md
-      query: example.com
-      interval: 10s
-      timeout: 2s
-    backends:
-      - address: 10.0.0.11:53
-      - address: 10.0.0.12:53
-      - address: 10.0.0.13:53
+pool "resolvers" {
+  algorithm = "round_robin"
+
+  health_check "dns" { # a real query; see health-checks.md
+    query    = "example.com"
+    interval = "10s"
+    timeout  = "2s"
+  }
+
+  backend "10.0.0.11:53" {}
+  backend "10.0.0.12:53" {}
+  backend "10.0.0.13:53" {}
+}
 ```
 
-| Listener field | Notes |
+| Listener attribute | Notes |
 |---|---|
-| `udp_pool` | Name of the pool to forward to; must exist in `pools`. The value is a pool name, not a protocol: datagrams of any UDP protocol are forwarded unchanged. Makes the listener UDP-only: vhosts and routes are ignored |
-| `tls` | Rejected together with `udp_pool` — datagrams are never terminated |
-| `tcp_pool` | Rejected on the same listener entry. To serve both protocols on one port, add two listener entries with the same `address` (see the DNS example) |
+| `pool` | The pool to forward to; required, and must be defined. To serve UDP and TCP on one port, add a `tcp` listener on the same address (see the DNS example) |
 | `proxy_protocol` | Every datagram starts with a PROXY Protocol v2 header (as an NLB sends for UDP); the flow's client is the address it names. Datagrams without one are dropped |
 
-| `keel` field | Default | Notes |
+| `keel` attribute | Default | Notes |
 |---|---|---|
-| `udp_flow_timeout_seconds` | `30` | Idle time before a flow expires. Applies to every UDP listener. Must be at least 1 |
-| `udp_max_flows` | `8192` | Most flows each UDP listener holds at once — a worker's ceiling is this times the number of `udp_pool` listeners. Datagrams from further clients are dropped and counted in `keel_udp_errors_total{reason="flow_limit"}` until a flow expires; existing flows are unaffected. A flow costs an upstream socket and a task, so this bounds what a flood from spoofed source addresses can consume |
+| `udp_flow_timeout` | `30s` | Idle time before a flow expires. Applies to every UDP listener |
+| `udp_max_flows` | `8192` | Most flows each UDP listener holds at once — a worker's ceiling is this times the number of `udp` listeners. Datagrams from further clients are dropped and counted in `keel_udp_errors_total{reason="flow_limit"}` until a flow expires; existing flows are unaffected. A flow costs an upstream socket and a task, so this bounds what a flood from spoofed source addresses can consume |
 
-Config validation fails at startup for an unknown `udp_pool`, a
-`udp_pool` + `tls: true` combination, `udp_pool` and `tcp_pool` on the same
-listener, or a zero timeout.
+Config validation fails at startup for an unknown pool or a missing one.
 
 Health checks for UDP pools: `dns` and `ntp` ask the service itself; `udp`
 sends an empty datagram and marks a backend down only on ICMP
@@ -67,30 +66,34 @@ same one.
 ## Example: DNS
 
 Resolvers answer on 53/udp and 53/tcp (the latter for truncated responses
-and zone transfers). One listener entry per protocol, both referencing the
-same pool:
+and zone transfers). One listener per protocol, both referencing the same
+pool:
 
-```yaml
-keel:
-  udp_flow_timeout_seconds: 10   # DNS exchanges are short; expire flows early
+```hcl
+keel {
+  udp_flow_timeout = "10s" # DNS exchanges are short; expire flows early
+}
 
-listeners:
-  - address: 0.0.0.0:53
-    udp_pool: resolvers
-  - address: 0.0.0.0:53
-    tcp_pool: resolvers
+listener "udp" "0.0.0.0:53" {
+  pool = "resolvers"
+}
 
-pools:
-  resolvers:
-    algorithm: round_robin
-    health_check:
-      type: dns
-      query: example.org
-      interval: 5s
-      timeout: 1s
-    backends:
-      - address: 10.0.0.11:53
-      - address: 10.0.0.12:53
+listener "tcp" "0.0.0.0:53" {
+  pool = "resolvers"
+}
+
+pool "resolvers" {
+  algorithm = "round_robin"
+
+  health_check "dns" {
+    query    = "example.org"
+    interval = "5s"
+    timeout  = "1s"
+  }
+
+  backend "10.0.0.11:53" {}
+  backend "10.0.0.12:53" {}
+}
 ```
 
 ```bash
@@ -112,19 +115,19 @@ Syslog over UDP (RFC 5426) is one datagram per message with no reply.
 Flows carry traffic in one direction only; `bytes_out` and `packets_out`
 stay zero in the log entry:
 
-```yaml
-listeners:
-  - address: 0.0.0.0:514
-    udp_pool: syslog
+```hcl
+listener "udp" "0.0.0.0:514" {
+  pool = "syslog"
+}
 
-pools:
-  syslog:
-    algorithm: consistent_hash   # one sender keeps reaching the same collector
-    health_check:
-      type: udp                  # syslog has no reply to check; detect closed ports only
-    backends:
-      - address: 10.0.0.21:514
-      - address: 10.0.0.22:514
+pool "syslog" {
+  algorithm = "consistent_hash" # one sender keeps reaching the same collector
+
+  health_check "udp" {} # syslog has no reply to check; detect closed ports only
+
+  backend "10.0.0.21:514" {}
+  backend "10.0.0.22:514" {}
+}
 ```
 
 With consistent hashing, messages from one host stay in order on one
@@ -158,7 +161,7 @@ keel backend drain 10.0.0.11:53 --wait       # works remotely via keelctl too
 
 Draining stops new flows to the backend immediately; existing flows run
 until they expire, and the backend moves to `removed` when the last one
-does. A drain therefore completes at most `udp_flow_timeout_seconds` after
+does. A drain therefore completes at most `udp_flow_timeout` after
 the last datagram on the backend's last flow — a client that keeps sending
 holds its flow, and the drain, open. `--wait` shows the live count.
 
@@ -218,4 +221,4 @@ throughput is visible while a long flow is open.
   fragmentation and reassembly happen in the kernel on either side.
 - **Hot reload** applies to UDP pools the same way as to TCP: a backend
   removed from config drains, a new backend needs a restart. Changing
-  `udp_flow_timeout_seconds` or adding a UDP listener requires a restart.
+  `udp_flow_timeout` or adding a UDP listener requires a restart.

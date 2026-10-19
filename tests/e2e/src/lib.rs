@@ -105,12 +105,14 @@ pub fn pebble_root() -> Result<String> {
 /// years; a renew_before larger than that renews on every check, so a test
 /// sees a renewal within a minute.
 pub const PEBBLE_ACME: &str = r#"
-acme:
-  renew_before: 99999d
-  issuers:
-    test:
-      directory: https://pebble:14000/dir
-      root_ca: certs/pebble.minica.pem
+acme {
+  renew_before = "99999d"
+
+  issuer "test" {
+    directory = "https://pebble:14000/dir"
+    root_ca   = "certs/pebble.minica.pem"
+  }
+}
 "#;
 
 fn repo_root() -> PathBuf {

@@ -1,6 +1,6 @@
 //! TLS handshake health probe.
 //!
-//! Completes a TLS handshake with the backend and, with `min_days_valid`,
+//! Completes a TLS handshake with the backend and, with `min_valid`,
 //! checks how long the presented certificate stays valid. The chain is not
 //! verified: the probe asks "does this backend speak TLS and is its
 //! certificate about to expire", not "do I trust it" — that is the client's
@@ -10,6 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rustls::pki_types::ServerName;
@@ -20,12 +21,12 @@ use super::{io_reason, Probe, ProbeResult};
 pub struct TlsProbe {
     config: Arc<rustls::ClientConfig>,
     sni: Option<String>,
-    min_days_valid: Option<u32>,
+    min_valid: Option<Duration>,
 }
 
 impl TlsProbe {
-    pub fn new(sni: Option<String>, min_days_valid: Option<u32>) -> Self {
-        TlsProbe { config: crate::tls::insecure_client_config(), sni, min_days_valid }
+    pub fn new(sni: Option<String>, min_valid: Option<Duration>) -> Self {
+        TlsProbe { config: crate::tls::insecure_client_config(), sni, min_valid }
     }
 }
 
@@ -39,18 +40,18 @@ impl Probe for TlsProbe {
         };
         let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.config));
         let stream = connector.connect(name, tcp).await.map_err(|e| format!("handshake: {e}"))?;
-        let Some(min_days) = self.min_days_valid else { return Ok(()) };
+        let Some(min_valid) = self.min_valid else { return Ok(()) };
         let (_, conn) = stream.get_ref();
         let leaf = conn
             .peer_certificates()
             .and_then(|chain| chain.first())
             .ok_or_else(|| "no certificate presented".to_owned())?;
-        check_expiry(leaf.as_ref(), min_days)
+        check_expiry(leaf.as_ref(), min_valid)
     }
 }
 
-/// `Err` when the DER certificate is expired or expires within `min_days`.
-pub fn check_expiry(der: &[u8], min_days: u32) -> ProbeResult {
+/// `Err` when the DER certificate is expired or expires within `min_valid`.
+pub fn check_expiry(der: &[u8], min_valid: Duration) -> ProbeResult {
     let cert = openssl::x509::X509::from_der(der).map_err(|e| format!("certificate: {e}"))?;
     let now = openssl::asn1::Asn1Time::days_from_now(0).map_err(|e| e.to_string())?;
     let diff = now.diff(cert.not_after()).map_err(|e| e.to_string())?;
@@ -58,9 +59,8 @@ pub fn check_expiry(der: &[u8], min_days: u32) -> ProbeResult {
     if secs < 0 {
         return Err(format!("certificate expired {} days ago", -secs / 86_400));
     }
-    let days = secs / 86_400;
-    if days < i64::from(min_days) {
-        return Err(format!("certificate expires in {days} days"));
+    if secs < min_valid.as_secs() as i64 {
+        return Err(format!("certificate expires in {} days", secs / 86_400));
     }
     Ok(())
 }
@@ -70,6 +70,8 @@ mod tests {
     use super::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::net::TcpListener;
+
+    const DAY: Duration = Duration::from_secs(86_400);
 
     /// Self-signed cert for localhost; `expired` dates it in the past.
     fn self_signed(expired: bool) -> (Vec<u8>, Vec<u8>) {
@@ -111,22 +113,22 @@ mod tests {
     #[test]
     fn expiry_arithmetic() {
         let (fresh, _) = self_signed(false);
-        assert_eq!(check_expiry(&fresh, 30), Ok(()));
-        assert!(check_expiry(&fresh, u32::MAX).unwrap_err().starts_with("certificate expires in "));
+        assert_eq!(check_expiry(&fresh, DAY * 30), Ok(()));
+        assert!(check_expiry(&fresh, DAY * 1_000_000).unwrap_err().starts_with("certificate expires in "));
         let (old, _) = self_signed(true);
-        assert!(check_expiry(&old, 1).unwrap_err().starts_with("certificate expired "));
-        assert!(check_expiry(b"junk", 1).unwrap_err().starts_with("certificate: "));
+        assert!(check_expiry(&old, DAY).unwrap_err().starts_with("certificate expired "));
+        assert!(check_expiry(b"junk", DAY).unwrap_err().starts_with("certificate: "));
     }
 
     #[tokio::test]
     async fn handshake_and_expiry_against_a_local_server() {
         let fresh = tls_server(false).await;
         assert_eq!(TlsProbe::new(None, None).probe(fresh).await, Ok(()));
-        assert_eq!(TlsProbe::new(Some("localhost".into()), Some(30)).probe(fresh).await, Ok(()));
+        assert_eq!(TlsProbe::new(Some("localhost".into()), Some(DAY * 30)).probe(fresh).await, Ok(()));
 
         let expired = tls_server(true).await;
         assert_eq!(TlsProbe::new(None, None).probe(expired).await, Ok(()), "handshake alone passes");
-        let reason = TlsProbe::new(None, Some(1)).probe(expired).await.unwrap_err();
+        let reason = TlsProbe::new(None, Some(DAY)).probe(expired).await.unwrap_err();
         assert!(reason.starts_with("certificate expired "), "{reason}");
 
         // A plain TCP listener is not a TLS server.

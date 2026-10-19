@@ -28,4 +28,4 @@ COPY --from=builder /build/target/release/keel /usr/local/bin/keel
 EXPOSE 80 443 10790
 
 ENTRYPOINT ["/usr/local/bin/keel"]
-CMD ["--config", "/etc/keel/node.yaml"]
+CMD ["--config", "/etc/keel/node.hcl"]

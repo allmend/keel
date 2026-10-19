@@ -2,7 +2,7 @@ use crate::{
     access_log::{AccessLogEntry, AccessLogger},
     backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
     cache::CacheHandle,
-    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, VhostCacheConfig},
+    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, Protocol, VhostCacheConfig},
     health,
     tls::CertStore,
     vhost::RoutingTable,
@@ -125,7 +125,6 @@ fn response_cacheability(
     now: std::time::SystemTime,
 ) -> RespCacheable {
     use pingora::cache::{NoCacheReason, RespCacheable::{Cacheable, Uncacheable}};
-    use std::time::Duration;
 
     // Status filter (default: 200 only)
     let status = resp.status.as_u16();
@@ -181,7 +180,7 @@ fn response_cacheability(
     if forbidden || personal || resp.headers.contains_key("expires") {
         return verdict;
     }
-    Cacheable(CacheMeta::new(now + Duration::from_secs(ttl as u64), now, 0, 0, resp.clone()))
+    Cacheable(CacheMeta::new(now + ttl, now, 0, 0, resp.clone()))
 }
 
 /// Lowercased header names listed in a response's `Vary` headers.
@@ -769,7 +768,7 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
                 name.clone(),
                 crate::backend::PassiveRule {
                     failures: pool_cfg.passive.failures,
-                    eject_for: health::parse_duration(&pool_cfg.passive.eject_for),
+                    eject_for: pool_cfg.passive.eject_for,
                 },
             );
         }
@@ -934,7 +933,7 @@ fn new_server(cfg: &Config, inherited: Option<&WorkerSockets>) -> Server {
     use pingora::server::configuration::Opt;
 
     let mut conf = pingora::server::configuration::ServerConf {
-        grace_period_seconds: Some(cfg.keel.grace_period_seconds),
+        grace_period_seconds: Some(cfg.keel.grace_period.as_secs()),
         graceful_shutdown_timeout_seconds: Some(5),
         // One proxy thread per worker: a work-stealing runtime only adds
         // cross-thread bookkeeping to every task wake (≈15 % CPU per request).
@@ -991,11 +990,11 @@ struct WorkerApplier {
 
 impl crate::control::worker_socket::Apply for WorkerApplier {
     fn apply(&self, next: &crate::control::fanout::Applied) -> Result<(), String> {
-        let cfg = crate::config::assemble(&next.node_yaml, &next.files).map_err(|e| format!("{e:#}"))?;
+        let cfg = crate::config::assemble(&next.node_file, &next.files).map_err(|e| format!("{e:#}"))?;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let config_changed = last
             .as_ref()
-            .is_none_or(|l| l.version != next.version || l.files != next.files || l.node_yaml != next.node_yaml);
+            .is_none_or(|l| l.version != next.version || l.files != next.files || l.node_file != next.node_file);
         if config_changed {
             self.routing.store(Arc::new(RoutingTable::build(&cfg)));
             self.pools.sync_from_config(&cfg);
@@ -1078,9 +1077,9 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     let plain: Vec<_> = cfg
         .listeners
         .iter()
-        .filter(|l| !l.tls && !l.proxy_protocol && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .filter(|l| l.protocol == Protocol::Http && !l.proxy_protocol)
         .collect();
-    let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls && !l.proxy_protocol).collect();
+    let tls: Vec<_> = cfg.listeners.iter().filter(|l| l.tls() && !l.proxy_protocol).collect();
 
     if cfg.listeners.is_empty() {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
@@ -1185,7 +1184,7 @@ fn add_proxy_protocol_tls_services(
     proxy: KProxy,
     cert_store: &Arc<CertStore>,
 ) {
-    for l in cfg.listeners.iter().filter(|l| l.tls && l.proxy_protocol) {
+    for l in cfg.listeners.iter().filter(|l| l.tls() && l.proxy_protocol) {
         info!(address = l.address, "adding TLS listener (PROXY protocol)");
         let mut svc = http_proxy_service(&server.configuration, proxy.clone());
         svc.endpoints()
@@ -1221,7 +1220,7 @@ fn add_proxy_protocol_services(server: &mut Server, cfg: &Config, proxy: KProxy)
     for l in cfg
         .listeners
         .iter()
-        .filter(|l| l.proxy_protocol && !l.tls && l.tcp_pool.is_none() && l.udp_pool.is_none())
+        .filter(|l| l.proxy_protocol && l.protocol == Protocol::Http)
     {
         info!(address = l.address, "adding listener (PROXY protocol)");
         let app = ProxyProtocolApp {
@@ -1234,7 +1233,7 @@ fn add_proxy_protocol_services(server: &mut Server, cfg: &Config, proxy: KProxy)
     }
 }
 
-/// Register one L4 service per `tcp_pool` listener, with the TLS material its
+/// Register one L4 service per `tcp` listener, with the TLS material its
 /// `tls_mode` needs.
 fn add_l4_services(
     server: &mut Server,
@@ -1245,8 +1244,8 @@ fn add_l4_services(
 ) {
     use crate::config::TlsMode;
 
-    for l in cfg.listeners.iter().filter(|l| l.tcp_pool.is_some()) {
-        let pool = l.tcp_pool.clone().unwrap();
+    for l in cfg.listeners.iter() {
+        let Some(pool) = l.tcp_pool().map(str::to_owned) else { continue };
         let built = (|| -> anyhow::Result<_> {
             let server_tls = match l.tls_mode {
                 TlsMode::Passthrough => None,
@@ -1305,7 +1304,7 @@ fn add_l4_services(
     }
 }
 
-/// Register one UDP forwarding service per `udp_pool` listener. These run as
+/// Register one UDP forwarding service per `udp` listener. These run as
 /// background services on raw Tokio sockets — Pingora's data plane is TCP only.
 /// `inherited` holds sockets the master bound as root; without it (dev, no
 /// privilege drop) each service binds its own.
@@ -1316,8 +1315,8 @@ fn add_udp_services(
     access_logger: &Arc<AccessLogger>,
     mut inherited: Option<&mut HashMap<String, std::net::UdpSocket>>,
 ) {
-    for l in cfg.listeners.iter().filter(|l| l.udp_pool.is_some()) {
-        let pool = l.udp_pool.clone().unwrap();
+    for l in cfg.listeners.iter() {
+        let Some(pool) = l.udp_pool().map(str::to_owned) else { continue };
         let socket = inherited.as_mut().and_then(|m| m.remove(&l.address));
         info!(address = l.address, pool, inherited = socket.is_some(), "adding UDP listener");
         let svc = crate::udp::UdpProxyService {
@@ -1325,7 +1324,7 @@ fn add_udp_services(
             pool,
             pools: Arc::clone(pools),
             access_logger: Arc::clone(access_logger),
-            flow_timeout: std::time::Duration::from_secs(cfg.keel.udp_flow_timeout_seconds),
+            flow_timeout: cfg.keel.udp_flow_timeout,
             max_flows: cfg.keel.udp_max_flows,
             socket,
             proxy_protocol: l.proxy_protocol,

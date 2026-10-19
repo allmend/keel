@@ -13,7 +13,7 @@ Both directions of the join exchange are AEAD-encrypted with ChaCha20-Poly1305. 
 A captured exchange can still be brute-forced offline against a low-entropy secret, so use a high-entropy token:
 
 ```bash
-openssl rand -hex 32    # for cluster.secret in node.yaml
+openssl rand -hex 32    # for cluster.secret in node.hcl
 ```
 
 See [Cluster](cluster.md) for the full join flow.
@@ -30,7 +30,7 @@ Every member holds the cluster CA key, in memory and in its Raft store, so any m
 
 ## Peers require a shared secret
 
-A `node.yaml` with a `cluster:` section and no non-empty `cluster.secret` is a load error. A node without the section opens no peer port.
+A `node.hcl` with a `cluster` block and no non-empty `cluster.secret` is a load error. A node without the block opens no peer port.
 
 Without it, the join listener would issue a CA-signed mTLS identity to any peer that can reach the cluster port, granting that peer full cluster membership.
 
@@ -96,11 +96,11 @@ No code in the root master accepts a connection or reads from one. It binds the 
 
 | Process | User | Parses network input | Reads |
 |---|---|---|---|
-| master | root | no | `node.yaml`, the config directory |
+| master | root | no | `node.hcl`, the config directory |
 | control worker | `keel.control_user` (default `keel-control`) | control socket, `control.remote`, Raft peers | the state directory: node key, Raft store with the cluster and control CA keys, ACME account and certificates |
 | workers | `keel.user` | proxy listeners | nothing under the state directory |
 
-Workers get what they serve from the control worker over their sockets: the applied config version (with `node.yaml`'s `cluster:` section, and its secret, removed) and the ACME certificates. A worker compromised through traffic therefore holds site TLS keys, never a CA key: it cannot mint node certificates or operator credentials. `keel.control_user` and `keel.user` must differ; the same name is a load error.
+Workers get what they serve from the control worker over their sockets: the applied config version (with `node.hcl`'s `cluster` block, and its secret, removed) and the ACME certificates. A worker compromised through traffic therefore holds site TLS keys, never a CA key: it cannot mint node certificates or operator credentials. `keel.control_user` and `keel.user` must differ; the same name is a load error.
 
 | Path | Owner | Mode |
 |---|---|---|
@@ -139,7 +139,7 @@ Files that can hold a private key are `0600` in a `0700` directory:
 | `acme.storage` (`/var/lib/keel/acme`) | issued certificate keys, ACME account keys |
 | the config directory | keys the config names by relative path |
 
-Exclude these from backups, or back them up as secrets. `/etc/keel/node.yaml` can hold the cluster secret; Keel never writes it.
+Exclude these from backups, or back them up as secrets. `/etc/keel/node.hcl` can hold the cluster secret; Keel never writes it.
 
 Ownership of these directories: [Processes and what each can read](#processes-and-what-each-can-read).
 
@@ -149,7 +149,7 @@ Ownership of these directories: [Processes and what each can read](#processes-an
 
 | Requirement | Action |
 |---|---|
-| Peers need a secret | Set `cluster.secret` in `node.yaml`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
+| Peers need a secret | Set `cluster.secret` in `node.hcl`. Use a high-entropy token, e.g. `openssl rand -hex 32`. |
 | Metrics bind to loopback by default | To scrape from another host, set `metrics.address: 0.0.0.0:10790` explicitly and firewall the port. |
 | Two users | Startup fails if `keel.user`, `keel.group` or `keel.control_user` (default `keel-control`) cannot be resolved. Create them, e.g. `useradd --system keel-control`. |
 | All cluster nodes must speak the same join protocol | Run the same Keel build across the cluster when joining nodes. |

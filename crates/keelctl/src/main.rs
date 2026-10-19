@@ -81,7 +81,7 @@ enum BackendCommand {
 enum ConfigCommand {
     /// Push the node's config directory as the next version (same as SIGHUP)
     Reload,
-    /// Push a config directory (or a single file, as its keel.yaml) as the next version
+    /// Push a config directory (or a single file, as its keel.hcl) as the next version
     Push { file: String },
 }
 

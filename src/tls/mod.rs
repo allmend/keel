@@ -381,21 +381,23 @@ mod tests {
         (CertStore::from_map(map), leaves)
     }
 
-    fn config(keel_yaml: &str, extra: &[(&str, &[u8])]) -> crate::config::Config {
+    fn config(keel_hcl: &str, extra: &[(&str, &[u8])]) -> crate::config::Config {
         let mut set: keel_control::FileSet = extra
             .iter()
             .map(|(p, b)| (p.to_string(), String::from_utf8(b.to_vec()).unwrap()))
             .collect();
-        set.insert("keel.yaml".into(), keel_yaml.into());
+        set.insert("keel.hcl".into(), keel_hcl.into());
         crate::config::assemble("", &set).unwrap()
     }
 
     #[test]
     fn a_vhost_switched_to_acme_keeps_its_certificate_until_one_is_issued() {
         let (c, k) = pem_pair("a.test");
-        let head = "pools:\n  web:\n    backends:\n      - address: 10.0.0.1:80\nvhosts:\n  - host: a.test\n    pool: web\n";
-        let byo = format!("{head}    tls:\n      cert: a.crt\n      key: a.key\n");
-        let acme = format!("{head}    tls:\n      acme: true\n");
+        let pool = "pool \"web\" {\n  backend \"10.0.0.1:80\" {}\n}\n";
+        let vhost = |tls: &str| format!("{pool}vhost \"a.test\" {{\n  pool = \"web\"\n{tls}}}\n");
+        let head = vhost("");
+        let byo = vhost("  tls {\n    cert = \"a.crt\"\n    key  = \"a.key\"\n  }\n");
+        let acme = vhost("  tls {\n    acme = true\n  }\n");
         let none = Issued::new();
 
         let store = CertStore::build(&config(&byo, &[("a.crt", &c), ("a.key", &k)]), &none).unwrap();
@@ -411,7 +413,7 @@ mod tests {
         let from_pem = rustls_pemfile::certs(&mut &c2[..]).next().unwrap().unwrap();
         assert_eq!(leaf(), Some(from_pem.to_vec()), "the issued certificate replaces it");
 
-        store.reload(&config(head, &[]), &issued).unwrap();
+        store.reload(&config(&head, &[]), &issued).unwrap();
         assert_eq!(leaf(), None, "a vhost without TLS has no certificate");
     }
 
