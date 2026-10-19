@@ -8,110 +8,91 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-10-19
+
 ### Changed
 
-- **Breaking: the configuration is HCL.** The node file is
-  `/etc/keel/node.hcl`, the config directory holds `keel.hcl` and other
-  `*.hcl` files, and a `*.yaml` file there is a load error. Named things are
-  labeled blocks: `listener "<protocol>" "<address>"`, `pool "<name>"` with
-  `backend "<address>"` blocks, `vhost "<host>"` with `route "<path>"`
-  blocks, `health_check "<type>"`, `certificate "<host>"`, ACME
-  `issuer "<name>"`. Values are literals, `local.<name>` references from
-  `locals` blocks and string templates; functions, operators, conditionals
-  and `for` expressions are refused. See
-  [Configuration](docs/configuration.md#the-language). There is no
-  conversion tool and no upgrade path for stored state.
-- Listeners name their protocol: `http`, `https` (was `tls: true`), `tcp`
-  and `udp` with `pool` (were `tcp_pool` and `udp_pool`).
-- Every time setting is a duration string from `1s` up (`s`, `m`, `h`, `d`,
-  `w`, `y`): `keel.grace_period` and `keel.udp_flow_timeout` (were
-  `*_seconds` numbers), vhost and route `cache.ttl` (was seconds), the `tls`
-  health check's `min_valid` (was `min_days_valid`). `ms` is gone: health
-  checks run at most once a second.
-- Unknown attributes are refused everywhere, as are a vhost with both
-  `pool` and `route` blocks, a path routed twice in one vhost, two
-  listeners on one address, and an HTTP listener with a pool. Load errors
-  name the file, line and column.
-
-- Health checks run once per node, in the control worker: a backend gets
-  one probe per interval, not one per worker. The verdict goes to the
-  workers through shared memory; all of them act on it at once, a worker
-  started later reads the current verdict instead of starting with every
-  backend healthy, and the verdicts stay while the control worker is down.
-  `icmp` checks use one socket pair, held by the control worker.
-
-- **Breaking:** the keelconfig credentials file is HCL, as is
-  `members.hcl` in the state directory (`member "<node_id>"` blocks; was
-  `members.yaml`). Keelconfigs issued before are not read: issue new ones
-  with `keel credentials create`. Keel reads and writes no YAML.
-
-- An `http` health check counts any status from 200 to 399 as healthy, so
-  a redirecting `path` passes; `expect_status = ["200-299"]` keeps the
-  old rule. `expect_status` takes ranges: `[200, "204", "300-308"]`.
+- **Breaking: configuration is HCL.** Node file `/etc/keel/node.hcl`;
+  the config directory holds `keel.hcl` and other `*.hcl` files, a
+  `*.yaml` file there is a load error. Named things are labeled blocks:
+  `listener "<protocol>" "<address>"`, `pool "<name>"` with
+  `backend "<address>"`, `vhost "<host>"` with `route "<path>"`,
+  `health_check "<type>"`, `certificate "<host>"`, ACME
+  `issuer "<name>"`. Values: literals, `local.<name>` from `locals`
+  blocks, string templates; functions, operators, conditionals and `for`
+  are refused. No conversion tool, no upgrade path for stored state. See
+  [Configuration](docs/configuration.md#the-language).
+- **Breaking:** keelconfig files and `members.hcl` (was `members.yaml`)
+  are HCL. Earlier keelconfigs are not read; issue new ones with
+  `keel credentials create`.
+- Listeners name their protocol: `http`, `https` (was `tls: true`),
+  `tcp` and `udp` with `pool` (were `tcp_pool`, `udp_pool`).
+- Time settings are durations from `1s` (`s m h d w y`):
+  `keel.grace_period`, `keel.udp_flow_timeout` (were `*_seconds`),
+  `cache.ttl` (was seconds), `tls` check `min_valid` (was
+  `min_days_valid`). No `ms`: health checks run at most once a second.
+- Refused at load: unknown attributes, a vhost with both `pool` and
+  `route`, a path routed twice in a vhost, two listeners on one address,
+  an HTTP listener with a pool. Errors give file, line and column.
+- Health checks run once per node, in the control worker, not once per
+  worker. Workers read the verdict from shared memory: all act at once, a
+  new worker starts with the current verdict, verdicts hold while the
+  control worker is down. `icmp` uses one socket pair, in the control worker.
+- `http` health checks pass on 200–399 by default, so a redirecting
+  `path` is healthy; `expect_status = ["200-299"]` restores the old rule.
+  `expect_status` takes ranges: `[200, "204", "300-308"]`.
 - UDP datagrams dropped without a flow (`no_backend`, `flow_limit`) are
-  logged once a second per listener and reason, with the dropped
-  datagrams and bytes in `packets_in` and `bytes_in`: a flood against a
-  dead pool wrote one line per datagram.
+  logged once a second per listener and reason, counts in `packets_in`
+  and `bytes_in`. Was one line per datagram.
 
 ### Added
 
-- `keel backend activate <address>` returns a drained backend to service,
-  on every node through Raft. `drain` and `activate` take `ip:port` or a
-  bare IP, which names every backend on that IP.
-- `keel config validate [node.hcl]`: load a node file and its config
-  directory as a start or reload would, without a running node. Silent: exit
-  0 when the files can go live, 1 with the error on stderr. `--full` prints
-  every file loaded, `--diff` what changed since the running node's version
-  with each change marked reload or restart, `--list` files not in canonical
-  HCL format (the output of `terraform fmt`), `--write` fixes them, `--check`
-  exits 3 for them. See
+- `keel backend activate <address>`: return a drained backend to
+  service, on every node. `drain` and `activate` take `ip:port`, or an IP
+  for every backend on it.
+- `keel config validate [node.hcl]`: load as a start or reload would,
+  without a running node. Exit 0 valid, 1 not (error on stderr).
+  `--full` prints every file, `--diff` changes since the applied version
+  marked reload or restart, `--list` files not in canonical format,
+  `--write` fixes them, `--check` exits 3 for them. See
   [Checking a configuration](docs/configuration.md#checking-a-configuration).
-- `--no-color` (or `NO_COLOR`) for every command.
+- `--no-color` (or `NO_COLOR`) on every command.
 - `keel_pool_backends{pool, state}`: backends per pool that are available,
-  unhealthy, ejected or draining, counted at each scrape from the node's
-  view; the `KeelPoolNoAvailableBackend` alert rule in `contrib/` uses it.
-- Minimum Rust version 1.90, declared as `rust-version` and built in CI.
-- CI runs `cargo deny`: advisories, licenses, duplicate versions.
-  Dependabot proposes cargo and GitHub Actions updates weekly.
-- HTTP access entries carry `"type": "http"`, as TCP and UDP entries
-  carry theirs. [Access logging](docs/access-logging.md#containers)
-  describes stdout and stderr in a container.
-- Cache metrics: `keel_cache_requests_total{pool, vhost, result}` (hit,
-  miss) and `keel_cache_hits_total{tier}` (memory, disk).
+  unhealthy, ejected or draining. Alert rule `KeelPoolNoAvailableBackend`
+  in `contrib/`.
+- `keel_cache_requests_total{pool, vhost, result}` and
+  `keel_cache_hits_total{tier}`.
+- HTTP access entries carry `"type": "http"`.
+  [Access logging](docs/access-logging.md#containers) covers containers.
+- MSRV 1.90 (`rust-version`, checked in CI). CI runs `cargo deny`;
+  Dependabot updates cargo and Actions weekly.
 
 ### Fixed
 
-- A cache hit is counted in `keel_requests_total` and logged under its
-  vhost and pool; hits were missing from the metrics and logged to
+- Cache hits are counted in `keel_requests_total` and logged under their
+  vhost and pool; they were missing from metrics and logged to
   `access_unknown.log`.
-- A drained backend no worker holds a connection to is removed at once.
-  A worker without connections to it never marked it removed, so
-  `keel status` and `keel_backend_drain_state` showed a finished drain as
-  draining.
-- A worker that dies within 10s of starting is restarted after a delay, 1s
-  doubling up to 30s, per worker index; one that ran longer is restarted at
-  once. Workers that kept dying at start (a backend name that stopped
-  resolving) were restarted in a tight loop. The control worker restarts
-  the same way. The log line gives the `delay`.
-- A config is checked as far as a worker would use it: certificate and key
-  files are read and parsed at load (a bad or missing one failed only in
-  the workers, which kept the previous certificates or exited at start), as
-  are cache sizes and `trusted_proxies` CIDRs (an invalid CIDR was silently
+- A drained backend without connections is removed at once; workers
+  without connections to it kept it `draining`.
+- A worker that dies within 10s of starting is restarted after 1s,
+  doubling to 30s, per worker index; was a tight loop. Same for the
+  control worker. The log line gives the `delay`.
+- Load checks what workers use: certificate and key files (failed only in
+  workers), cache sizes, `trusted_proxies` CIDRs (invalid ones were
   ignored).
 
 ### Removed
 
 - `keel backend add`, which only printed that it is not supported.
-- The hidden `--cluster`, `--bootstrap`, `--join` and `--secret` flags,
-  which only named the `node.hcl` settings that replaced them.
+- Hidden `--cluster`, `--bootstrap`, `--join`, `--secret` flags.
 
 ### Security
 
-- rustls 0.23.46: fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages
-  accepted at the wrong encryption level), RUSTSEC-2026-0346 (secrets in
-  `Debug` output) and three more advisories against 0.23.44.
-- PEM files are parsed by rustls' own types; `rustls-pemfile` is
-  unmaintained. `serde_yml` (RUSTSEC-2025-0068, unsound) is gone with YAML.
+- rustls 0.23.46: RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted
+  at the wrong encryption level), RUSTSEC-2026-0346 (secrets in `Debug`
+  output) and three more.
+- `rustls-pemfile` (unmaintained) replaced by rustls' PEM types;
+  `serde_yml` (RUSTSEC-2025-0068) gone with YAML.
 
 ---
 
@@ -1201,7 +1182,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/allmend/keel/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/allmend/keel/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/allmend/keel/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/allmend/keel/compare/v0.22.0...v0.23.0
