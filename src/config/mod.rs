@@ -273,9 +273,6 @@ impl Config {
                         if !path.starts_with('/') {
                             anyhow::bail!("pool '{name}': health_check.path must start with '/'");
                         }
-                        if let Some(s) = expect_status.iter().find(|s| !(100..=599).contains(*s)) {
-                            anyhow::bail!("pool '{name}': health_check.expect_status {s} is not an HTTP status");
-                        }
                     }
                     ProbeConfig::Tls { sni: Some(sni), .. } => {
                         let labels: Vec<&str> = sni.split('.').collect();
@@ -946,7 +943,7 @@ pub enum ProbeConfig {
     Tcp,
     /// Empty datagram sent; healthy unless ICMP port-unreachable comes back.
     Udp,
-    /// HTTP GET; 2xx (or `expect_status`) and optionally `expect_body`.
+    /// HTTP GET; 200–399 (or `expect_status`) and optionally `expect_body`.
     Http {
         #[serde(default = "default_health_path")]
         path: String,
@@ -955,9 +952,9 @@ pub enum ProbeConfig {
         host: Option<String>,
         #[serde(default)]
         tls: bool,
-        /// Acceptable status codes; empty means any 2xx.
+        /// Acceptable status codes; empty means 200–399.
         #[serde(default)]
-        expect_status: Vec<u16>,
+        expect_status: Vec<StatusRange>,
         /// Substring that must appear in the response body.
         #[serde(default)]
         expect_body: Option<String>,
@@ -987,6 +984,66 @@ pub enum ProbeConfig {
         #[serde(default, with = "duration::option")]
         min_valid: Option<Duration>,
     },
+}
+
+/// An inclusive range of HTTP status codes in `expect_status`: written as a
+/// number (`204`), or a string of one code (`"204"`) or a range (`"200-299"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+impl StatusRange {
+    pub fn contains(&self, status: u16) -> bool {
+        (self.lo..=self.hi).contains(&status)
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        let wrong = || anyhow::anyhow!("expect_status entry \"{s}\" is not a status code or a range such as \"200-299\"");
+        let (lo, hi) = match s.split_once('-') {
+            Some((lo, hi)) => (lo.trim().parse().map_err(|_| wrong())?, hi.trim().parse().map_err(|_| wrong())?),
+            None => {
+                let code = s.trim().parse().map_err(|_| wrong())?;
+                (code, code)
+            }
+        };
+        Self::new(lo, hi).map_err(|e| anyhow::anyhow!("expect_status entry \"{s}\": {e}"))
+    }
+
+    fn new(lo: u16, hi: u16) -> Result<Self> {
+        if !(100..=599).contains(&lo) || !(100..=599).contains(&hi) {
+            anyhow::bail!("status codes are 100-599");
+        }
+        if lo > hi {
+            anyhow::bail!("{lo} is above {hi}");
+        }
+        Ok(StatusRange { lo, hi })
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusRange {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) => StatusRange::parse(&s).map_err(D::Error::custom),
+            serde_json::Value::Number(n) => {
+                let code = n.as_u64().and_then(|c| u16::try_from(c).ok()).ok_or_else(|| D::Error::custom(format!("expect_status entry {n} is not a status code")))?;
+                StatusRange::new(code, code).map_err(|e| D::Error::custom(format!("expect_status entry {n}: {e}")))
+            }
+            other => Err(D::Error::custom(format!("expect_status entry {other} is not a status code or a range"))),
+        }
+    }
+}
+
+impl Serialize for StatusRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        if self.lo == self.hi {
+            s.serialize_u16(self.lo)
+        } else {
+            s.serialize_str(&format!("{}-{}", self.lo, self.hi))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
@@ -1841,7 +1898,7 @@ vhost "a.test" {
         match &hc.probe {
             ProbeConfig::Http { path, expect_status, tls, .. } => {
                 assert_eq!(path, "/ready");
-                assert_eq!(expect_status, &[200, 204]);
+                assert_eq!(expect_status, &[StatusRange { lo: 200, hi: 200 }, StatusRange { lo: 204, hi: 204 }]);
                 assert!(!tls);
             }
             other => panic!("unexpected {other:?}"),
@@ -1856,6 +1913,28 @@ vhost "a.test" {
         assert!(health_err("health_check \"tcp\" {\n    path = \"/health\"\n  }").contains("'path' is not valid for type 'tcp'"));
         assert!(health_err("health_check \"udp\" {\n    expect_body = \"ok\"\n  }").contains("'expect_body' is not valid for type 'udp'"));
         assert!(health_err("health_check \"smtp\" {}").contains("not one of"));
+    }
+
+    #[test]
+    fn expect_status_takes_codes_strings_and_ranges() {
+        let cfg = health("health_check \"http\" {\n    expect_status = [200, \"204\", \"300-308\", \" 404 - 404 \"]\n  }");
+        let ProbeConfig::Http { expect_status, .. } = &cfg.pools["p"].health_check.as_ref().unwrap().probe else { panic!() };
+        let r = |lo, hi| StatusRange { lo, hi };
+        assert_eq!(expect_status, &[r(200, 200), r(204, 204), r(300, 308), r(404, 404)]);
+        let range = r(300, 308);
+        assert!(range.contains(300) && range.contains(308) && !range.contains(299) && !range.contains(309));
+        for (entry, wanted) in [
+            ("\"210-201\"", "210 is above 201"),
+            ("\"2xx\"", "is not a status code or a range"),
+            ("\"100-600\"", "status codes are 100-599"),
+            ("\"-\"", "is not a status code"),
+            ("true", "is not a status code or a range"),
+            ("99", "status codes are 100-599"),
+        ] {
+            let e = health_err(&format!("health_check \"http\" {{\n    expect_status = [{entry}]\n  }}"));
+            assert!(e.contains(wanted), "{entry}: {e}");
+            assert!(e.starts_with("keel.hcl:"), "located: {e}");
+        }
     }
 
     #[test]
@@ -1903,7 +1982,7 @@ vhost "a.test" {
         let e = |hc: &str| err(&health(hc));
         assert!(e("health_check \"tcp\" {\n    healthy_threshold = 0\n  }").contains("thresholds"));
         assert!(e("health_check \"http\" {\n    path = \"health\"\n  }").contains("start with '/'"));
-        assert!(e("health_check \"http\" {\n    expect_status = [42]\n  }").contains("not an HTTP status"));
+        assert!(health_err("health_check \"http\" {\n    expect_status = [42]\n  }").contains("expect_status entry 42: status codes are 100-599"));
         assert!(e("passive {\n    failures = 0\n  }").contains("passive.failures"));
         assert!(health_err("passive {\n    eject_for = \"forever\"\n  }").contains("'forever' is not a duration"));
     }

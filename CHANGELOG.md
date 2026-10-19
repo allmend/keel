@@ -45,6 +45,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
   `members.yaml`). Keelconfigs issued before are not read: issue new ones
   with `keel credentials create`. Keel reads and writes no YAML.
 
+- An `http` health check counts any status from 200 to 399 as healthy, so
+  a redirecting `path` passes; `expect_status = ["200-299"]` keeps the
+  old rule. `expect_status` takes ranges: `[200, "204", "300-308"]`.
+
 ### Added
 
 - `keel config validate [node.hcl]`: load a node file and its config

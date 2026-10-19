@@ -325,7 +325,7 @@ pub struct HttpProbe {
     path: String,
     host: Option<String>,
     tls: bool,
-    expect_status: Vec<u16>,
+    expect_status: Vec<crate::config::StatusRange>,
     expect_body: Option<String>,
     timeout: Duration,
 }
@@ -373,9 +373,9 @@ impl Probe for HttpProbe {
 
         let status = session.response_header().map(|r| r.status.as_u16()).unwrap_or(0);
         let accepted = if self.expect_status.is_empty() {
-            (200..300).contains(&status)
+            (200..400).contains(&status)
         } else {
-            self.expect_status.contains(&status)
+            self.expect_status.iter().any(|r| r.contains(status))
         };
         if !accepted {
             return Err(format!("status {status}"));

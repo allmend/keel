@@ -57,14 +57,14 @@ health_check "udp" {
 
 ### http
 
-A `GET` to `path`. Healthy on 2xx (or a code in `expect_status`) with `expect_body`, if set, in the first 64 KiB of the body.
+A `GET` to `path`. Healthy on a status from 200 to 399 (or one `expect_status` allows) with `expect_body`, if set, in the first 64 KiB of the body. Redirects are not followed: a `path` that redirects counts as healthy, so point it at an endpoint that answers itself.
 
 ```hcl
 health_check "http" {
   path          = "/health"
   host          = "app.internal"
   tls           = false
-  expect_status = [200, 204]
+  expect_status = [200, "204", "300-308"]
   expect_body   = "\"ok\""
 }
 ```
@@ -74,7 +74,7 @@ health_check "http" {
 | `path` | `/health` | Starts with `/` |
 | `host` | backend `ip:port` | Host header, and SNI with `tls` |
 | `tls` | `false` | HTTPS; the backend certificate is not verified |
-| `expect_status` | any 2xx | Acceptable codes |
+| `expect_status` | 200–399 | Codes (`204`, `"204"`) and inclusive ranges (`"300-308"`) |
 | `expect_body` | none | Substring the body must contain |
 
 ### dns

@@ -69,6 +69,17 @@ pool "web" {
   backend "172.29.89.22:80" {}
 }
 
+// The server answers /usr with a redirect to /usr/.
+pool "redirected" {
+  health_check "http" {
+    path                = "/usr"
+    interval            = "1s"
+    unhealthy_threshold = 1
+  }
+
+  backend "172.29.89.20:80" {}
+}
+
 pool "pinged" {
   health_check "icmp" {
     interval = "1s"
@@ -129,6 +140,12 @@ fn health_checks_run_once_per_node_and_every_worker_acts_on_them() -> Result<()>
     std::thread::sleep(Duration::from_secs(10));
     let probed = probes(&stack)? - before;
     assert!((7..=13).contains(&probed), "{probed} probes in 10s at a 1s interval");
+
+    // A redirect is healthy by default (200-399).
+    std::thread::sleep(Duration::from_secs(2));
+    let out = stack.exec("keel", &["keel", "backend", "list", "--pool", "redirected"])?;
+    let list = String::from_utf8_lossy(&out.stdout);
+    assert!(list.contains("healthy") && !list.contains("unhealthy"), "{list}");
 
     // Nothing answers ICMP at .99.
     wait_until("icmp unhealthy", Duration::from_secs(30), || {
