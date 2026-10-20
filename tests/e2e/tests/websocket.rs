@@ -236,6 +236,7 @@ fn websockets_pass_through_count_as_connections_and_are_logged_on_close() -> Res
     // Shutdown: an open socket keeps working, then is closed.
     let mut ws = tls_connect(stack.addr("keel", 443)?, "ws.test", &[b"http/1.1"])?;
     upgrade(&mut ws)?;
+    // Taken after the signal is delivered, so a little under grace_period.
     stack.signal("keel", "TERM")?;
     let signalled = Instant::now();
     std::thread::sleep(Duration::from_millis(500));
@@ -244,6 +245,6 @@ fn websockets_pass_through_count_as_connections_and_are_logged_on_close() -> Res
     let mut rest = Vec::new();
     let _ = ws.read_to_end(&mut rest);
     let closed = signalled.elapsed();
-    assert!(closed >= Duration::from_secs(2) && closed < Duration::from_secs(5), "closed {closed:?} after SIGTERM, grace_period 2s");
+    assert!(closed >= Duration::from_millis(1500) && closed < Duration::from_secs(5), "closed {closed:?} after SIGTERM, grace_period 2s");
     Ok(())
 }
