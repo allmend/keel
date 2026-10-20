@@ -53,8 +53,6 @@ chrono = "0.4"
 
 # Cache utilities
 hex = "0.4"
-# TSIG keys in config are base64, as in BIND key statements
-base64 = "0.23"
 
 # Logging
 tracing = "0.1"
