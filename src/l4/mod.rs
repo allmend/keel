@@ -22,7 +22,9 @@
 //! no request concept at L4) to `access_tcp_<pool>.log`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -52,6 +54,11 @@ pub struct TcpProxyApp {
     pub proxy_protocol: bool,
     /// The applied routing table, for this listener's access list.
     pub routing: Arc<arc_swap::ArcSwap<crate::vhost::RoutingTable>>,
+    /// The pool's `connect_timeout`.
+    pub connect_timeout: Duration,
+    /// The listener's `idle_timeout`: a connection with no bytes either way
+    /// for this long is closed.
+    pub idle_timeout: Duration,
 }
 
 /// What one connection did, for accounting and the access log.
@@ -105,7 +112,9 @@ impl TcpProxyApp {
             }
         }
 
-        let upstream = match TcpStream::connect(backend).await {
+        let connected = tokio::time::timeout(self.connect_timeout, TcpStream::connect(backend)).await;
+        let connected = connected.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")));
+        let upstream = match connected {
             Ok(s) => {
                 self.pools.report_success(&self.pool, backend);
                 s
@@ -125,7 +134,7 @@ impl TcpProxyApp {
                 let name = ServerName::IpAddress(backend.ip().into());
                 let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
                 match connector.connect(name, upstream).await {
-                    Ok(mut tls_upstream) => copy(&mut client, &mut tls_upstream, shutdown).await,
+                    Ok(mut tls_upstream) => copy(&mut client, &mut tls_upstream, shutdown, self.idle_timeout).await,
                     Err(e) => {
                         warn!(pool = self.pool, backend = %backend, error = %e, "tcp: upstream TLS handshake failed");
                         (0, 0, Some("upstream_tls"))
@@ -134,11 +143,11 @@ impl TcpProxyApp {
             }
             (None, Some(mut client), _) => {
                 let mut upstream = upstream;
-                copy(&mut client, &mut upstream, shutdown).await
+                copy(&mut client, &mut upstream, shutdown, self.idle_timeout).await
             }
             (_, None, Some(mut client)) => {
                 let mut upstream = upstream;
-                copy(&mut client, &mut upstream, shutdown).await
+                copy(&mut client, &mut upstream, shutdown, self.idle_timeout).await
             }
             (_, None, None) => unreachable!("client stream is either terminated or plain"),
         };
@@ -172,42 +181,61 @@ impl TcpProxyApp {
     }
 }
 
-/// Splice until both directions have closed, an I/O error occurs, or the
-/// server shuts down (graceful shutdown closes L4 connections — there is no
-/// in-flight request boundary to wait for). Returns (client→backend bytes,
-/// backend→client bytes, error).
-async fn copy<A, B>(client: &mut A, upstream: &mut B, shutdown: &ShutdownWatch) -> (u64, u64, Option<&'static str>)
+/// Splice until both directions have closed, an I/O error occurs, nothing
+/// moves for `idle`, or the server shuts down (graceful shutdown closes L4
+/// connections — there is no in-flight request boundary to wait for).
+/// Returns (client→backend bytes, backend→client bytes, error); the counts
+/// include what moved before an early end.
+async fn copy<A, B>(client: &mut A, upstream: &mut B, shutdown: &ShutdownWatch, idle: Duration) -> (u64, u64, Option<&'static str>)
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
 
+    let started = Instant::now();
+    // Milliseconds since `started` of the last byte either way.
+    let active = AtomicU64::new(0);
+    let (bytes_in, bytes_out) = (AtomicU64::new(0), AtomicU64::new(0));
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut ur, mut uw) = tokio::io::split(upstream);
     // Each direction half-closes its destination when its source ends, so a
     // client that finishes sending still receives the backend's tail.
     let c2u = async {
-        let r = pump(&mut cr, &mut uw).await;
+        let r = pump(&mut cr, &mut uw, &bytes_in, &active, started).await;
         let _ = uw.shutdown().await;
         r
     };
     let u2c = async {
-        let r = pump(&mut ur, &mut cw).await;
+        let r = pump(&mut ur, &mut cw, &bytes_out, &active, started).await;
         let _ = cw.shutdown().await;
         r
     };
+    let idle_out = async {
+        loop {
+            let last = Duration::from_millis(active.load(Ordering::Relaxed));
+            let deadline = last + idle;
+            let now = started.elapsed();
+            if now >= deadline {
+                return;
+            }
+            tokio::time::sleep(deadline - now).await;
+        }
+    };
     let mut shutdown = shutdown.clone();
-    tokio::select! {
-        ((bytes_in, e1), (bytes_out, e2)) = async { tokio::join!(c2u, u2c) } => (bytes_in, bytes_out, e1.or(e2)),
-        _ = shutdown.changed() => (0, 0, Some("shutdown")),
-    }
+    let error = tokio::select! {
+        (e1, e2) = async { tokio::join!(c2u, u2c) } => e1.or(e2),
+        _ = idle_out => Some("idle_timeout"),
+        _ = shutdown.changed() => Some("shutdown"),
+    };
+    (bytes_in.into_inner(), bytes_out.into_inner(), error)
 }
 
-/// Copy one direction, counting bytes, flushing as it goes. A peer that drops the TCP connection
+/// Copy one direction, counting bytes into `total` and noting activity,
+/// flushing as it goes. A peer that drops the TCP connection
 /// without a TLS close_notify surfaces as `UnexpectedEof` from rustls; many
 /// TCP clients close that way, so it counts as a normal end, not an error.
-async fn pump<R, W>(r: &mut R, w: &mut W) -> (u64, Option<&'static str>)
+async fn pump<R, W>(r: &mut R, w: &mut W, total: &AtomicU64, active: &AtomicU64, started: Instant) -> Option<&'static str>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -215,24 +243,24 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = vec![0u8; 16 * 1024];
-    let mut total = 0u64;
     loop {
         match r.read(&mut buf).await {
-            Ok(0) => return (total, None),
+            Ok(0) => return None,
             Ok(n) => {
+                active.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                 // Flush every chunk: Pingora's client stream and TLS streams
                 // buffer writes, and a client waiting for an answer would
                 // otherwise only get it when the connection closes.
                 if let Err(e) = w.write_all(&buf[..n]).await.and(w.flush().await) {
                     debug!(error = %e, "tcp: write failed");
-                    return (total, Some("io"));
+                    return Some("io");
                 }
-                total += n as u64;
+                total.fetch_add(n as u64, Ordering::Relaxed);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return (total, None),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(e) => {
                 debug!(error = %e, "tcp: read failed");
-                return (total, Some("io"));
+                return Some("io");
             }
         }
     }
@@ -372,6 +400,8 @@ mod tests {
             client_tls,
             proxy_protocol: false,
             routing: Default::default(),
+            connect_timeout: Duration::from_secs(3),
+            idle_timeout: Duration::from_secs(3600),
         })
     }
 

@@ -81,8 +81,10 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 | `no_route` | No vhost or route matched, or Keel answered itself |
 | `no_backend` | No available backend in the pool; Keel answered 503 |
 | `denied` | An access list turned the client away; Keel answered 403 |
-| `upstream_connect` | Connecting to the backend failed; Keel answered 502 |
-| `upstream_timeout` | The backend did not answer in time |
+| `header_too_large` | Request line and headers over `keel.max_header_size`; Keel answered 431 |
+| `body_too_large` | Request body over `max_body_size`; Keel answered 413 |
+| `upstream_connect` | Connecting to the backend failed; Keel answered 502, or 504 when it timed out |
+| `upstream_timeout` | The backend did not answer within `read_timeout` or `write_timeout`; Keel answered 504 |
 | `upstream` | The backend's connection failed after it was established |
 | `downstream` | The client's connection failed or closed early |
 | `internal` | Any other failure |
@@ -119,7 +121,7 @@ One entry per connection, written when it closes:
 | `bytes_in`, `bytes_out` | Application bytes from and to the client |
 | `duration_ms` | Accept to close |
 | `tls_sni`, `tls_version`, `tls_cipher` | When Keel terminates TLS; `null` otherwise |
-| `error` | `null`, `denied`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
+| `error` | `null`, `denied`, `idle_timeout`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
 
 ## UDP
 

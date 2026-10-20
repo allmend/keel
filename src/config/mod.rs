@@ -321,6 +321,7 @@ impl Config {
                 })?;
             }
         }
+        crate::cache::parse_size(&self.keel.max_header_size).map_err(|e| anyhow::anyhow!("keel.max_header_size: {e}"))?;
         if self.keel.udp_max_flows == 0 {
             anyhow::bail!("keel.udp_max_flows must be at least 1");
         }
@@ -345,6 +346,9 @@ impl Config {
                 anyhow::bail!("{id}: allow and deny apply to tcp and udp listeners; HTTP takes them on the vhost or route");
             }
             crate::access::AccessList::new(&l.allow, &l.deny).map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
+            if l.protocol != Protocol::Tcp && l.idle_timeout.is_some() {
+                anyhow::bail!("{id}: idle_timeout applies to tcp listeners; UDP has keel.udp_flow_timeout");
+            }
             if l.protocol != Protocol::Tcp && (l.tls_mode != TlsMode::Passthrough || l.tls_host.is_some() || l.tls_verify || l.tls_ca.is_some()) {
                 anyhow::bail!("{id}: tls_mode, tls_host, tls_verify and tls_ca apply to tcp listeners only");
             }
@@ -420,6 +424,13 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("vhost '{}': forwarded_headers.trusted_proxies: invalid CIDR '{cidr}': {e}", vhost.host))?;
             }
             crate::access::AccessList::new(&vhost.allow, &vhost.deny).map_err(|e| anyhow::anyhow!("vhost '{}': {e}", vhost.host))?;
+            let sizes = std::iter::once((vhost.max_body_size.as_ref(), String::new()))
+                .chain(vhost.routes.iter().map(|r| (r.max_body_size.as_ref(), format!(" route '{}'", r.path))));
+            for (size, route) in sizes {
+                if let Some(size) = size {
+                    crate::cache::parse_size(size).map_err(|e| anyhow::anyhow!("vhost '{}'{route}: max_body_size: {e}", vhost.host))?;
+                }
+            }
             for r in &vhost.routes {
                 crate::access::AccessList::new(&r.allow, &r.deny)
                     .map_err(|e| anyhow::anyhow!("vhost '{}': route '{}': {e}", vhost.host, r.path))?;
@@ -728,6 +739,18 @@ pub struct KeelConfig {
     #[serde(default = "default_udp_max_flows")]
     pub udp_max_flows: usize,
 
+    /// HTTP: how long a client connection is kept open between requests.
+    #[serde(default = "default_keepalive_timeout", with = "duration")]
+    pub keepalive_timeout: Duration,
+
+    /// HTTP: longest wait between two reads of a request body.
+    #[serde(default = "default_body_timeout", with = "duration")]
+    pub body_timeout: Duration,
+
+    /// HTTP: largest request line and headers, e.g. `64K`; larger is 431.
+    #[serde(default = "default_max_header_size")]
+    pub max_header_size: String,
+
     /// Directory for state Keel creates and keeps across restarts: the node
     /// ID today. Written by the unprivileged process after the drop.
     #[serde(default = "default_state_dir")]
@@ -750,6 +773,9 @@ impl Default for KeelConfig {
             grace_period: default_grace_period(),
             udp_flow_timeout: default_udp_flow_timeout(),
             udp_max_flows: default_udp_max_flows(),
+            keepalive_timeout: default_keepalive_timeout(),
+            body_timeout: default_body_timeout(),
+            max_header_size: default_max_header_size(),
             state_dir: default_state_dir(),
             config_dir: default_config_dir(),
         }
@@ -773,6 +799,9 @@ impl KeelConfig {
 fn default_config_dir() -> String { "/etc/keel/config".into() }
 
 fn default_grace_period() -> Duration { Duration::from_secs(10) }
+fn default_keepalive_timeout() -> Duration { Duration::from_secs(75) }
+fn default_body_timeout() -> Duration { Duration::from_secs(60) }
+fn default_max_header_size() -> String { "64K".into() }
 fn default_udp_flow_timeout() -> Duration { Duration::from_secs(30) }
 fn default_udp_max_flows() -> usize { 8192 }
 
@@ -833,6 +862,11 @@ pub struct Listener {
     /// Client networks turned away, before `allow` is looked at.
     #[serde(default)]
     pub deny: Vec<String>,
+
+    /// `tcp`: a connection with no bytes either way for this long is
+    /// closed. Default 1h.
+    #[serde(default, with = "duration::option")]
+    pub idle_timeout: Option<Duration>,
 }
 
 /// What a listener speaks: HTTP routed by vhost (plain or TLS-terminated),
@@ -905,9 +939,33 @@ pub struct Pool {
     #[serde(default)]
     pub passive: PassiveConfig,
 
+    /// Time to open a connection to a backend.
+    #[serde(default = "default_connect_timeout", with = "duration")]
+    pub connect_timeout: Duration,
+
+    /// HTTP: longest wait for the backend between two reads.
+    #[serde(default = "default_upstream_timeout", with = "duration")]
+    pub read_timeout: Duration,
+
+    /// HTTP: longest wait for the backend between two writes.
+    #[serde(default = "default_upstream_timeout", with = "duration")]
+    pub write_timeout: Duration,
+
+    /// HTTP: how long an unused connection to a backend is kept for reuse.
+    #[serde(default = "default_upstream_timeout", with = "duration")]
+    pub idle_timeout: Duration,
+
+    /// HTTP: a request whose connection failed tries one other backend.
+    /// Never once bytes were sent.
+    #[serde(default = "default_true")]
+    pub retry: bool,
+
     #[serde(default)]
     pub backends: Vec<Backend>,
 }
+
+fn default_connect_timeout() -> Duration { Duration::from_secs(3) }
+fn default_upstream_timeout() -> Duration { Duration::from_secs(60) }
 
 /// Outlier ejection: a backend whose real requests, connections, or UDP
 /// flows fail `failures` times in a row is taken out for `eject_for`.
@@ -1185,8 +1243,10 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 
 /// Attributes that hold a duration; `keel config validate --write` adds the
 /// unit to a bare number there.
-pub const DURATION_ATTRIBUTES: [&str; 7] =
-    ["grace_period", "udp_flow_timeout", "eject_for", "interval", "timeout", "ttl", "min_valid"];
+pub const DURATION_ATTRIBUTES: [&str; 13] = [
+    "grace_period", "udp_flow_timeout", "eject_for", "interval", "timeout", "ttl", "min_valid", "connect_timeout",
+    "read_timeout", "write_timeout", "idle_timeout", "keepalive_timeout", "body_timeout",
+];
 
 /// Serde for duration attributes: a string such as `30s`.
 mod duration {
@@ -1333,6 +1393,9 @@ pub struct Vhost {
     /// Client networks turned away, before `allow` is looked at.
     #[serde(default)]
     pub deny: Vec<String>,
+
+    /// Largest request body, e.g. `10M`; larger is 413. Unset: no limit.
+    pub max_body_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1375,6 +1438,9 @@ pub struct Route {
     /// Client networks turned away, before `allow` is looked at.
     #[serde(default)]
     pub deny: Vec<String>,
+
+    /// Largest request body, e.g. `10M`; larger is 413. Unset: no limit.
+    pub max_body_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1911,6 +1977,19 @@ vhost "a.test" {
         );
         assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  allow = [\"10.0.0.0/8\"]\n}\n").contains("allow and deny apply to tcp and udp listeners"));
         with_pool("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n  allow = [\"10.0.0.0/8\", \"2001:db8::1\"]\n}\n").validate().unwrap();
+    }
+
+    #[test]
+    fn limits_and_timeouts_are_checked() {
+        let e = |text: &str| err(&with_pool(text));
+        assert!(e("keel {\n  max_header_size = \"lots\"\n}\n").starts_with("keel.max_header_size:"));
+        assert!(e("vhost \"a\" {\n  pool          = \"dns\"\n  max_body_size = \"x\"\n}\n").starts_with("vhost 'a': max_body_size:"));
+        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  idle_timeout = \"5s\"\n}\n").contains("idle_timeout applies to tcp listeners"));
+        let cfg = with_pool("listener \"tcp\" \"0.0.0.0:53\" {\n  pool         = \"dns\"\n  idle_timeout = \"5m\"\n}\n");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.listeners[0].idle_timeout, Some(Duration::from_secs(300)));
+        let p = &cfg.pools["dns"];
+        assert_eq!((p.connect_timeout, p.read_timeout, p.retry), (Duration::from_secs(3), Duration::from_secs(60), true));
     }
 
     #[test]

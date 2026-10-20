@@ -179,6 +179,18 @@ impl PoolRegistry {
     /// Select a backend from the named pool. Skips draining/removed backends.
     /// `key` is used for consistent hashing; ignored by round-robin and random.
     pub fn select(&self, pool_name: &str, key: &[u8]) -> Option<SocketAddr> {
+        self.select_except(pool_name, key, None)
+    }
+
+    /// Another backend of the pool than `addr` can take traffic.
+    pub fn has_available_except(&self, pool_name: &str, addr: SocketAddr) -> bool {
+        let now = self.now_ms();
+        self.drain.get(pool_name).is_some_and(|entries| entries.iter().any(|(a, e)| *a != addr && e.available(now)))
+    }
+
+    /// As [`select`](Self::select), never picking `except`: a retry's
+    /// other backend.
+    pub fn select_except(&self, pool_name: &str, key: &[u8], except: Option<SocketAddr>) -> Option<SocketAddr> {
         let pool = self.pools.get(pool_name)?;
         let empty = HashMap::new();
         let entries = self.drain.get(pool_name).unwrap_or(&empty);
@@ -187,13 +199,13 @@ impl PoolRegistry {
         // Pingora's own `healthy` flag is always true here: no Pingora
         // health check is attached, Keel keeps health in `drain`.
         let available = |b: &Backend, _: bool| {
-            b.addr.as_inet().is_some_and(|a| is_available(entries, a, now))
+            b.addr.as_inet().is_some_and(|a| Some(*a) != except && is_available(entries, a, now))
         };
         let picked = match pool {
             Pool::RoundRobin(lb) => lb.select_with(key, 256, available),
             Pool::Random(lb) => lb.select_with(key, 256, available),
             Pool::ConsistentHash(lb) => lb.select_with(key, 256, available),
-            Pool::LeastConn(lc) => return lc.select(entries, now),
+            Pool::LeastConn(lc) => return lc.select(entries, now, except),
         };
         let addr = *picked?.addr.as_inet()?;
         if let Some(entry) = entries.get(&addr) {
@@ -488,12 +500,12 @@ impl LeastConnPool {
 
     /// The available backend with the fewest connections per unit of
     /// weight, as nginx's weighted least_conn; ties go to the first listed.
-    fn select(&self, entries: &HashMap<SocketAddr, BackendEntry>, now_ms: u64) -> Option<SocketAddr> {
+    fn select(&self, entries: &HashMap<SocketAddr, BackendEntry>, now_ms: u64, except: Option<SocketAddr>) -> Option<SocketAddr> {
         let conns = |e: &LeastConnEntry| entries.get(&e.addr).map(|d| d.connections.load(Ordering::Relaxed)).unwrap_or(0);
         let addr = self
             .backends
             .iter()
-            .filter(|e| is_available(entries, &e.addr, now_ms))
+            .filter(|e| Some(e.addr) != except && is_available(entries, &e.addr, now_ms))
             // a/wa < b/wb without division: a*wb < b*wa.
             .min_by(|a, b| (conns(a) * b.weight).cmp(&(conns(b) * a.weight)))?
             .addr;

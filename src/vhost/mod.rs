@@ -38,6 +38,8 @@ pub struct Route {
     cache: Option<VhostCacheConfig>,
     /// The route's access list, else its vhost's.
     pub access: Option<AccessList>,
+    /// The route's `max_body_size` in bytes, else its vhost's.
+    pub max_body: Option<usize>,
 }
 
 impl RoutingTable {
@@ -55,6 +57,9 @@ impl RoutingTable {
         for vhost in &cfg.vhosts {
             let routes = vhosts.entry(vhost.host.clone()).or_default();
             let vhost_access = list(&vhost.allow, &vhost.deny);
+            // Validated: sizes parse.
+            let size = |s: &Option<String>| s.as_deref().and_then(|s| crate::cache::parse_size(s).ok());
+            let vhost_max_body = size(&vhost.max_body_size);
 
             if vhost.routes.is_empty() {
                 // Single pool for the whole vhost — treat as "/"
@@ -65,6 +70,7 @@ impl RoutingTable {
                         series: std::sync::Arc::new(crate::metrics::RequestSeries::new(pool, &vhost.host)),
                         cache: None,
                         access: vhost_access.clone(),
+                        max_body: vhost_max_body,
                     });
                 }
             } else {
@@ -75,6 +81,7 @@ impl RoutingTable {
                         series: std::sync::Arc::new(crate::metrics::RequestSeries::new(&r.pool, &vhost.host)),
                         cache: r.cache.clone(),
                         access: list(&r.allow, &r.deny).or_else(|| vhost_access.clone()),
+                        max_body: size(&r.max_body_size).or(vhost_max_body),
                     });
                 }
             }
@@ -283,6 +290,11 @@ mod tests {
             algorithm: LbAlgorithm::RoundRobin,
             health_check: None,
             passive: Default::default(),
+            connect_timeout: std::time::Duration::from_secs(3),
+            read_timeout: std::time::Duration::from_secs(60),
+            write_timeout: std::time::Duration::from_secs(60),
+            idle_timeout: std::time::Duration::from_secs(60),
+            retry: true,
             backends: vec![Backend { address: "127.0.0.1:8080".into(), weight: 1 }],
         })
     }
@@ -299,6 +311,7 @@ mod tests {
             default_action: None,
             allow: vec![],
             deny: vec![],
+            max_body_size: None,
         }
     }
 
@@ -358,8 +371,8 @@ mod tests {
                 host: "example.com".into(),
                 pool: None,
                 routes: vec![
-                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, allow: vec![], deny: vec![] },
-                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, allow: vec![], deny: vec![] },
+                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, allow: vec![], deny: vec![], max_body_size: None },
+                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, allow: vec![], deny: vec![], max_body_size: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -368,6 +381,7 @@ mod tests {
                 default_action: None,
                 allow: vec![],
                 deny: vec![],
+                max_body_size: None,
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -408,8 +422,9 @@ mod tests {
                         }),
                         allow: vec![],
                         deny: vec![],
+                        max_body_size: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![] },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![], max_body_size: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -423,6 +438,7 @@ mod tests {
                 default_action: None,
                 allow: vec![],
                 deny: vec![],
+                max_body_size: None,
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -452,8 +468,9 @@ mod tests {
                         cache: Some(VhostCacheConfig { enabled: false, ..Default::default() }),
                         allow: vec![],
                         deny: vec![],
+                        max_body_size: None,
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![] },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![], max_body_size: None },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -462,6 +479,7 @@ mod tests {
                 default_action: None,
                 allow: vec![],
                 deny: vec![],
+                max_body_size: None,
             }],
             [pool("api"), pool("web")].into(),
         );

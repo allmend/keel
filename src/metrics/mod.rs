@@ -101,6 +101,7 @@ families! {
     CACHE_REQUESTS = "keel_cache_requests_total", Kind::Counter, &["pool", "vhost", "result"], "HTTP requests with caching on, by result (hit, miss)";
     CACHE_HITS = "keel_cache_hits_total", Kind::Counter, &["tier"], "Cache hits by the tier that served them (memory, disk)";
     UDP_ERRORS = "keel_udp_errors_total", Kind::Counter, POOL_REASON, "UDP (L4) datagrams dropped or flows ended by an error";
+    UPSTREAM_RETRIES = "keel_upstream_retries_total", Kind::Counter, &["pool"], "HTTP requests retried on another backend after a failed connect";
 }
 
 // Header counters, each written by one kind of process.
@@ -537,6 +538,10 @@ pub fn record_lb_error(pool: &str, vhost: &str, reason: &str) {
 
 pub fn record_tcp_error(pool: &str, reason: &str) {
     Counter::of(F::TCP_ERRORS, &[pool, reason]).inc();
+}
+
+pub fn record_upstream_retry(pool: &str) {
+    Counter::of(F::UPSTREAM_RETRIES, &[pool]).inc();
 }
 
 pub fn record_udp_error(pool: &str, reason: &str) {

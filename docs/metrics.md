@@ -56,6 +56,7 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 |---|---|---|---|
 | `keel_backend_requests_total` | counter | `pool`, `backend`, `status` | HTTP requests forwarded per backend |
 | `keel_backend_response_duration_seconds` | histogram | `pool`, `backend` | Backend selected to response complete |
+| `keel_upstream_retries_total` | counter | `pool` | HTTP requests retried on another backend after a failed connect |
 | `keel_backend_connection_errors_total` | counter | `pool`, `backend` | Requests that failed on the backend's side: access-log errors `upstream_connect`, `upstream_timeout`, `upstream` |
 | `keel_active_connections` | gauge | `pool`, `backend` | Current active connections — HTTP and TCP combined; the same counter drain waits on |
 | `keel_backend_healthy` | gauge | `pool`, `backend` | `1` healthy, `0` unhealthy: the control worker's verdict, which every worker follows. Pools without a `health_check` never emit it |
@@ -113,7 +114,7 @@ keel_pool_backends{state="available"}
 | `keel_tcp_connections_total` | counter | `pool`, `backend` | Connections accepted and spliced |
 | `keel_tcp_bytes_in_total` | counter | `pool`, `backend` | Bytes received from clients over connection lifetimes |
 | `keel_tcp_bytes_out_total` | counter | `pool`, `backend` | Bytes sent to clients over connection lifetimes |
-| `keel_tcp_errors_total` | counter | `pool`, `reason` | Connections ending in error. Reasons: `denied`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
+| `keel_tcp_errors_total` | counter | `pool`, `reason` | Connections ending in error. Reasons: `denied`, `idle_timeout`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
 
 ## UDP (L4) metrics
 

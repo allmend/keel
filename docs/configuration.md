@@ -134,6 +134,11 @@ keel {
 | `grace_period` | config directory | duration | `10s` |
 | `udp_flow_timeout` | config directory | duration | `30s` |
 | `udp_max_flows` | config directory | number | `8192` |
+| `keepalive_timeout` | config directory | duration | `75s` |
+| `body_timeout` | config directory | duration | `60s` |
+| `max_header_size` | config directory | size | `64K` |
+
+`keepalive_timeout` closes an HTTP/1 client connection idle between requests. `body_timeout` is the longest wait between two reads of a request body. A request line and headers over `max_header_size` get `431`. Pingora reads the first request's headers with a fixed 60s timeout.
 
 On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets in-flight requests finish for up to `grace_period`, then exits. Keep the value below the supervisor's kill timeout (`docker stop` defaults to 10s, K8s `terminationGracePeriodSeconds` to 30s). L4 TCP connections and UDP flows are closed at shutdown; use [backend drain](load-balancing.md#backend-drain) for zero-impact maintenance.
 
@@ -189,6 +194,7 @@ listener "tcp" "0.0.0.0:53" {
 | `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificate` block or a vhost with `tls`, served when the client's SNI has no certificate of its own |
 | `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's IP |
 | `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs. A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
+| `idle_timeout` | duration | `1h` | `tcp`: close a connection with no bytes either way for this long; error `idle_timeout` |
 
 `http`, `https` and `tcp` share TCP ports, so two of them on one address is a load error; `udp` and `tcp` can share an address. A `tcp` or `udp` listener's pool is an ordinary `pool` block — health checks, weights, algorithms, and drain behave the same as for HTTP.
 
@@ -299,6 +305,11 @@ pool "web" {
 | `passive.enabled` | bool | `true` | Eject a backend after consecutive traffic failures. See [Health checks](health-checks.md#passive-detection) |
 | `passive.failures` | number | `5` | Consecutive upstream connect (or UDP reply) failures that eject |
 | `passive.eject_for` | duration | `30s` | Time out of rotation before re-admission |
+| `connect_timeout` | duration | `3s` | Opening a connection to a backend, HTTP and TCP; `504` |
+| `read_timeout` | duration | `60s` | HTTP: longest wait between two reads from a backend; `504` |
+| `write_timeout` | duration | `60s` | HTTP: longest wait between two writes to a backend |
+| `idle_timeout` | duration | `60s` | HTTP: how long an unused backend connection is kept for reuse |
+| `retry` | bool | `true` | HTTP: a failed connect tries one other available backend. Never once bytes were sent; counted in `keel_upstream_retries_total` |
 | `backend "<address>"` | block | required | `ip:port`; at least one |
 | `backend.weight` | number | `1` | Relative weight, 1–1000; honoured by every algorithm |
 
@@ -339,6 +350,7 @@ vhost "*" {
 | `pool` | string | none | The pool for every path. Excludes `route` blocks |
 | `route "<path>"` | block | none | Path-prefix routing with a `pool` each, and optional `cache`, `allow` and `deny`; see [Virtual hosts](virtual-hosts.md#path-routing). Excludes `pool` |
 | `allow`, `deny` | list | none | Client networks or addresses; see [Access lists](virtual-hosts.md#access-lists) |
+| `max_body_size` | size | none | Largest request body, e.g. `10M`; larger gets `413`. A route's own replaces the vhost's |
 | `tls.cert` | string | none | PEM certificate (BYO cert). A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
 | `tls.key` | string | none | PEM private key (BYO cert), same resolution as `tls.cert` |
 | `tls.acme` | bool or string | `false` | `true` = ACME via issuer `default`; a string names an `acme` issuer — see [ACME](acme.md) |

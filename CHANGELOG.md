@@ -14,6 +14,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
   listeners. HTTP answers 403, TCP closes, UDP drops; error `denied`.
   Behind `trusted_proxies` the client is the last untrusted
   `X-Forwarded-For` hop. Applied live on push.
+- Timeouts and limits. Pools: `connect_timeout` (3s), `read_timeout`,
+  `write_timeout`, `idle_timeout` (60s), `retry` once on another backend
+  after a failed connect. `keel`: `keepalive_timeout` (75s),
+  `body_timeout` (60s), `max_header_size` (64K, 431). Vhost and route:
+  `max_body_size` (off, 413). `tcp` listeners: `idle_timeout` (1h).
 - `-o json` on every `keel` and `keelctl` client command, `config validate`
   and `credentials create`: one JSON object per line.
 

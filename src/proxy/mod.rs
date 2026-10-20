@@ -71,8 +71,13 @@ pub struct ProxyCtx {
     uri: String,
     protocol: String,
     user_agent: Option<String>,
-    /// Turned away by an access list.
-    denied: bool,
+    /// Why Keel refused the request itself: `denied`, `header_too_large`,
+    /// `body_too_large`.
+    refused: Option<&'static str>,
+    /// The backend whose connection failed, when the request was retried.
+    retried_from: Option<SocketAddr>,
+    /// The route's `max_body_size`.
+    max_body: Option<usize>,
 }
 
 // Proxy implementation
@@ -83,6 +88,27 @@ pub struct KProxy {
     pools: Arc<PoolRegistry>,
     access_logger: Arc<AccessLogger>,
     cache: Option<CacheHandle>,
+    /// Pool name → its upstream timeouts and retry setting.
+    upstream: Arc<HashMap<String, Upstream>>,
+    /// The `keel` block's settings toward clients.
+    downstream: Downstream,
+}
+
+/// Settings toward HTTP clients, from the `keel` block.
+#[derive(Clone, Copy)]
+struct Downstream {
+    keepalive: std::time::Duration,
+    body: std::time::Duration,
+    max_header: usize,
+}
+
+/// A pool's settings toward its backends.
+struct Upstream {
+    connect: std::time::Duration,
+    read: std::time::Duration,
+    write: std::time::Duration,
+    idle: std::time::Duration,
+    retry: bool,
 }
 
 /// The name the client asked for: the `Host` header, or HTTP/2's `:authority`
@@ -238,6 +264,7 @@ impl KProxy {
         ctx.is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
         if let Some(route) = routing.resolve(&host, req.uri.path()) {
             ctx.series = Some(Arc::clone(&route.series));
+            ctx.max_body = route.max_body;
             // Set before select() so logging() can tell no_route from no_backend.
             ctx.pool = route.pool.clone();
         }
@@ -339,7 +366,9 @@ impl ProxyHttp for KProxy {
             uri: String::new(),
             protocol: String::new(),
             user_agent: None,
-            denied: false,
+            refused: None,
+            retried_from: None,
+            max_body: None,
         }
     }
 
@@ -381,6 +410,30 @@ impl ProxyHttp for KProxy {
 
         let routing = self.routing.load();
 
+        session.set_keepalive(Some(self.downstream.keepalive.as_secs()));
+        session.set_read_timeout(Some(self.downstream.body));
+        let req = session.req_header();
+        let header_size = req.method.as_str().len()
+            + req.uri.to_string().len()
+            + req.headers.iter().map(|(k, v)| k.as_str().len() + v.len() + 4).sum::<usize>();
+        let refused = if header_size > self.downstream.max_header {
+            Some((431, "header_too_large"))
+        } else {
+            self.bind_route(session, ctx);
+            let length = session.req_header().headers.get("content-length").and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
+            ctx.max_body.zip(length).is_some_and(|(max, length)| length > max).then_some((413, "body_too_large"))
+        };
+        if let Some((status, reason)) = refused {
+            self.bind_route(session, ctx);
+            ctx.refused = Some(reason);
+            let mut resp = pingora::http::ResponseHeader::build(status, Some(2))?;
+            resp.insert_header("content-length", "0")?;
+            resp.insert_header("connection", "close")?;
+            session.set_keepalive(None);
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
+        }
+
         // Access lists, after the ACME responder so a vhost open to few
         // clients can still be validated.
         if let Some(list) = routing.access(&host, session.req_header().uri.path()) {
@@ -388,7 +441,7 @@ impl ProxyHttp for KProxy {
             let forwarded_for = session.get_header("x-forwarded-for").and_then(|v| v.to_str().ok());
             let client = ctx.client_ip.map(|peer| crate::access::client_ip(peer, forwarded_for, routing.trusted_proxies(&ctx.vhost)));
             if !client.is_some_and(|ip| list.permits(ip)) {
-                ctx.denied = true;
+                ctx.refused = Some("denied");
                 crate::metrics::record_lb_error(&ctx.pool, &ctx.vhost, "denied");
                 let mut resp = pingora::http::ResponseHeader::build(403, Some(1))?;
                 resp.insert_header("content-length", "0")?;
@@ -478,7 +531,7 @@ impl ProxyHttp for KProxy {
 
         let addr = self
             .pools
-            .select(&pool_name, &key)
+            .select_except(&pool_name, &key, ctx.retried_from)
             .ok_or_else(|| {
                 crate::metrics::record_lb_error(&pool_name, &ctx.vhost, "no_backend");
                 // No upstream failed, there is none to try: 503, not 502.
@@ -491,7 +544,14 @@ impl ProxyHttp for KProxy {
         ctx.backend = Some(addr);
         ctx.backend_started_at = Some(Instant::now());
 
-        Ok(Box::new(HttpPeer::new(addr, false, String::new())))
+        let mut peer = HttpPeer::new(addr, false, String::new());
+        if let Some(u) = self.upstream.get(&pool_name) {
+            peer.options.connection_timeout = Some(u.connect);
+            peer.options.read_timeout = Some(u.read);
+            peer.options.write_timeout = Some(u.write);
+            peer.options.idle_timeout = Some(u.idle);
+        }
+        Ok(Box::new(peer))
     }
 
     async fn upstream_request_filter(
@@ -513,6 +573,11 @@ impl ProxyHttp for KProxy {
     ) -> pingora::Result<()> {
         if let Some(b) = body {
             ctx.request_bytes += b.len();
+        }
+        // A body without Content-Length, or longer than it said.
+        if ctx.max_body.is_some_and(|max| ctx.request_bytes > max) {
+            ctx.refused = Some("body_too_large");
+            return Err(Error::explain(ErrorType::HTTPStatus(413), "request body larger than max_body_size"));
         }
         Ok(())
     }
@@ -652,8 +717,18 @@ impl ProxyHttp for KProxy {
         ctx: &mut Self::CTX,
         e: Box<Error>,
     ) -> Box<Error> {
-        if let Some(addr) = ctx.backend {
-            self.pools.report_failure(&ctx.pool, addr, "connect");
+        let Some(addr) = ctx.backend else { return e };
+        self.pools.report_failure(&ctx.pool, addr, "connect");
+        // Once, on another backend: nothing reached this one.
+        let retry = self.upstream.get(&ctx.pool).is_some_and(|u| u.retry);
+        if retry && ctx.retried_from.is_none() && self.pools.has_available_except(&ctx.pool, addr) {
+            self.pools.release(&ctx.pool, addr);
+            ctx.backend = None;
+            ctx.retried_from = Some(addr);
+            crate::metrics::record_upstream_retry(&ctx.pool);
+            let mut e = e;
+            e.set_retry(true);
+            return e;
         }
         e
     }
@@ -671,6 +746,24 @@ impl ProxyHttp for KProxy {
             self.pools.report_success(&ctx.pool, addr);
         }
         Ok(())
+    }
+
+    /// Pingora's mapping, except that a backend that timed out is 504.
+    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> pingora::proxy::FailToProxy {
+        use pingora::{ErrorSource, ErrorType::*};
+        let code = match (e.etype(), e.esource()) {
+            (HTTPStatus(code), _) => *code,
+            (ConnectTimedout | ReadTimedout | WriteTimedout, ErrorSource::Upstream) => 504,
+            (_, ErrorSource::Upstream) => 502,
+            // The client's connection is gone: nothing to answer.
+            (WriteError | ReadError | ConnectionClosed, ErrorSource::Downstream) => 0,
+            (_, ErrorSource::Downstream) => 400,
+            _ => 500,
+        };
+        if code > 0 {
+            let _ = session.respond_error(code).await;
+        }
+        pingora::proxy::FailToProxy { error_code: code, can_reuse_downstream: false }
     }
 
     async fn logging(
@@ -713,8 +806,8 @@ impl ProxyHttp for KProxy {
             return;
         }
 
-        let error_str: Option<String> = if ctx.denied {
-            Some("denied".into())
+        let error_str: Option<String> = if let Some(refused) = ctx.refused {
+            Some(refused.into())
         } else if ctx.pool.is_empty() {
             Some("no_route".into())
         } else if backend.is_none() {
@@ -1061,7 +1154,23 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         cert_store: Arc::clone(&cert_store),
         last: std::sync::Mutex::new(None),
     };
+    let upstream = cfg
+        .pools
+        .iter()
+        .map(|(name, p)| {
+            let u = Upstream { connect: p.connect_timeout, read: p.read_timeout, write: p.write_timeout, idle: p.idle_timeout, retry: p.retry };
+            (name.clone(), u)
+        })
+        .collect();
+    let downstream = Downstream {
+        keepalive: cfg.keel.keepalive_timeout,
+        body: cfg.keel.body_timeout,
+        // Validated: the size parses.
+        max_header: crate::cache::parse_size(&cfg.keel.max_header_size).unwrap_or(64 * 1024),
+    };
     let proxy = KProxy {
+        upstream: Arc::new(upstream),
+        downstream,
         routing,
         pools: Arc::clone(&pools),
         access_logger,
@@ -1274,6 +1383,7 @@ fn add_l4_services(
             }
         };
         info!(address = l.address, pool, mode = ?l.tls_mode, "adding TCP listener");
+        let connect_timeout = cfg.pools[&pool].connect_timeout;
         let app = crate::l4::TcpProxyApp {
             listener: l.address.clone(),
             pool,
@@ -1284,6 +1394,8 @@ fn add_l4_services(
             client_tls,
             proxy_protocol: l.proxy_protocol,
             routing: Arc::clone(routing),
+            connect_timeout,
+            idle_timeout: l.idle_timeout.unwrap_or(std::time::Duration::from_secs(3600)),
         };
         let mut svc = pingora::services::listening::Service::new(
             format!("tcp-{}", l.address),
