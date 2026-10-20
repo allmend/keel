@@ -1,6 +1,7 @@
 //! Synchronous control client: sends one request over any `Read + Write`
-//! stream and renders the response for a terminal. Used by `keel` (over the
-//! local Unix socket) and `keelctl` (over mTLS TCP).
+//! stream and renders the response for a terminal, or with `json` prints its
+//! `data` as one JSON line. Used by `keel` (over the local Unix socket) and
+//! `keelctl` (over mTLS TCP).
 
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -30,10 +31,14 @@ fn require_ok(val: serde_json::Value) -> Result<serde_json::Value> {
     Ok(val["data"].clone())
 }
 
-// Commands (print human output to stdout)
+// Commands (print human output, or JSON, to stdout)
 
-pub fn status<S: Read + Write>(stream: &mut S) -> Result<()> {
+pub fn status<S: Read + Write>(stream: &mut S, json: bool) -> Result<()> {
     let data = one_shot(stream, &ControlRequest::Status)?;
+    if json {
+        println!("{data}");
+        return Ok(());
+    }
 
     let uptime = data["uptime_secs"].as_u64().unwrap_or(0);
     println!("keel — uptime {}", format_duration(uptime));
@@ -58,8 +63,12 @@ pub fn status<S: Read + Write>(stream: &mut S) -> Result<()> {
     Ok(())
 }
 
-pub fn backend_list<S: Read + Write>(stream: &mut S, pool: &str) -> Result<()> {
+pub fn backend_list<S: Read + Write>(stream: &mut S, pool: &str, json: bool) -> Result<()> {
     let data = one_shot(stream, &ControlRequest::BackendList { pool: pool.to_owned() })?;
+    if json {
+        println!("{data}");
+        return Ok(());
+    }
 
     let name = data["pool"].as_str().unwrap_or(pool);
     let backends = data["backends"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
@@ -73,10 +82,11 @@ pub fn backend_list<S: Read + Write>(stream: &mut S, pool: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn backend_drain<S: Read + Write>(stream: &mut S, address: &str, wait: bool) -> Result<()> {
+/// With `json`, one line per response: the drain, then each status update.
+pub fn backend_drain<S: Read + Write>(stream: &mut S, address: &str, wait: bool, json: bool) -> Result<()> {
     let request = ControlRequest::BackendDrain { address: address.to_owned(), wait };
-    let json = serde_json::to_string(&request)?;
-    stream.write_all(json.as_bytes())?;
+    let line = serde_json::to_string(&request)?;
+    stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
@@ -97,6 +107,13 @@ pub fn backend_drain<S: Read + Write>(stream: &mut S, address: &str, wait: bool)
         }
 
         let data = &val["data"];
+        if json {
+            println!("{data}");
+            if data["done"].as_bool() == Some(true) {
+                return Ok(());
+            }
+            continue;
+        }
         if first {
             // Initial response: lists the pools affected
             let pools: Vec<&str> = data["pools"]
@@ -142,8 +159,12 @@ pub fn backend_drain<S: Read + Write>(stream: &mut S, address: &str, wait: bool)
     Ok(())
 }
 
-pub fn cluster_status<S: Read + Write>(stream: &mut S) -> Result<()> {
+pub fn cluster_status<S: Read + Write>(stream: &mut S, json: bool) -> Result<()> {
     let data = one_shot(stream, &ControlRequest::ClusterStatus)?;
+    if json {
+        println!("{data}");
+        return Ok(());
+    }
 
     let role = data["role"].as_str().unwrap_or("?");
     let node_id = data["node_id"].as_u64().unwrap_or(0);
@@ -180,8 +201,12 @@ pub fn config_applied<S: Read + Write>(stream: &mut S) -> Result<(String, crate:
 }
 
 /// Commands whose response is a single `message` string.
-pub fn message<S: Read + Write>(stream: &mut S, request: &ControlRequest) -> Result<()> {
+pub fn message<S: Read + Write>(stream: &mut S, request: &ControlRequest, json: bool) -> Result<()> {
     let data = one_shot(stream, request)?;
+    if json {
+        println!("{data}");
+        return Ok(());
+    }
     println!("{}", data["message"].as_str().unwrap_or("done"));
     Ok(())
 }

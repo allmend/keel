@@ -19,8 +19,8 @@ COPY tests/e2e ./tests/e2e
 ARG CARGO_BUILD_JOBS=3
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --bin keel \
-    && cp target/debug/keel /keel
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build -p keel -p keelctl \
+    && cp target/debug/keel /keel && cp target/debug/keelctl /keelctl
 
 FROM debian:bookworm-slim
 
@@ -31,5 +31,6 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin keel-control
 
 COPY --from=builder /keel /usr/local/bin/keel
+COPY --from=builder /keelctl /usr/local/bin/keelctl
 
 ENTRYPOINT ["/usr/local/bin/keel"]

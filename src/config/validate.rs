@@ -27,6 +27,8 @@ pub struct Options {
     pub write: bool,
     pub check: bool,
     pub color: bool,
+    /// One JSON object on stdout instead of text.
+    pub json: bool,
 }
 
 /// Run `keel config validate`; returns the exit status.
@@ -34,9 +36,14 @@ pub fn run(opts: &Options) -> Result<i32> {
     let out = Paint { on: opts.color && std::io::stdout().is_terminal() };
     let err = Paint { on: opts.color && std::io::stderr().is_terminal() };
     let fail = |e: anyhow::Error| {
-        eprintln!("{}", err.red(&format!("{e:#}")));
+        if opts.json {
+            println!("{}", serde_json::json!({ "valid": false, "error": format!("{e:#}") }));
+        } else {
+            eprintln!("{}", err.red(&format!("{e:#}")));
+        }
         Ok(INVALID)
     };
+    let mut report = serde_json::Map::new();
 
     let node_file = match super::read_node_file(&opts.node) {
         Ok(text) => text,
@@ -52,7 +59,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     if Path::new(&opts.node).exists() {
         targets.insert(0, PathBuf::from(&opts.node));
     }
-    let mut unformatted = false;
+    let mut unformatted = Vec::new();
     for file in &targets {
         let name = file.display().to_string();
         let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {name}"))?;
@@ -61,13 +68,13 @@ pub fn run(opts: &Options) -> Result<i32> {
         if fixed == text {
             continue;
         }
-        if opts.list {
+        if opts.list && !opts.json {
             println!("{name}");
         }
         if opts.write {
             std::fs::write(file, &fixed).with_context(|| format!("cannot write {name}"))?;
         } else {
-            unformatted = true;
+            unformatted.push(name);
         }
     }
 
@@ -83,28 +90,47 @@ pub fn run(opts: &Options) -> Result<i32> {
     };
 
     if opts.full {
+        let mut loaded = Vec::new();
         if !node_file.is_empty() {
-            print_file(&out, &opts.node, &node_file);
+            loaded.push((opts.node.clone(), node_file.as_str()));
         }
         for (path, text) in super::config_files(&files)? {
-            print_file(&out, &dir.join(path).display().to_string(), text);
+            loaded.push((dir.join(path).display().to_string(), text));
+        }
+        if opts.json {
+            report.insert("files".into(), loaded.iter().map(|(path, text)| serde_json::json!({ "path": path, "text": text })).collect());
+        } else {
+            for (path, text) in &loaded {
+                print_file(&out, path, text);
+            }
         }
     }
 
     if opts.diff {
         match applied(&opts.socket) {
             Ok((applied_node, applied_files)) => {
-                print!("{}", diff(&out, &format!("applied/{}", node_name(&opts.node)), &opts.node, &applied_node, &node_file));
+                let out = if opts.json { Paint { on: false } } else { out };
+                let mut text = diff(&out, &format!("applied/{}", node_name(&opts.node)), &opts.node, &applied_node, &node_file);
                 let paths: BTreeSet<&String> = applied_files.keys().chain(files.keys()).collect();
                 for path in paths {
                     let old = applied_files.get(path).map_or("", String::as_str);
                     let new = files.get(path).map_or("", String::as_str);
-                    print!("{}", diff(&out, &format!("applied/{path}"), &dir.join(path).display().to_string(), old, new));
+                    text += &diff(&out, &format!("applied/{path}"), &dir.join(path).display().to_string(), old, new);
+                }
+                if opts.json {
+                    report.insert("diff".into(), text.into());
+                } else {
+                    print!("{text}");
                 }
                 match super::assemble(&applied_node, &applied_files) {
                     Ok(old) => {
-                        for (restart, what) in changes(&old, &cfg, applied_node != node_file) {
-                            let tag = if restart { out.yellow("restart") } else { out.green("reload ") };
+                        let changes = changes(&old, &cfg, applied_node != node_file);
+                        if opts.json {
+                            let changes = changes.iter().map(|(restart, what)| serde_json::json!({ "restart": restart, "change": what }));
+                            report.insert("changes".into(), changes.collect());
+                        }
+                        for (restart, what) in changes.iter().filter(|_| !opts.json) {
+                            let tag = if *restart { out.yellow("restart") } else { out.green("reload ") };
                             println!("{tag} {what}");
                         }
                     }
@@ -115,7 +141,13 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
     }
 
-    Ok(if opts.check && unformatted { NOT_FORMATTED } else { 0 })
+    let status = if opts.check && !unformatted.is_empty() { NOT_FORMATTED } else { 0 };
+    if opts.json {
+        report.insert("valid".into(), true.into());
+        report.insert("unformatted".into(), unformatted.into());
+        println!("{}", serde_json::Value::Object(report));
+    }
+    Ok(status)
 }
 
 /// What the running node serves: its node file and config files.

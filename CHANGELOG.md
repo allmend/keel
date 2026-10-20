@@ -14,6 +14,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
   listeners. HTTP answers 403, TCP closes, UDP drops; error `denied`.
   Behind `trusted_proxies` the client is the last untrusted
   `X-Forwarded-For` hop. Applied live on push.
+- `-o json` on every `keel` and `keelctl` client command, `config validate`
+  and `credentials create`: one JSON object per line.
 
 ### Changed
 

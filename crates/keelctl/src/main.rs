@@ -25,8 +25,19 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
+    /// Output format
+    #[arg(short, long, global = true, value_enum, default_value_t = Output::Text)]
+    output: Output,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum Output {
+    Text,
+    /// The response data as JSON, one object per line
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -112,37 +123,38 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let kc = Keelconfig::load(cli.config.as_deref())?;
     let mut stream = connect(&kc)?;
+    let json = cli.output == Output::Json;
 
     match &cli.command {
-        Command::Status => client::status(&mut stream),
+        Command::Status => client::status(&mut stream, json),
         Command::Backend { command } => match command {
-            BackendCommand::List { pool } => client::backend_list(&mut stream, pool),
+            BackendCommand::List { pool } => client::backend_list(&mut stream, pool, json),
             BackendCommand::Drain { address, wait } => {
-                client::backend_drain(&mut stream, address, *wait)
+                client::backend_drain(&mut stream, address, *wait, json)
             }
             BackendCommand::Activate { address } => {
-                client::message(&mut stream, &ControlRequest::BackendActivate { address: address.clone() })
+                client::message(&mut stream, &ControlRequest::BackendActivate { address: address.clone() }, json)
             }
         },
         Command::Config { command } => match command {
-            ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload),
+            ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload, json),
             ConfigCommand::Push { file } => {
                 let files = keel_control::push_file_set(std::path::Path::new(file))?;
-                client::message(&mut stream, &ControlRequest::ConfigPush { files })
+                client::message(&mut stream, &ControlRequest::ConfigPush { files }, json)
             }
         },
         Command::Cluster { command } => match command {
-            ClusterCommand::Status => client::cluster_status(&mut stream),
-            ClusterCommand::Demote => client::message(&mut stream, &ControlRequest::ClusterDemote),
+            ClusterCommand::Status => client::cluster_status(&mut stream, json),
+            ClusterCommand::Demote => client::message(&mut stream, &ControlRequest::ClusterDemote, json),
             ClusterCommand::Stepdown { force } => {
-                client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force })
+                client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force }, json)
             }
             ClusterCommand::Remove { node_id } => {
-                client::message(&mut stream, &ControlRequest::ClusterRemove { node_id: *node_id })
+                client::message(&mut stream, &ControlRequest::ClusterRemove { node_id: *node_id }, json)
             }
         },
         Command::Credentials { command: CredentialsCommand::RevokeAll } => {
-            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll)
+            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll, json)
         }
     }
 }

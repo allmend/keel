@@ -47,7 +47,10 @@ keelctl config reload
 keelctl config push ./config
 keelctl cluster status
 keelctl cluster stepdown
+keelctl -o json status
 ```
+
+`-o json` prints the same objects as `keel`; see [JSON output](cli.md#json-output).
 
 The keelconfig is found in this order:
 

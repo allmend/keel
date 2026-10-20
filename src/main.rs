@@ -46,8 +46,19 @@ struct Cli {
     #[arg(long, global = true, env = "NO_COLOR", value_parser = clap::builder::FalseyValueParser::new())]
     no_color: bool,
 
+    /// Output format
+    #[arg(short, long, global = true, value_enum, default_value_t = Output::Text)]
+    output: Output,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum Output {
+    Text,
+    /// The response data as JSON, one object per line
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -214,44 +225,46 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
                 write: *write,
                 check: *check,
                 color: !cli.no_color,
+                json: cli.output == Output::Json,
             };
             std::process::exit(config::validate::run(&opts)?);
         }
         _ => {}
     }
 
+    let json = cli.output == Output::Json;
     let mut stream = connect_socket(&cli.socket)?;
     match cmd {
-        Command::Status => client::status(&mut stream),
+        Command::Status => client::status(&mut stream, json),
         Command::Backend { command } => match command {
-            BackendCommand::List { pool } => client::backend_list(&mut stream, pool),
+            BackendCommand::List { pool } => client::backend_list(&mut stream, pool, json),
             BackendCommand::Drain { address, wait } => {
-                client::backend_drain(&mut stream, address, *wait)
+                client::backend_drain(&mut stream, address, *wait, json)
             }
             BackendCommand::Activate { address } => {
-                client::message(&mut stream, &ControlRequest::BackendActivate { address: address.clone() })
+                client::message(&mut stream, &ControlRequest::BackendActivate { address: address.clone() }, json)
             }
         },
         Command::Config { command } => match command {
-            ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload),
+            ConfigCommand::Reload => client::message(&mut stream, &ControlRequest::ConfigReload, json),
             ConfigCommand::Push { file } => {
                 let files = keel_control::push_file_set(std::path::Path::new(file))?;
-                client::message(&mut stream, &ControlRequest::ConfigPush { files })
+                client::message(&mut stream, &ControlRequest::ConfigPush { files }, json)
             }
             ConfigCommand::Validate { .. } => unreachable!(),
         },
-        Command::Cluster { command: ClusterCommand::Status } => client::cluster_status(&mut stream),
+        Command::Cluster { command: ClusterCommand::Status } => client::cluster_status(&mut stream, json),
         Command::Cluster { command: ClusterCommand::Demote } => {
-            client::message(&mut stream, &ControlRequest::ClusterDemote)
+            client::message(&mut stream, &ControlRequest::ClusterDemote, json)
         }
         Command::Cluster { command: ClusterCommand::Stepdown { force } } => {
-            client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force })
+            client::message(&mut stream, &ControlRequest::ClusterStepdown { force: *force }, json)
         }
         Command::Cluster { command: ClusterCommand::Remove { node_id } } => {
-            client::message(&mut stream, &ControlRequest::ClusterRemove { node_id: *node_id })
+            client::message(&mut stream, &ControlRequest::ClusterRemove { node_id: *node_id }, json)
         }
         Command::Credentials { command: CredentialsCommand::RevokeAll } => {
-            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll)
+            client::message(&mut stream, &ControlRequest::CredentialsRevokeAll, json)
         }
         Command::Credentials { command: CredentialsCommand::Create { .. } } => unreachable!(),
     }
@@ -287,6 +300,10 @@ fn cli_credentials_create(cli: &Cli, name: &str, endpoint: &str) -> Result<()> {
         client_key,
     };
 
+    if cli.output == Output::Json {
+        println!("{}", serde_json::to_string(&kc)?);
+        return Ok(());
+    }
     eprintln!("# keelconfig for '{name}' — contains a private key, store it like one.");
     eprintln!("# Save as ~/.keel/config (or point KEEL_CONFIG at it) and run: keelctl status");
     print!("{}", kc.to_hcl()?);

@@ -10,6 +10,25 @@
 | `--socket <path>` | `/var/run/keel/keel.sock` | Control socket, for client commands |
 | `--force-new-cluster` | off | Make this node the only member, keeping its state; see [Forced recovery](cluster.md#forced-recovery) |
 | `--no-color` | off | No colors in any output, logs included. `NO_COLOR` does the same |
+| `-o`, `--output <text\|json>` | `text` | Client commands and local tools; see [JSON output](#json-output) |
+
+## JSON output
+
+`-o json` prints one JSON object per line on stdout, for every client command and local tool, on `keel` and `keelctl` alike. Errors go to stderr with a non-zero exit, as in text mode. Fields:
+
+| Command | Object |
+|---|---|
+| `status` | `uptime_secs`, `pools`: `[{name, backends}]` |
+| `backend list` | `pool`, `backends` |
+| `backend drain` | `pools`, `workers`, `workers_acknowledged`, `done`; with `--wait` then one `{connections, done}` per update until `done` |
+| `backend activate` | `pools` |
+| `cluster status` | `node_id`, `role`, `term`, `leader_id`, `last_committed`, `membership`: `[{id, addr, role}]` |
+| `config push` | `message`, `version` |
+| `config reload`, `cluster demote`, `cluster stepdown`, `cluster remove`, `credentials revoke-all` | `message` |
+| `config validate` | `valid`, `error` when not, `unformatted` (files), `files` with `--full` (`[{path, text}]`), `diff` and `changes` with `--diff` (`[{restart, change}]`) |
+| `credentials create` | `endpoint`, `ca_cert`, `client_cert`, `client_key` |
+
+A backend is `{address, state, health, health_reason, connections}`. `state` is `active`, `draining` or `removed`; `health` is `healthy`, `unhealthy`, `ejected` or `unchecked`; `health_reason` is `null` or why.
 
 ## Control socket
 
