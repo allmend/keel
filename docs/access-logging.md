@@ -80,6 +80,7 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 |---|---|
 | `no_route` | No vhost or route matched, or Keel answered itself |
 | `no_backend` | No available backend in the pool; Keel answered 503 |
+| `denied` | An access list turned the client away; Keel answered 403 |
 | `upstream_connect` | Connecting to the backend failed; Keel answered 502 |
 | `upstream_timeout` | The backend did not answer in time |
 | `upstream` | The backend's connection failed after it was established |
@@ -118,7 +119,7 @@ One entry per connection, written when it closes:
 | `bytes_in`, `bytes_out` | Application bytes from and to the client |
 | `duration_ms` | Accept to close |
 | `tls_sni`, `tls_version`, `tls_cipher` | When Keel terminates TLS; `null` otherwise |
-| `error` | `null`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
+| `error` | `null`, `denied`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
 
 ## UDP
 
@@ -146,6 +147,6 @@ One entry per flow, written when it ends:
 | `backend_addr` | `null` with `no_backend` and `flow_limit` |
 | `packets_in`, `packets_out` | Datagrams from and to the client |
 | `duration_ms` | First datagram to expiry, so it includes `keel.udp_flow_timeout` |
-| `error` | `null` (expired), `no_backend`, `flow_limit`, `upstream_bind`, `upstream_send`, `upstream_recv` (ICMP port-unreachable from the backend), `downstream_send`, `shutdown` |
+| `error` | `null` (expired), `denied`, `no_backend`, `flow_limit`, `upstream_bind`, `upstream_send`, `upstream_recv` (ICMP port-unreachable from the backend), `downstream_send`, `shutdown` |
 
 Datagrams dropped without a flow, `no_backend` and `flow_limit`, are logged once a second per listener and reason: `packets_in` and `bytes_in` are the datagrams and bytes dropped in that time, `client_addr` the last client, and `duration_ms` the time since the first drop.

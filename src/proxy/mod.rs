@@ -71,6 +71,8 @@ pub struct ProxyCtx {
     uri: String,
     protocol: String,
     user_agent: Option<String>,
+    /// Turned away by an access list.
+    denied: bool,
 }
 
 // Proxy implementation
@@ -337,13 +339,14 @@ impl ProxyHttp for KProxy {
             uri: String::new(),
             protocol: String::new(),
             user_agent: None,
+            denied: false,
         }
     }
 
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
 
@@ -377,6 +380,22 @@ impl ProxyHttp for KProxy {
         let host = requested_host_or(session.req_header(), "*").to_owned();
 
         let routing = self.routing.load();
+
+        // Access lists, after the ACME responder so a vhost open to few
+        // clients can still be validated.
+        if let Some(list) = routing.access(&host, session.req_header().uri.path()) {
+            self.bind_route(session, ctx);
+            let forwarded_for = session.get_header("x-forwarded-for").and_then(|v| v.to_str().ok());
+            let client = ctx.client_ip.map(|peer| crate::access::client_ip(peer, forwarded_for, routing.trusted_proxies(&ctx.vhost)));
+            if !client.is_some_and(|ip| list.permits(ip)) {
+                ctx.denied = true;
+                crate::metrics::record_lb_error(&ctx.pool, &ctx.vhost, "denied");
+                let mut resp = pingora::http::ResponseHeader::build(403, Some(1))?;
+                resp.insert_header("content-length", "0")?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
+        }
 
         // Default action: the matching vhost answers directly, no pool involved
         // (IP-direct redirect, unknown-host 404, maintenance page). Applies on
@@ -694,7 +713,9 @@ impl ProxyHttp for KProxy {
             return;
         }
 
-        let error_str: Option<String> = if ctx.pool.is_empty() {
+        let error_str: Option<String> = if ctx.denied {
+            Some("denied".into())
+        } else if ctx.pool.is_empty() {
             Some("no_route".into())
         } else if backend.is_none() {
             Some("no_backend".into())
@@ -1031,8 +1052,8 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         }
     };
 
-    add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store);
-    add_udp_services(&mut server, cfg, &pools, &access_logger, inherited.as_mut().map(|w| &mut w.udp));
+    add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store, &routing);
+    add_udp_services(&mut server, cfg, &pools, &access_logger, &routing, inherited.as_mut().map(|w| &mut w.udp));
 
     let applier = WorkerApplier {
         routing: Arc::clone(&routing),
@@ -1217,6 +1238,7 @@ fn add_l4_services(
     pools: &Arc<crate::backend::PoolRegistry>,
     access_logger: &Arc<AccessLogger>,
     cert_store: &Arc<CertStore>,
+    routing: &Arc<ArcSwap<RoutingTable>>,
 ) {
     use crate::config::TlsMode;
 
@@ -1261,6 +1283,7 @@ fn add_l4_services(
             server_tls,
             client_tls,
             proxy_protocol: l.proxy_protocol,
+            routing: Arc::clone(routing),
         };
         let mut svc = pingora::services::listening::Service::new(
             format!("tcp-{}", l.address),
@@ -1280,6 +1303,7 @@ fn add_udp_services(
     cfg: &Config,
     pools: &Arc<crate::backend::PoolRegistry>,
     access_logger: &Arc<AccessLogger>,
+    routing: &Arc<ArcSwap<RoutingTable>>,
     mut inherited: Option<&mut HashMap<String, std::net::UdpSocket>>,
 ) {
     for l in cfg.listeners.iter() {
@@ -1295,6 +1319,7 @@ fn add_udp_services(
             max_flows: cfg.keel.udp_max_flows,
             socket,
             proxy_protocol: l.proxy_protocol,
+            routing: Arc::clone(routing),
         };
         server.add_service(background_service(&format!("udp-{}", l.address), svc));
     }

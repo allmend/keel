@@ -8,6 +8,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `allow` and `deny` client lists on vhosts, routes and `tcp`/`udp`
+  listeners. HTTP answers 403, TCP closes, UDP drops; error `denied`.
+  Behind `trusted_proxies` the client is the last untrusted
+  `X-Forwarded-For` hop. Applied live on push.
+
 ### Changed
 
 - **Breaking: addresses are `ip:port`.** Backends, listeners, `metrics`,

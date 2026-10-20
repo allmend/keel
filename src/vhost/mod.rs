@@ -1,3 +1,4 @@
+use crate::access::AccessList;
 use crate::config::{Config, DefaultAction, ForwardedHeadersConfig, VhostCacheConfig};
 use std::collections::{HashMap, HashSet};
 
@@ -6,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 /// Resolution order:
 ///  1. Exact host match, longest path-prefix match
 ///  2. Wildcard host ("*"), longest path-prefix match
+#[derive(Default)]
 pub struct RoutingTable {
     /// host → routes sorted by path prefix length descending
     vhosts: HashMap<String, Vec<Route>>,
@@ -19,6 +21,12 @@ pub struct RoutingTable {
     default_actions: HashMap<String, DefaultAction>,
     /// Where HTTP-01 tokens are served from; `None` when the config uses no ACME.
     acme_challenge_dir: Option<std::path::PathBuf>,
+    /// host → the vhost's access list, for requests no route takes.
+    access: HashMap<String, AccessList>,
+    /// host → `forwarded_headers.trusted_proxies`, parsed.
+    trusted: HashMap<String, Vec<ipnet::IpNet>>,
+    /// `tcp` and `udp` listener address → its access list.
+    listener_access: HashMap<String, AccessList>,
 }
 
 pub struct Route {
@@ -28,6 +36,8 @@ pub struct Route {
     pub series: std::sync::Arc<crate::metrics::RequestSeries>,
     /// Route-level cache config — overrides the vhost-level config when present.
     cache: Option<VhostCacheConfig>,
+    /// The route's access list, else its vhost's.
+    pub access: Option<AccessList>,
 }
 
 impl RoutingTable {
@@ -37,9 +47,14 @@ impl RoutingTable {
         let mut cache: HashMap<String, VhostCacheConfig> = HashMap::new();
         let mut redirect_http: HashSet<String> = HashSet::new();
         let mut default_actions: HashMap<String, DefaultAction> = HashMap::new();
+        let mut access: HashMap<String, AccessList> = HashMap::new();
+        let mut trusted: HashMap<String, Vec<ipnet::IpNet>> = HashMap::new();
+        // Validated: the lists parse.
+        let list = |allow: &[String], deny: &[String]| AccessList::new(allow, deny).ok().flatten();
 
         for vhost in &cfg.vhosts {
             let routes = vhosts.entry(vhost.host.clone()).or_default();
+            let vhost_access = list(&vhost.allow, &vhost.deny);
 
             if vhost.routes.is_empty() {
                 // Single pool for the whole vhost — treat as "/"
@@ -49,6 +64,7 @@ impl RoutingTable {
                         pool: pool.clone(),
                         series: std::sync::Arc::new(crate::metrics::RequestSeries::new(pool, &vhost.host)),
                         cache: None,
+                        access: vhost_access.clone(),
                     });
                 }
             } else {
@@ -58,6 +74,7 @@ impl RoutingTable {
                         pool: r.pool.clone(),
                         series: std::sync::Arc::new(crate::metrics::RequestSeries::new(&r.pool, &vhost.host)),
                         cache: r.cache.clone(),
+                        access: list(&r.allow, &r.deny).or_else(|| vhost_access.clone()),
                     });
                 }
             }
@@ -67,6 +84,13 @@ impl RoutingTable {
 
             if let Some(fwd) = &vhost.forwarded_headers {
                 forwarded.insert(vhost.host.clone(), fwd.clone());
+                let nets: Vec<_> = fwd.trusted_proxies.iter().filter_map(|n| crate::access::parse_net(n).ok()).collect();
+                if !nets.is_empty() {
+                    trusted.insert(vhost.host.clone(), nets);
+                }
+            }
+            if let Some(a) = vhost_access {
+                access.insert(vhost.host.clone(), a);
             }
 
             if let Some(cc) = &vhost.cache {
@@ -82,8 +106,36 @@ impl RoutingTable {
             }
         }
 
+        let listener_access = cfg
+            .listeners
+            .iter()
+            .filter_map(|l| Some((l.address.clone(), list(&l.allow, &l.deny)?)))
+            .collect();
         let acme_challenge_dir = cfg.acme_effective().map(|_| crate::acme::challenge_dir(&cfg.keel));
-        RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions, acme_challenge_dir }
+        RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions, acme_challenge_dir, access, trusted, listener_access }
+    }
+
+    /// The access list for a request: its route's, else its vhost's.
+    pub fn access(&self, host: &str, path: &str) -> Option<&AccessList> {
+        let vhost = self.vhost_label(host);
+        // A vhost answering with its default action takes no route.
+        if vhost.is_some_and(|v| self.default_actions.contains_key(v)) {
+            return vhost.and_then(|v| self.access.get(v));
+        }
+        match self.resolve(host, path) {
+            Some(route) => route.access.as_ref(),
+            None => vhost.and_then(|v| self.access.get(v)),
+        }
+    }
+
+    /// The vhost's trusted proxies, by vhost label.
+    pub fn trusted_proxies(&self, vhost: &str) -> &[ipnet::IpNet] {
+        self.trusted.get(vhost).map_or(&[], Vec::as_slice)
+    }
+
+    /// The access list of a `tcp` or `udp` listener.
+    pub fn listener_access(&self, address: &str) -> Option<&AccessList> {
+        self.listener_access.get(address)
     }
 
     pub fn acme_challenge_dir(&self) -> Option<&std::path::Path> {
@@ -245,6 +297,8 @@ mod tests {
             cache: None,
             redirect_http: None,
             default_action: None,
+            allow: vec![],
+            deny: vec![],
         }
     }
 
@@ -272,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    fn a_route_list_replaces_its_vhosts() {
+        let cfg = crate::config::parse(
+            "pool \"web\" {\n  backend \"10.0.0.1:80\" {}\n}\n\
+             listener \"tcp\" \"0.0.0.0:22\" {\n  pool = \"web\"\n  allow = [\"10.0.0.0/8\"]\n}\n\
+             vhost \"a.test\" {\n  allow = [\"10.0.0.0/8\"]\n\n  route \"/\" {\n    pool = \"web\"\n  }\n\n  \
+             route \"/open/\" {\n    pool = \"web\"\n    deny = [\"192.0.2.1\"]\n  }\n}\n\
+             vhost \"*\" {\n  deny = [\"10.0.0.0/8\"]\n\n  default_action {\n    status = 404\n  }\n}\n",
+        )
+        .unwrap();
+        let t = RoutingTable::build(&cfg);
+        let permits = |host: &str, path: &str, ip: &str| t.access(host, path).is_none_or(|l| l.permits(ip.parse().unwrap()));
+        assert!(permits("a.test", "/", "10.1.1.1") && !permits("a.test", "/", "192.0.2.2"));
+        assert!(permits("a.test", "/open/x", "192.0.2.2") && !permits("a.test", "/open/x", "192.0.2.1"));
+        assert!(!permits("other.test", "/", "10.1.1.1") && permits("other.test", "/", "192.0.2.2"));
+        assert!(t.listener_access("0.0.0.0:22").is_some_and(|l| !l.permits("192.0.2.2".parse().unwrap())));
+    }
+
+    #[test]
     fn exact_host_match() {
         let cfg = make_config(vec![vhost("api.example.com", "api")], [pool("api")].into());
         let t = RoutingTable::build(&cfg);
@@ -286,14 +358,16 @@ mod tests {
                 host: "example.com".into(),
                 pool: None,
                 routes: vec![
-                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None },
-                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "default".into(), cache: None, allow: vec![], deny: vec![] },
+                    CfgRoute { path: "/api/".into(), pool: "api".into(), cache: None, allow: vec![], deny: vec![] },
                 ],
                 tls: None,
                 forwarded_headers: None,
                 cache: None,
                 redirect_http: None,
                 default_action: None,
+                allow: vec![],
+                deny: vec![],
             }],
             [pool("default"), pool("api")].into(),
         );
@@ -332,8 +406,10 @@ mod tests {
                             statuses: vec![200],
                             content_types: vec!["image/*".into()],
                         }),
+                        allow: vec![],
+                        deny: vec![],
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![] },
                 ],
                 tls: None,
                 forwarded_headers: None,
@@ -345,6 +421,8 @@ mod tests {
                 }),
                 redirect_http: None,
                 default_action: None,
+                allow: vec![],
+                deny: vec![],
             }],
             [pool("assets"), pool("web")].into(),
         );
@@ -372,14 +450,18 @@ mod tests {
                         path: "/api/".into(),
                         pool: "api".into(),
                         cache: Some(VhostCacheConfig { enabled: false, ..Default::default() }),
+                        allow: vec![],
+                        deny: vec![],
                     },
-                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None },
+                    CfgRoute { path: "/".into(), pool: "web".into(), cache: None, allow: vec![], deny: vec![] },
                 ],
                 tls: None,
                 forwarded_headers: None,
                 cache: Some(VhostCacheConfig { enabled: true, ttl: Some(std::time::Duration::from_secs(60)), ..Default::default() }),
                 redirect_http: None,
                 default_action: None,
+                allow: vec![],
+                deny: vec![],
             }],
             [pool("api"), pool("web")].into(),
         );

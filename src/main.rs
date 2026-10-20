@@ -1,3 +1,4 @@
+mod access;
 mod access_log;
 mod acme;
 mod backend;

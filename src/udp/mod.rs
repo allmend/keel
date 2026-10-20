@@ -61,6 +61,8 @@ pub struct UdpProxyService {
     /// Every datagram starts with a PROXY protocol v2 header (as an NLB
     /// sends for UDP); the client is the address it names.
     pub proxy_protocol: bool,
+    /// The applied routing table, for this listener's access list.
+    pub routing: Arc<arc_swap::ArcSwap<crate::vhost::RoutingTable>>,
 }
 
 /// Per-flow accounting, shared between the receive loop (client → backend)
@@ -255,6 +257,13 @@ impl UdpProxyService {
         let flow = match flows.entry(client) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
+                // Checked when a flow opens: one already open runs until it
+                // expires.
+                if self.routing.load().listener_access(&self.listener).is_some_and(|l| !l.permits(client.ip())) {
+                    crate::metrics::record_udp_error(&self.pool, "denied");
+                    drops.add("denied", client, data.len(), now);
+                    return;
+                }
                 if open >= self.max_flows {
                     // Opening one costs a socket and a task, and the worker's HTTP
                     // and TCP listeners share its descriptors. Existing flows keep

@@ -341,6 +341,10 @@ impl Config {
                 }
                 _ => {}
             }
+            if matches!(l.protocol, Protocol::Http | Protocol::Https) && !(l.allow.is_empty() && l.deny.is_empty()) {
+                anyhow::bail!("{id}: allow and deny apply to tcp and udp listeners; HTTP takes them on the vhost or route");
+            }
+            crate::access::AccessList::new(&l.allow, &l.deny).map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
             if l.protocol != Protocol::Tcp && (l.tls_mode != TlsMode::Passthrough || l.tls_host.is_some() || l.tls_verify || l.tls_ca.is_some()) {
                 anyhow::bail!("{id}: tls_mode, tls_host, tls_verify and tls_ca apply to tcp listeners only");
             }
@@ -414,6 +418,11 @@ impl Config {
             for cidr in vhost.forwarded_headers.iter().flat_map(|f| &f.trusted_proxies) {
                 cidr.parse::<ipnet::IpNet>()
                     .map_err(|e| anyhow::anyhow!("vhost '{}': forwarded_headers.trusted_proxies: invalid CIDR '{cidr}': {e}", vhost.host))?;
+            }
+            crate::access::AccessList::new(&vhost.allow, &vhost.deny).map_err(|e| anyhow::anyhow!("vhost '{}': {e}", vhost.host))?;
+            for r in &vhost.routes {
+                crate::access::AccessList::new(&r.allow, &r.deny)
+                    .map_err(|e| anyhow::anyhow!("vhost '{}': route '{}': {e}", vhost.host, r.path))?;
             }
             if vhost.pool.is_some() && !vhost.routes.is_empty() {
                 anyhow::bail!("vhost '{}': pool and route blocks exclude each other; add route \"/\" instead", vhost.host);
@@ -816,6 +825,14 @@ pub struct Listener {
     /// reencrypt with `tls_verify`: PEM bundle of additional trusted CAs.
     #[serde(default)]
     pub tls_ca: Option<String>,
+
+    /// Client networks let in; empty lets in every client not denied.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Client networks turned away, before `allow` is looked at.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 /// What a listener speaks: HTTP routed by vhost (plain or TLS-terminated),
@@ -1308,6 +1325,14 @@ pub struct Vhost {
     /// and `routes`. Typical on the `"*"` wildcard vhost: IP-direct access
     /// redirect, unknown-host 404, maintenance page.
     pub default_action: Option<DefaultAction>,
+
+    /// Client networks let in; empty lets in every client not denied.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Client networks turned away, before `allow` is looked at.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1342,6 +1367,14 @@ pub struct Route {
     pub pool: String,
     /// Per-route cache config. Overrides the vhost-level cache config when set.
     pub cache: Option<VhostCacheConfig>,
+
+    /// Client networks let in; empty lets in every client not denied.
+    #[serde(default)]
+    pub allow: Vec<String>,
+
+    /// Client networks turned away, before `allow` is looked at.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1866,6 +1899,18 @@ vhost "a.test" {
         assert_eq!(e("pool \"web\" {\n  backend \"10.0.0.1\" {}\n}\n"), "pool 'web': backend: '10.0.0.1' is not an ip:port");
         assert_eq!(e(&format!("{POOL}listener \"http\" \"localhost:80\" {{}}\n")), "listener: 'localhost:80' is not an ip:port");
         parse("pool \"web\" {\n  backend \"[2001:db8::1]:8080\" {}\n}\nlistener \"http\" \"[::]:80\" {}\n").unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn access_lists_are_networks_on_vhosts_routes_and_l4_listeners() {
+        let e = |text: &str| err(&with_pool(text));
+        assert_eq!(e("vhost \"a\" {\n  pool  = \"dns\"\n  allow = [\"nope\"]\n}\n"), "vhost 'a': 'nope' is not an IP network or address");
+        assert_eq!(
+            e("vhost \"a\" {\n  route \"/x/\" {\n    pool = \"dns\"\n    deny = [\"10.0.0.0/33\"]\n  }\n}\n"),
+            "vhost 'a': route '/x/': '10.0.0.0/33' is not an IP network or address"
+        );
+        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  allow = [\"10.0.0.0/8\"]\n}\n").contains("allow and deny apply to tcp and udp listeners"));
+        with_pool("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n  allow = [\"10.0.0.0/8\", \"2001:db8::1\"]\n}\n").validate().unwrap();
     }
 
     #[test]

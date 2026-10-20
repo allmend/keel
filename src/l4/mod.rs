@@ -50,6 +50,8 @@ pub struct TcpProxyApp {
     pub client_tls: Option<Arc<rustls::ClientConfig>>,
     /// Expect a PROXY protocol header before anything else on the stream.
     pub proxy_protocol: bool,
+    /// The applied routing table, for this listener's access list.
+    pub routing: Arc<arc_swap::ArcSwap<crate::vhost::RoutingTable>>,
 }
 
 /// What one connection did, for accounting and the access log.
@@ -266,6 +268,16 @@ impl ServerApp for TcpProxyApp {
             }
         }
 
+        if let Some(list) = self.routing.load().listener_access(&self.listener) {
+            let ip = client_addr.as_deref().and_then(|a| a.parse::<SocketAddr>().ok()).map(|a| a.ip());
+            if !ip.is_some_and(|ip| list.permits(ip)) {
+                crate::metrics::record_tcp_error(&self.pool, "denied");
+                let out = Outcome { error: Some("denied"), ..Default::default() };
+                self.log(client_addr, None, &out, started);
+                return None;
+            }
+        }
+
         // Client address doubles as the consistent-hash key (session affinity).
         let key = client_addr.clone().unwrap_or_default();
         let Some(backend) = self.pools.select(&self.pool, key.as_bytes()) else {
@@ -359,6 +371,7 @@ mod tests {
             server_tls,
             client_tls,
             proxy_protocol: false,
+            routing: Default::default(),
         })
     }
 

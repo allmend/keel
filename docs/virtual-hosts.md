@@ -117,6 +117,38 @@ listener "http" "0.0.0.0:80" {
 - A `LOCAL` (v2) or `UNKNOWN` (v1) header keeps the socket's peer as the client.
 - A connection without a valid header is closed without a response and counted in `keel_proxy_protocol_errors_total`.
 
+## Access lists
+
+`allow` and `deny` take networks or single addresses, IPv4 and IPv6, on a vhost, a route, or a `tcp` or `udp` listener.
+
+```hcl
+vhost "admin.example.com" {
+  allow = ["10.0.0.0/8", "2001:db8::/32"]
+  deny  = ["10.0.66.0/24"]
+
+  route "/" {
+    pool = "admin"
+  }
+
+  route "/health" {
+    pool  = "admin"
+    allow = ["0.0.0.0/0", "::/0"]
+  }
+}
+
+listener "tcp" "0.0.0.0:5432" {
+  pool  = "postgres"
+  allow = ["10.1.0.0/16"]
+}
+```
+
+- `deny` first. Then, if `allow` lists anything, only those clients.
+- A route with a list of its own uses it instead of the vhost's.
+- HTTP answers `403`, TCP closes the connection, UDP drops the datagram. Each is logged and counted with error `denied`.
+- The client is the PROXY protocol address when the listener reads one. When that client is in the vhost's `trusted_proxies`, it is the last `X-Forwarded-For` address that is not.
+- A push applies them live. Open TCP connections and UDP flows are not cut; HTTP checks every request.
+- ACME challenges are answered before the check.
+
 ## HTTP to HTTPS redirect
 
 `redirect_http = true` answers plain HTTP for the host with a 301 to `https://<host><path>?<query>`. Default `false`, `true` for ACME vhosts. On `vhost "*"` it applies to every host no other vhost matches.

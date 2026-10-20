@@ -184,6 +184,7 @@ listener "tcp" "0.0.0.0:53" {
 |---|---|---|---|
 | `pool` | string | none | `tcp` and `udp`: the pool to forward to; required. Refused on `http` and `https`, which route by vhost |
 | `proxy_protocol` | bool | `false` | Expect a PROXY protocol v1/v2 header from the load balancer in front and take the client address from it. Every protocol. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
+| `allow`, `deny` | list | none | `tcp` and `udp`: client networks or addresses. See [Access lists](virtual-hosts.md#access-lists) |
 | `tls_mode` | string | `passthrough` | `tcp` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-modes) |
 | `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificate` block or a vhost with `tls`, served when the client's SNI has no certificate of its own |
 | `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's IP |
@@ -336,13 +337,14 @@ vhost "*" {
 | Attribute | Type | Default | Notes |
 |---|---|---|---|
 | `pool` | string | none | The pool for every path. Excludes `route` blocks |
-| `route "<path>"` | block | none | Path-prefix routing with a `pool` each; see [Virtual hosts](virtual-hosts.md#path-routing). Excludes `pool` |
+| `route "<path>"` | block | none | Path-prefix routing with a `pool` each, and optional `cache`, `allow` and `deny`; see [Virtual hosts](virtual-hosts.md#path-routing). Excludes `pool` |
+| `allow`, `deny` | list | none | Client networks or addresses; see [Access lists](virtual-hosts.md#access-lists) |
 | `tls.cert` | string | none | PEM certificate (BYO cert). A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
 | `tls.key` | string | none | PEM private key (BYO cert), same resolution as `tls.cert` |
 | `tls.acme` | bool or string | `false` | `true` = ACME via issuer `default`; a string names an `acme` issuer — see [ACME](acme.md) |
 | `redirect_http` | bool | `false` (`true` when `tls.acme`) | 301 plain HTTP to HTTPS |
 | `forwarded_headers.mode` | string | `replace` | `replace`, `append`, or `off` |
-| `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode |
+| `forwarded_headers.trusted_proxies` | list | none | CIDRs trusted in `append` mode and by access lists |
 | `cache.enabled` | bool | `false` | Enable caching for this vhost |
 | `cache.ttl` | duration | none | Fallback TTL when the origin gives no freshness; see [Caching](caching.md#what-is-stored) |
 | `default_action` | block | none | Answer directly without a pool: `redirect` or `status`/`body` — see [Virtual hosts](virtual-hosts.md#default-action). Excludes `pool` and `route` |

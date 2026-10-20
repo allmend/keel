@@ -46,7 +46,7 @@ connection arrives, `keel_udp_*` once the first flow opens.
 | `keel_request_duration_seconds` | histogram | `pool`, `vhost` | End-to-end duration, first byte in to last byte out |
 | `keel_request_bytes_in_total` | counter | `pool`, `vhost` | Request body bytes from clients |
 | `keel_request_bytes_out_total` | counter | `pool`, `vhost` | Response body bytes to clients |
-| `keel_lb_errors_total` | counter | `pool`, `vhost`, `reason` | Errors before a backend was reached. Reasons: `no_route` (no vhost matched; `pool` is empty), `no_backend` (pool has no usable backend) |
+| `keel_lb_errors_total` | counter | `pool`, `vhost`, `reason` | Errors before a backend was reached. Reasons: `no_route` (no vhost matched; `pool` is empty), `no_backend` (pool has no usable backend), `denied` (an access list turned the client away) |
 
 Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s.
 
@@ -113,7 +113,7 @@ keel_pool_backends{state="available"}
 | `keel_tcp_connections_total` | counter | `pool`, `backend` | Connections accepted and spliced |
 | `keel_tcp_bytes_in_total` | counter | `pool`, `backend` | Bytes received from clients over connection lifetimes |
 | `keel_tcp_bytes_out_total` | counter | `pool`, `backend` | Bytes sent to clients over connection lifetimes |
-| `keel_tcp_errors_total` | counter | `pool`, `reason` | Connections ending in error. Reasons: `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
+| `keel_tcp_errors_total` | counter | `pool`, `reason` | Connections ending in error. Reasons: `denied`, `no_backend`, `proxy_protocol`, `tls_handshake`, `upstream_connect`, `upstream_tls`, `io`, `shutdown` |
 
 ## UDP (L4) metrics
 
@@ -126,7 +126,7 @@ One flow (client `ip:port` → backend, until idle timeout) is the unit for `kee
 | `keel_udp_packets_out_total` | counter | `pool`, `backend` | Datagrams sent to clients |
 | `keel_udp_bytes_in_total` | counter | `pool`, `backend` | Bytes received from clients |
 | `keel_udp_bytes_out_total` | counter | `pool`, `backend` | Bytes sent to clients |
-| `keel_udp_errors_total` | counter | `pool`, `reason` | Dropped datagrams and flows ended by error. Reasons: `no_backend` (per dropped datagram), `flow_limit` (per dropped datagram), `proxy_protocol`, `upstream_bind`, `upstream_send`, `upstream_recv` (backend not listening — ICMP unreachable), `downstream_send`, `shutdown` |
+| `keel_udp_errors_total` | counter | `pool`, `reason` | Dropped datagrams and flows ended by error. Reasons: `denied`, `no_backend` and `flow_limit` (per dropped datagram), `proxy_protocol`, `upstream_bind`, `upstream_send`, `upstream_recv` (backend not listening — ICMP unreachable), `downstream_send`, `shutdown` |
 
 Flow expiry is not an error.
 
