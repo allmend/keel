@@ -80,7 +80,11 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 |---|---|
 | `no_route` | No vhost or route matched, or Keel answered itself |
 | `no_backend` | No available backend in the pool; Keel answered 503 |
-| `upstream_connect` | Proxying to the backend failed; Keel answered 502 if nothing was sent yet |
+| `upstream_connect` | Connecting to the backend failed; Keel answered 502 |
+| `upstream_timeout` | The backend did not answer in time |
+| `upstream` | The backend's connection failed after it was established |
+| `downstream` | The client's connection failed or closed early |
+| `internal` | Any other failure |
 
 Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` and `default_action` — have empty `vhost`, `method` and `uri`, `error` `no_route`, and the status Keel sent.
 

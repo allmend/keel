@@ -15,6 +15,15 @@ Versioning: [Semantic Versioning](https://semver.org/).
   no names.
 - TCP `reencrypt` sends no SNI and, with `tls_verify`, checks the backend
   certificate against the backend's IP.
+- HTTP access-log errors after a backend is chosen name the failing side:
+  `upstream_connect`, `upstream_timeout`, `upstream`, `downstream`,
+  `internal`. Only backend-side failures count in
+  `keel_backend_connection_errors_total`.
+
+### Fixed
+
+- A WebSocket the client dropped was logged as `upstream_connect` and
+  counted against the backend.
 
 ## [0.26.0] — 2026-10-19
 

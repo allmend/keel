@@ -31,6 +31,23 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info};
 
+/// The access-log `error` for a request that failed after a backend was
+/// chosen.
+fn error_reason(e: &Error) -> &'static str {
+    use pingora::{ErrorSource, ErrorType::*};
+    match (e.esource(), e.etype()) {
+        (ErrorSource::Downstream, _) => "downstream",
+        (
+            _,
+            ConnectTimedout | ConnectRefused | ConnectNoRoute | TLSHandshakeFailure | TLSHandshakeTimedout | InvalidCert
+            | HandshakeError | ConnectError | ConnectProxyFailure | BindError | SocketError,
+        ) => "upstream_connect",
+        (ErrorSource::Upstream, ReadTimedout | WriteTimedout) => "upstream_timeout",
+        (ErrorSource::Upstream, _) => "upstream",
+        _ => "internal",
+    }
+}
+
 // Per-request context
 
 pub struct ProxyCtx {
@@ -649,8 +666,9 @@ impl ProxyHttp for KProxy {
         }
         let backend_series = backend.and_then(|a| self.pools.series(&ctx.pool, a));
 
-        // Backend was selected but proxying failed — count as a connection error.
-        if e.is_some() {
+        let reason = e.map(error_reason);
+        // Proxying failed on the backend's side: count it against the backend.
+        if reason.is_some_and(|r| r.starts_with("upstream")) {
             if let Some(series) = backend_series {
                 series.connection_error();
             }
@@ -680,10 +698,8 @@ impl ProxyHttp for KProxy {
             Some("no_route".into())
         } else if backend.is_none() {
             Some("no_backend".into())
-        } else if e.is_some() {
-            Some("upstream_connect".into())
         } else {
-            None
+            reason.map(Into::into)
         };
 
         let backend_duration_ms = ctx

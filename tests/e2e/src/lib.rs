@@ -494,10 +494,8 @@ pub fn http_get(addr: SocketAddr, host: &str, path: &str) -> Result<(u16, String
 
 // TLS
 
-/// The leaf certificate (DER) a TLS listener serves for `sni`, or an error
-/// when the handshake fails — no certificate for that name, say. The chain
-/// is not verified: tests compare it with the certificate they expect.
-pub fn served_certificate(addr: SocketAddr, sni: &str) -> Result<Vec<u8>> {
+/// A client config that accepts any server certificate, offering `alpn`.
+fn accept_any(alpn: &[&[u8]]) -> Result<rustls::ClientConfig> {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
@@ -536,18 +534,34 @@ pub fn served_certificate(addr: SocketAddr, sni: &str) -> Result<Vec<u8>> {
     }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
         .with_no_client_auth();
-    let mut conn = rustls::ClientConnection::new(Arc::new(config), ServerName::try_from(sni.to_owned())?)?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(config)
+}
+
+/// A TLS connection to `addr` for `sni`, offering `alpn`, handshake done.
+/// The server certificate is not verified.
+pub fn tls_connect(addr: SocketAddr, sni: &str, alpn: &[&[u8]]) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    let name = rustls::pki_types::ServerName::try_from(sni.to_owned())?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(accept_any(alpn)?), name)?;
     let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut sock)?;
     }
-    let leaf = conn.peer_certificates().and_then(|c| c.first()).context("no certificate served")?;
+    Ok(rustls::StreamOwned::new(conn, sock))
+}
+
+/// The leaf certificate (DER) a TLS listener serves for `sni`, or an error
+/// when the handshake fails — no certificate for that name, say. The chain
+/// is not verified: tests compare it with the certificate they expect.
+pub fn served_certificate(addr: SocketAddr, sni: &str) -> Result<Vec<u8>> {
+    let tls = tls_connect(addr, sni, &[])?;
+    let leaf = tls.conn.peer_certificates().and_then(|c| c.first()).context("no certificate served")?;
     Ok(leaf.as_ref().to_vec())
 }
 

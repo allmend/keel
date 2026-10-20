@@ -92,6 +92,17 @@ vhost "internal.example.com" {
 | `append` | A direct client inside `trusted_proxies` keeps its `X-Forwarded-For` chain, Keel appends its IP, and `X-Real-IP` is the first address of the chain. Any other client is handled as `replace` |
 | `off` | Forwarded headers are removed |
 
+## WebSocket
+
+The HTTP/1.1 upgrade passes through on `http` and `https` listeners. An open socket:
+
+- is a connection to its backend: it counts in `keel_active_connections` and keeps a drain at `draining` until it closes;
+- is never cached;
+- gets one access entry when it closes: status `101`, `duration_ms` the socket's lifetime, `bytes_in`/`bytes_out` the frames each way;
+- is closed `grace_period` after a shutdown signal.
+
+WebSocket over HTTP/2 (RFC 8441) is not supported. Clients offered `h2` open WebSockets on a separate HTTP/1.1 connection, as browsers do when the server does not offer extended CONNECT.
+
 ## PROXY protocol
 
 With `proxy_protocol = true` a listener reads a PROXY protocol header (v1 or v2) before anything else and uses its address as the client's: in forwarded headers, logs, the consistent-hash key and passive health.

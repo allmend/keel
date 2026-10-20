@@ -56,7 +56,7 @@ Histogram buckets: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
 |---|---|---|---|
 | `keel_backend_requests_total` | counter | `pool`, `backend`, `status` | HTTP requests forwarded per backend |
 | `keel_backend_response_duration_seconds` | histogram | `pool`, `backend` | Backend selected to response complete |
-| `keel_backend_connection_errors_total` | counter | `pool`, `backend` | Failed upstream connections |
+| `keel_backend_connection_errors_total` | counter | `pool`, `backend` | Requests that failed on the backend's side: access-log errors `upstream_connect`, `upstream_timeout`, `upstream` |
 | `keel_active_connections` | gauge | `pool`, `backend` | Current active connections — HTTP and TCP combined; the same counter drain waits on |
 | `keel_backend_healthy` | gauge | `pool`, `backend` | `1` healthy, `0` unhealthy: the control worker's verdict, which every worker follows. Pools without a `health_check` never emit it |
 | `keel_backend_drain_state` | gauge | `pool`, `backend` | `0` active, `1` draining, `2` removed |
