@@ -21,7 +21,6 @@
 //! One access log entry is written per connection (not per request — there is
 //! no request concept at L4) to `access_tcp_<pool>.log`.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -49,9 +48,6 @@ pub struct TcpProxyApp {
     pub server_tls: Option<Arc<rustls::ServerConfig>>,
     /// Present for reencrypt: how Keel connects to the backend.
     pub client_tls: Option<Arc<rustls::ClientConfig>>,
-    /// Configured hostname per resolved backend, used as SNI and, with
-    /// `tls_verify`, as the name the backend certificate must match.
-    pub backend_names: HashMap<SocketAddr, String>,
     /// Expect a PROXY protocol header before anything else on the stream.
     pub proxy_protocol: bool,
 }
@@ -123,7 +119,8 @@ impl TcpProxyApp {
         // Backend side: re-encrypt when configured.
         let (bytes_in, bytes_out, error) = match (&self.client_tls, terminated, plain) {
             (Some(cfg), Some(mut client), _) => {
-                let name = self.backend_server_name(backend);
+                // Backends are IPs: no SNI, and a verified certificate names the IP.
+                let name = ServerName::IpAddress(backend.ip().into());
                 let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
                 match connector.connect(name, upstream).await {
                     Ok(mut tls_upstream) => copy(&mut client, &mut tls_upstream, shutdown).await,
@@ -147,14 +144,6 @@ impl TcpProxyApp {
         out.bytes_out = bytes_out;
         out.error = error;
         out
-    }
-
-    /// SNI for the backend: its configured hostname when it is one, else its IP.
-    fn backend_server_name(&self, backend: SocketAddr) -> ServerName<'static> {
-        self.backend_names
-            .get(&backend)
-            .and_then(|h| ServerName::try_from(h.clone()).ok())
-            .unwrap_or_else(|| ServerName::IpAddress(backend.ip().into()))
     }
 
     fn log(&self, client_addr: Option<String>, backend: Option<SocketAddr>, out: &Outcome, started: std::time::Instant) {
@@ -309,6 +298,7 @@ impl ServerApp for TcpProxyApp {
 mod tests {
     use super::*;
     use crate::tls::CertStore;
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -335,10 +325,10 @@ mod tests {
         addr
     }
 
-    /// TLS echo backend presenting `cert_pem`.
+    /// TLS echo backend presenting `cert_pem` to clients that send no SNI.
     async fn tls_echo_backend(cert_pem: &str, key_pem: &str) -> SocketAddr {
         let store = CertStore::with_test_cert("backend.example.test", cert_pem, key_pem);
-        let cfg = store.rustls_server_config(&[]).unwrap();
+        let cfg = store.rustls_server_config_with_default(&[], "backend.example.test").unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -357,11 +347,9 @@ mod tests {
         addr
     }
 
-    fn app(mode: TlsMode, server_tls: Option<Arc<rustls::ServerConfig>>, client_tls: Option<Arc<rustls::ClientConfig>>, backend: SocketAddr) -> Arc<TcpProxyApp> {
+    fn app(mode: TlsMode, server_tls: Option<Arc<rustls::ServerConfig>>, client_tls: Option<Arc<rustls::ClientConfig>>) -> Arc<TcpProxyApp> {
         let pools = Arc::new(PoolRegistry::new(HashMap::new(), HashMap::new(), HashMap::new()));
         let access_logger = Arc::new(AccessLogger::new(&crate::config::AccessLogConfig { enabled: false, dir: "-".into() }));
-        let mut backend_names = HashMap::new();
-        backend_names.insert(backend, "backend.example.test".to_owned());
         Arc::new(TcpProxyApp {
             listener: "test".into(),
             pool: "p".into(),
@@ -370,7 +358,6 @@ mod tests {
             mode,
             server_tls,
             client_tls,
-            backend_names,
             proxy_protocol: false,
         })
     }
@@ -407,7 +394,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let (_keep, rx) = tokio::sync::watch::channel(false);
-        let app = app(TlsMode::Passthrough, None, None, backend);
+        let app = app(TlsMode::Passthrough, None, None);
         tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
             app.splice(tokio::io::BufStream::new(s), backend, &rx).await
@@ -425,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_splices_bytes() {
         let backend = echo_backend().await;
-        let (addr, h, _keep) = serve_one(app(TlsMode::Passthrough, None, None, backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Passthrough, None, None), backend).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
@@ -443,7 +430,7 @@ mod tests {
         let store = CertStore::with_test_cert("cache.example.test", &cert, &key);
         let server_tls = store.rustls_server_config_with_default(&[], "cache.example.test").unwrap();
         let backend = echo_backend().await;
-        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None, backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None), backend).await;
 
         let mut c = tls_client(addr, "cache.example.test").await;
         c.write_all(b"ping").await.unwrap();
@@ -469,7 +456,7 @@ mod tests {
         let store = CertStore::with_test_cert("cache.example.test", &cert, &key);
         let server_tls = store.rustls_server_config_with_default(&[], "cache.example.test").unwrap();
         let backend = echo_backend().await;
-        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None, backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None), backend).await;
         let mut c = tls_client(addr, "unknown.example.test").await;
         c.write_all(b"x").await.unwrap();
         let mut buf = [0u8; 1];
@@ -481,13 +468,14 @@ mod tests {
     #[tokio::test]
     async fn reencrypt_talks_tls_to_the_backend_and_verifies_when_asked() {
         let (front_cert, front_key) = self_signed("cache.example.test");
-        let (back_cert, back_key) = self_signed("backend.example.test");
+        // Verified against the backend's IP.
+        let (back_cert, back_key) = self_signed("127.0.0.1");
         let store = CertStore::with_test_cert("cache.example.test", &front_cert, &front_key);
         let server_tls = store.rustls_server_config_with_default(&[], "cache.example.test").unwrap();
         let backend = tls_echo_backend(&back_cert, &back_key).await;
 
         // No verification: any backend certificate is accepted.
-        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls.clone()), Some(crate::tls::insecure_client_config()), backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls.clone()), Some(crate::tls::insecure_client_config())), backend).await;
         let mut c = tls_client(addr, "cache.example.test").await;
         c.write_all(b"secret").await.unwrap();
         let mut buf = [0u8; 6];
@@ -498,7 +486,7 @@ mod tests {
 
         // Verification with the backend's certificate as the CA succeeds…
         let verifying = crate::tls::verifying_client_config(Some(back_cert.as_bytes())).unwrap();
-        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls.clone()), Some(verifying), backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls.clone()), Some(verifying)), backend).await;
         let mut c = tls_client(addr, "cache.example.test").await;
         c.write_all(b"ok").await.unwrap();
         let mut buf = [0u8; 2];
@@ -508,7 +496,7 @@ mod tests {
 
         // …and without that CA the upstream handshake is refused.
         let strict = crate::tls::verifying_client_config(None).unwrap();
-        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls), Some(strict), backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Reencrypt, Some(server_tls), Some(strict)), backend).await;
         let c = tls_client(addr, "cache.example.test").await;
         let out = h.await.unwrap();
         drop(c);
@@ -521,7 +509,7 @@ mod tests {
         let store = CertStore::with_test_cert("cache.example.test", &cert, &key);
         let server_tls = store.rustls_server_config_with_default(&[], "cache.example.test").unwrap();
         let backend = echo_backend().await;
-        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None, backend), backend).await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None), backend).await;
         let mut c = TcpStream::connect(addr).await.unwrap();
         c.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
         let out = h.await.unwrap();

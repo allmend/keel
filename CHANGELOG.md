@@ -8,6 +8,14 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: addresses are `ip:port`.** Backends, listeners, `metrics`,
+  `control.remote` and `cluster` refuse host names at load. Keel resolves
+  no names.
+- TCP `reencrypt` sends no SNI and, with `tls_verify`, checks the backend
+  certificate against the backend's IP.
+
 ## [0.26.0] — 2026-10-19
 
 ### Changed

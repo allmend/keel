@@ -237,19 +237,36 @@ impl Config {
                 anyhow::bail!("cluster.secret is required when node.hcl has a cluster block");
             }
         }
-        self.check_port_collisions()?;
-
-        // Must be a literal address, not a name: the master binds it inline
-        // so that resolving it cannot add a thread to the process that forks
-        // workers (see control::remote and process::run_master).
+        // Keel resolves no names: every address it binds or connects to is
+        // an IP and a port.
+        let literal = |field: String, address: &str| -> Result<()> {
+            if address.parse::<std::net::SocketAddr>().is_err() {
+                anyhow::bail!("{field}: '{address}' is not an ip:port");
+            }
+            Ok(())
+        };
+        literal("metrics.address".into(), &self.metrics.address)?;
         if let Some(remote) = self.control.as_ref().and_then(|c| c.remote.as_ref()) {
-            if remote.address.parse::<std::net::SocketAddr>().is_err() {
-                anyhow::bail!(
-                    "control.remote.address must be a literal ip:port (e.g. 0.0.0.0:10789), got '{}'",
-                    remote.address
-                );
+            literal("control.remote.address".into(), &remote.address)?;
+        }
+        if let Some(cluster) = &self.cluster {
+            literal("cluster.addr".into(), &cluster.addr)?;
+            if let Some(advertise) = &cluster.advertise {
+                literal("cluster.advertise".into(), advertise)?;
+            }
+            for member in &cluster.join {
+                literal("cluster.join".into(), member)?;
             }
         }
+        for l in &self.listeners {
+            literal("listener".into(), &l.address)?;
+        }
+        for (name, pool) in &self.pools {
+            for b in &pool.backends {
+                literal(format!("pool '{name}': backend"), &b.address)?;
+            }
+        }
+        self.check_port_collisions()?;
 
         for (name, pool) in &self.pools {
             if pool.backends.is_empty() {
@@ -1831,12 +1848,24 @@ vhost "a.test" {
     }
 
     #[test]
-    fn remote_control_address_must_be_literal() {
-        // A hostname would resolve through tokio's blocking pool, adding a
-        // thread to the process that forks workers.
-        let remote = |address: &str| parse_with_node(&format!("control {{\n  remote {{\n    address = \"{address}\"\n  }}\n}}\n"), POOL).unwrap();
-        assert!(err(&remote("localhost:10789")).contains("literal ip:port"));
+    fn addresses_are_ip_and_port() {
+        let node = |text: &str| parse_with_node(text, POOL).unwrap();
+        let remote = |address: &str| node(&format!("control {{\n  remote {{\n    address = \"{address}\"\n  }}\n}}\n"));
+        assert_eq!(err(&remote("localhost:10789")), "control.remote.address: 'localhost:10789' is not an ip:port");
         remote("0.0.0.0:10789").validate().unwrap();
+        let metrics = node("metrics {\n  address = \"metrics.internal:10790\"\n}\n");
+        assert_eq!(err(&metrics), "metrics.address: 'metrics.internal:10790' is not an ip:port");
+        let cluster = |field: &str| node(&format!("cluster {{\n  secret = \"s\"\n  {field}\n}}\n"));
+        assert!(err(&cluster("addr = \"node1:7654\"")).starts_with("cluster.addr: 'node1:7654'"));
+        assert!(err(&cluster("advertise = \"node1:7654\"")).starts_with("cluster.advertise: 'node1:7654'"));
+        assert!(err(&cluster("join = [\"node1:7654\"]")).starts_with("cluster.join: 'node1:7654'"));
+        cluster("advertise = \"[2001:db8::1]:7654\"").validate().unwrap();
+
+        let e = |text: &str| err(&parse(text).unwrap());
+        assert_eq!(e("pool \"web\" {\n  backend \"web1:80\" {}\n}\n"), "pool 'web': backend: 'web1:80' is not an ip:port");
+        assert_eq!(e("pool \"web\" {\n  backend \"10.0.0.1\" {}\n}\n"), "pool 'web': backend: '10.0.0.1' is not an ip:port");
+        assert_eq!(e(&format!("{POOL}listener \"http\" \"localhost:80\" {{}}\n")), "listener: 'localhost:80' is not an ip:port");
+        parse("pool \"web\" {\n  backend \"[2001:db8::1]:8080\" {}\n}\nlistener \"http\" \"[::]:80\" {}\n").unwrap().validate().unwrap();
     }
 
     #[test]

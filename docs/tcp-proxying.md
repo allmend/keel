@@ -13,7 +13,7 @@ listener "tcp" "0.0.0.0:5432" {
 | `pool` | Required |
 | `tls_mode` | `passthrough` (default), `terminate`, `reencrypt` |
 | `tls_host` | `terminate`, `reencrypt`: host of a `certificate` block or a vhost with `tls`, served when the client's SNI has no certificate |
-| `tls_verify` | `reencrypt`: verify the backend certificate against the system roots plus `tls_ca` and the backend's hostname. Default `false` |
+| `tls_verify` | `reencrypt`: verify the backend certificate against the system roots plus `tls_ca` and the backend's IP. Default `false` |
 | `tls_ca` | `reencrypt` with `tls_verify`: extra trusted CAs, PEM |
 | `proxy_protocol` | Read a PROXY protocol header first, in every mode. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 
@@ -25,7 +25,7 @@ listener "tcp" "0.0.0.0:5432" {
 | `terminate` | TLS | plaintext | Keel's |
 | `reencrypt` | TLS | new TLS connection | Keel's, and the backend's |
 
-In `passthrough` Keel does not read the stream. In `terminate` and `reencrypt` the certificate is picked by SNI, else `tls_host`. `reencrypt` sends the backend's configured hostname as SNI (`backend "cache1.internal:6379"` sends `cache1.internal`; an IP sends none), and without `tls_verify` accepts any backend certificate.
+In `passthrough` Keel does not read the stream. In `terminate` and `reencrypt` the certificate is picked by SNI, else `tls_host`. `reencrypt` sends no SNI, and without `tls_verify` accepts any backend certificate; with it, the certificate must name the backend's IP.
 
 Protocols that start TLS at byte zero (Redis `tls-port`, LDAPS, MQTT over TLS) work in every mode. Protocols that upgrade mid-stream (PostgreSQL, SMTP) work in `passthrough` only.
 

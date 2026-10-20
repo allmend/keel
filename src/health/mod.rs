@@ -142,8 +142,6 @@ impl HealthTable {
 }
 
 /// The node's health table and one prober per pool with a health check.
-/// Backend names resolve here as in the workers; one that does not is left
-/// unchecked and logged.
 pub fn probers(cfg: &Config) -> (Arc<HealthTable>, Vec<HealthService>) {
     let mut table = HealthTable::default();
     let mut plans = Vec::new();
@@ -151,13 +149,10 @@ pub fn probers(cfg: &Config) -> (Arc<HealthTable>, Vec<HealthService>) {
         let Some(hc) = &pool.health_check else { continue };
         let mut addrs = Vec::new();
         for b in &pool.backends {
-            match crate::proxy::resolve_addr(&b.address).and_then(|a| Ok(a.parse::<SocketAddr>()?)) {
-                Ok(addr) => {
-                    table.backends.insert((name.clone(), addr), Checked::new(name, addr));
-                    addrs.push(addr);
-                }
-                Err(e) => warn!(pool = name, backend = b.address, error = %format!("{e:#}"), "health: backend not checked"),
-            }
+            // Validated as ip:port.
+            let Ok(addr) = b.address.parse::<SocketAddr>() else { continue };
+            table.backends.insert((name.clone(), addr), Checked::new(name, addr));
+            addrs.push(addr);
         }
         plans.push((name.clone(), hc.clone(), addrs));
     }

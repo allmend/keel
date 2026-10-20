@@ -13,15 +13,19 @@ services:
       - backend2
       - backend3
 
-  # traefik/whoami returns hostname + request info — easy to see which backend responded
+  # traefik/whoami returns hostname + request info — easy to see which backend responded.
+  # Fixed IPs: Keel takes backend addresses as ip:port.
   backend1:
     image: traefik/whoami
+    networks: { default: { ipv4_address: 172.29.100.11 } }
 
   backend2:
     image: traefik/whoami
+    networks: { default: { ipv4_address: 172.29.100.12 } }
 
   backend3:
     image: traefik/whoami
+    networks: { default: { ipv4_address: 172.29.100.13 } }
 
   # A little traffic for the dashboards: plain requests and slower ones
   # (whoami's ?wait= delays its answer).
@@ -63,3 +67,11 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+networks:
+  default:
+    ipam:
+      config:
+        # Other services take addresses from ip_range, clear of the backends.
+        - subnet: 172.29.100.0/24
+          ip_range: 172.29.100.128/25

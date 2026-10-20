@@ -91,6 +91,10 @@ Every time setting is a string: a whole number and a unit, `s`, `m`, `h`, `d`, `
 
 Timers start over when Keel restarts: a backend ejected for `30s` is back after a restart, a health check runs its first round within a second.
 
+### Addresses
+
+Every address Keel binds or connects to is an IP and a port: `10.0.0.1:8080`, `[2001:db8::1]:8080`. That covers listeners, backends, `metrics`, `control.remote` and `cluster`. Keel resolves no host names; a name is a load error.
+
 ---
 
 ## keel
@@ -182,7 +186,7 @@ listener "tcp" "0.0.0.0:53" {
 | `proxy_protocol` | bool | `false` | Expect a PROXY protocol v1/v2 header from the load balancer in front and take the client address from it. Every protocol. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 | `tls_mode` | string | `passthrough` | `tcp` only: `passthrough`, `terminate`, or `reencrypt`. See [TCP proxying](tcp-proxying.md#tls-modes) |
 | `tls_host` | string | none | `terminate`/`reencrypt`: host of a `certificate` block or a vhost with `tls`, served when the client's SNI has no certificate of its own |
-| `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's configured hostname |
+| `tls_verify` | bool | `false` | `reencrypt`: verify the backend certificate (system roots plus `tls_ca`) against the backend's IP |
 | `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs. A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
 
 `http`, `https` and `tcp` share TCP ports, so two of them on one address is a load error; `udp` and `tcp` can share an address. A `tcp` or `udp` listener's pool is an ordinary `pool` block — health checks, weights, algorithms, and drain behave the same as for HTTP.
@@ -294,7 +298,7 @@ pool "web" {
 | `passive.enabled` | bool | `true` | Eject a backend after consecutive traffic failures. See [Health checks](health-checks.md#passive-detection) |
 | `passive.failures` | number | `5` | Consecutive upstream connect (or UDP reply) failures that eject |
 | `passive.eject_for` | duration | `30s` | Time out of rotation before re-admission |
-| `backend "<address>"` | block | required | `host:port`; at least one |
+| `backend "<address>"` | block | required | `ip:port`; at least one |
 | `backend.weight` | number | `1` | Relative weight, 1–1000; honoured by every algorithm |
 
 Pools may be defined in any file of the config directory; a name defined twice is a load error naming both places. See [Load balancing](load-balancing.md) for details on algorithms and drain behavior.
@@ -415,7 +419,7 @@ cluster {
 | `addr` | string | `0.0.0.0:7654` | Peer listen address; must not be a listener's address |
 | `advertise` | string | `addr` | Address announced to the other nodes. Required when `addr` is unspecified (`0.0.0.0`, `::`) |
 | `secret` | string | none | Shared secret for join authentication; required |
-| `join` | list | none | Members to join through on first start |
+| `join` | list | none | Members to join through on first start, `ip:port` each |
 
 The node ID is not a setting: it is generated on first start and kept in `keel.state_dir` — see [Node identity](cluster.md#node-identity). The Raft store and the node's certificates live there too; see [Restarts](cluster.md#restarts).
 
@@ -438,7 +442,7 @@ control {
 
 | Attribute | Type | Default | Notes |
 |---|---|---|---|
-| `remote.address` | string | none | TCP listen address for keelctl. Must be a literal `ip:port`, not a listener's address — a hostname is rejected at startup |
+| `remote.address` | string | none | TCP listen address for keelctl, `ip:port`; not a listener's address |
 | `remote.allow` | list | none | Optional source-CIDR restriction; empty = any source. mTLS stays mandatory |
 
 The master binds the port and the control worker serves it. See [Security](security.md#processes-and-what-each-can-read). The control CA (`ca.crt` / `ca.key`) lives in `control/` under `keel.state_dir`.
@@ -556,6 +560,6 @@ What requires a process restart:
 - Listeners
 - Every setting in the `keel` block, including worker count, user/group and the UDP flow settings
 
-Backends are matched on the address exactly as written in the config, not on the IP it resolved to, so a hostname whose resolution changed since startup is still recognised as the same backend. Reloading issues no DNS queries; a new IP for an existing hostname takes effect on restart, as with any other backend change.
+Backends are matched on IP and port: `[2001:db8::1]:80` and `[2001:db8:0::1]:80` are the same backend.
 
 A version applies the same way on every node: what reloads live above takes effect on push, the rest needs a restart of each node.

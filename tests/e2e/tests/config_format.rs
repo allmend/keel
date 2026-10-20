@@ -2,7 +2,8 @@
 //! across the config directory, serves traffic. `keel config validate` is
 //! silent on a good config, names the file, line and column of a mistake,
 //! lists files not in canonical format, prints what it loads, and compares
-//! with what the running node serves.
+//! with what the running node serves. Addresses are IPs: a host name is
+//! refused, even one the container could resolve.
 
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ services:
       - ./messy-node.hcl:/messy-node.hcl:ro
       - ./edited:/edited:ro
       - ./edited-node.hcl:/edited-node.hcl:ro
+      - ./named:/named:ro
+      - ./named-node.hcl:/named-node.hcl:ro
     ports: ["80"]
     networks: { net: { ipv4_address: 172.29.88.10 } }
 "#;
@@ -102,6 +105,9 @@ fn a_node_configured_in_hcl_serves_traffic_and_validate_checks_files() -> Result
             ("messy/keel.hcl", MESSY.to_owned()),
             ("edited-node.hcl", node_for("/edited")),
             ("edited/keel.hcl", ROOT.to_owned()),
+            ("named-node.hcl", node_for("/named")),
+            ("named/keel.hcl", ROOT.to_owned()),
+            ("named/pools/web.hcl", POOL.replace("172.29.88.21:80", "backend:80")),
             ("edited/pools/web.hcl", POOL.replace("  backend \"172.29.88.21:80\" {}\n", "  backend \"172.29.88.21:80\" {}\n  backend \"172.29.88.22:80\" {}\n")),
         ],
     )?;
@@ -146,5 +152,14 @@ fn a_node_configured_in_hcl_serves_traffic_and_validate_checks_files() -> Result
     assert!(out.contains("restart pool \"web\": backend \"172.29.88.22:80\" added"), "{out}");
     assert!(out.contains("restart the node file"), "{out}");
     assert!(!out.contains("\x1b["), "no colors when not on a terminal: {out}");
+
+    // A host name, though Docker's DNS knows it: refused, and not pushed.
+    let (code, _, err) = run(&["/named-node.hcl"])?;
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("pool 'web': backend: 'backend:80' is not an ip:port"), "{err}");
+    let out = stack.exec("keel", &["keel", "config", "push", "/named"])?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("'backend:80' is not an ip:port"), "{err}");
+    assert_eq!(http_get(addr, "e2e.test", "/")?.0, 200);
     Ok(())
 }

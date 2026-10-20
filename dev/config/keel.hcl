@@ -22,9 +22,9 @@ pool "web" {
     unhealthy_threshold = 2
   }
 
-  backend "backend1:80" {}
-  backend "backend2:80" {}
-  backend "backend3:80" {}
+  backend "172.29.100.11:80" {}
+  backend "172.29.100.12:80" {}
+  backend "172.29.100.13:80" {}
 }
 
 vhost "*" {

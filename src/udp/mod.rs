@@ -494,12 +494,10 @@ async fn reply_loop(
 /// its flow table stays consistent.
 pub fn bind_reuseport(addr: &str) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::ToSocketAddrs;
 
-    let addr = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("no address for '{addr}'")))?;
+    let addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("'{addr}' is not an ip:port")))?;
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;

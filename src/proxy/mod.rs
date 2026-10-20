@@ -736,19 +736,6 @@ pub struct WorkerSockets {
     pub upgrade_sock: String,
 }
 
-// Resolves a backend address to IP:port; pass-through if already numeric, DNS lookup if hostname.
-pub(crate) fn resolve_addr(addr: &str) -> anyhow::Result<String> {
-    if addr.parse::<std::net::SocketAddr>().is_ok() {
-        return Ok(addr.to_owned());
-    }
-    use std::net::ToSocketAddrs;
-    addr.to_socket_addrs()
-        .map_err(|e| anyhow::anyhow!("cannot resolve '{addr}': {e}"))?
-        .next()
-        .map(|sa| sa.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no address resolved for '{addr}'"))
-}
-
 // Builds all pools from config. Health checks are registered separately
 // (`add_health_services`) once the registry exists.
 fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
@@ -766,23 +753,9 @@ fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
                 },
             );
         }
-        // Resolve hostnames to IPs once at startup so Pingora gets SocketAddrs
-        // and the drain map keys stay consistent with what the load balancer uses.
-        let resolved: Vec<String> = pool_cfg.backends.iter()
-            .map(|b| resolve_addr(&b.address))
-            .collect::<anyhow::Result<_>>()?;
-        let addrs: Vec<&str> = resolved.iter().map(String::as_str).collect();
+        let addrs: Vec<&str> = pool_cfg.backends.iter().map(|b| b.address.as_str()).collect();
         let weights: Vec<usize> = pool_cfg.backends.iter().map(|b| b.weight as usize).collect();
-
-        // Paired with the configured form, so a reload can match a backend
-        // without resolving it again.
-        let configured: Vec<(&str, &str)> = pool_cfg
-            .backends
-            .iter()
-            .map(|b| b.address.as_str())
-            .zip(addrs.iter().copied())
-            .collect();
-        build_drain_entries(name, &configured, &mut drain)?;
+        build_drain_entries(name, &addrs, &mut drain)?;
 
         let pool = match pool_cfg.algorithm {
             LbAlgorithm::RoundRobin => {
@@ -1253,17 +1226,9 @@ fn add_l4_services(
                 TlsMode::Reencrypt => Some(crate::tls::insecure_client_config()),
                 _ => None,
             };
-            // Configured hostnames per resolved backend: SNI toward the
-            // backend and, with tls_verify, the name its certificate must match.
-            let mut backend_names = HashMap::new();
-            for b in &cfg.pools[&pool].backends {
-                let resolved: SocketAddr = resolve_addr(&b.address)?.parse()?;
-                let host = b.address.rsplit_once(':').map(|(h, _)| h).unwrap_or(&b.address);
-                backend_names.insert(resolved, host.trim_matches(|c| c == '[' || c == ']').to_owned());
-            }
-            Ok((server_tls, client_tls, backend_names))
+            Ok((server_tls, client_tls))
         })();
-        let (server_tls, client_tls, backend_names) = match built {
+        let (server_tls, client_tls) = match built {
             Ok(v) => v,
             Err(e) => {
                 error!(address = l.address, error = %e, "tcp: cannot build TLS listener");
@@ -1279,7 +1244,6 @@ fn add_l4_services(
             mode: l.tls_mode,
             server_tls,
             client_tls,
-            backend_names,
             proxy_protocol: l.proxy_protocol,
         };
         let mut svc = pingora::services::listening::Service::new(

@@ -168,23 +168,42 @@ fn killed_worker_is_replaced_under_its_index() -> Result<()> {
     Ok(())
 }
 
-// Every worker fails to build its pools: the backend name does not resolve.
+// Every worker fails to build its TCP listener: an absolute tls_ca is read
+// when used, and this one does not exist.
 const FAILING_CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
-
-pool "web" {
-  backend "keel-e2e-nowhere.invalid:80" {}
+listener "tcp" "0.0.0.0:6380" {
+  pool       = "web"
+  tls_mode   = "reencrypt"
+  tls_host   = "failing.test"
+  tls_verify = true
+  tls_ca     = "/nonexistent/ca.pem"
 }
 
-vhost "*" {
-  pool = "web"
+certificate "failing.test" {
+  cert = "certs/failing.crt"
+  key  = "certs/failing.key"
+}
+
+pool "web" {
+  backend "172.29.83.20:80" {}
 }
 "#;
 
 #[test]
 #[ignore = "needs Docker"]
 fn workers_that_die_at_start_are_restarted_with_a_growing_delay() -> Result<()> {
-    let stack = Stack::up("worker-backoff", COMPOSE, &[("node.hcl", NODE.to_owned()), ("config/keel.hcl", FAILING_CONFIG.to_owned())])?;
+    let key = rcgen::KeyPair::generate()?;
+    let cert = rcgen::CertificateParams::new(vec!["failing.test".to_owned()])?.self_signed(&key)?;
+    let stack = Stack::up(
+        "worker-backoff",
+        COMPOSE,
+        &[
+            ("node.hcl", NODE.to_owned()),
+            ("config/keel.hcl", FAILING_CONFIG.to_owned()),
+            ("config/certs/failing.crt", cert.pem()),
+            ("config/certs/failing.key", key.serialize_pem()),
+        ],
+    )?;
     wait_until("the first worker death", Duration::from_secs(30), || {
         Ok(stack.logs("keel")?.contains("master: worker died").then_some(()))
     })?;

@@ -261,7 +261,6 @@ fn take_tree(path: &std::path::Path, uid: Uid, gid: Gid) -> Result<()> {
 /// datagrams).
 fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<BoundListeners> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::ToSocketAddrs;
 
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
@@ -291,11 +290,10 @@ fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<Bound
             continue;
         }
         let bound = (|| -> std::io::Result<std::net::TcpListener> {
-            let addr = l
+            let addr: std::net::SocketAddr = l
                 .address
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address"))?;
+                .parse()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not an ip:port"))?;
             let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
             s.set_reuse_address(true)?; // what Pingora sets on its own listeners
             s.set_nonblocking(true)?;
