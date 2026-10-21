@@ -11,6 +11,9 @@ FROM scratch
 ARG TARGETARCH
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY dist/linux-${TARGETARCH}/keel /keel
+# keel.user and keel.group (keel, 10001) and keel.control_user (keel-control,
+# 10002): the master starts as root and drops to them.
+COPY contrib/container/passwd contrib/container/group /etc/
 
 EXPOSE 80 443 10790
 

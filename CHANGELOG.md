@@ -19,6 +19,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   after a failed connect. `keel`: `keepalive_timeout` (75s),
   `body_timeout` (60s), `max_header_size` (64K, 431). Vhost and route:
   `max_body_size` (off, 413). `tcp` listeners: `idle_timeout` (1h).
+- The container image carries users `keel` (10001) and `keel-control`
+  (10002), so started as root it drops privileges. `keel.user`,
+  `keel.group` and `keel.control_user` take numeric ids.
 - `-o json` on every `keel` and `keelctl` client command, `config validate`
   and `credentials create`: one JSON object per line.
 

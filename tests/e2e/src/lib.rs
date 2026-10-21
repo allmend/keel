@@ -62,6 +62,52 @@ pub fn image() -> Result<String> {
         .map_err(|e| anyhow::anyhow!(e))
 }
 
+static RELEASE_IMAGE: OnceLock<Result<String, String>> = OnceLock::new();
+
+/// The release image (Dockerfile.release, FROM scratch) around a static
+/// MUSL keel: `KEEL_E2E_RELEASE_IMAGE`, or built once per test binary from
+/// the working tree with tests/e2e/Dockerfile.musl.
+pub fn release_image() -> Result<String> {
+    RELEASE_IMAGE
+        .get_or_init(|| {
+            if let Ok(tag) = std::env::var("KEEL_E2E_RELEASE_IMAGE") {
+                return Ok(tag);
+            }
+            let root = repo_root();
+            let docker = |args: &[&str], dir: &Path| -> Result<String, String> {
+                let out = Command::new("docker")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("DOCKER_BUILDKIT", "1")
+                    .output()
+                    .map_err(|e| format!("cannot run docker: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("docker {}:\n{}", args.join(" "), String::from_utf8_lossy(&out.stderr)));
+                }
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            };
+            let arch = docker(&["version", "--format", "{{.Server.Arch}}"], &root)?;
+            // The context release.yml hands buildx: the binary under
+            // dist/linux-<arch>/, and the files the Dockerfile copies.
+            let context = root.join("target/e2e-release");
+            let _ = std::fs::remove_dir_all(&context);
+            let bin = context.join(format!("dist/linux-{arch}"));
+            eprintln!("keel-e2e: building a static keel for the release image");
+            docker(&["build", "-f", "tests/e2e/Dockerfile.musl", "--output", &format!("type=local,dest={}", bin.display()), "."], &root)?;
+            let files = context.join("contrib/container");
+            std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
+            for f in ["passwd", "group"] {
+                std::fs::copy(root.join("contrib/container").join(f), files.join(f)).map_err(|e| e.to_string())?;
+            }
+            let tag = "keel-e2e-release:dev".to_owned();
+            let dockerfile = root.join("Dockerfile.release").display().to_string();
+            docker(&["build", "-f", &dockerfile, "-t", &tag, "."], &context)?;
+            Ok(tag)
+        })
+        .clone()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// A text file from an image, which need not have a shell: `docker cp` out of
 /// a created, never started container.
 pub fn file_from_image(image: &str, path: &str) -> Result<String> {
@@ -158,7 +204,8 @@ pub struct Stack {
 
 impl Stack {
     /// Write `files` and the compose file into a fresh directory and bring the
-    /// project up. `{image}` in the compose text is replaced with [`image()`].
+    /// project up. `{image}` in the compose text is replaced with [`image()`],
+    /// `{release_image}` with [`release_image()`].
     pub fn up(name: &str, compose: &str, files: &[(&str, String)]) -> Result<Stack> {
         let image = image()?;
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -176,7 +223,11 @@ impl Stack {
             }
             std::fs::write(&path, content).with_context(|| format!("write {file}"))?;
         }
-        std::fs::write(dir.join("compose.yaml"), compose.replace("{image}", &image))?;
+        let mut compose = compose.replace("{image}", &image);
+        if compose.contains("{release_image}") {
+            compose = compose.replace("{release_image}", &release_image()?);
+        }
+        std::fs::write(dir.join("compose.yaml"), compose)?;
 
         let mut stack = Stack { project, dir, services: Vec::new(), _serial: serial };
         let services = stack.compose(&["config", "--services"])?;

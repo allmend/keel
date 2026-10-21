@@ -133,4 +133,6 @@ Files that can hold a private key are `0600` in a `0700` directory:
 
 ## Users
 
-Started as root, Keel needs `keel.user`, `keel.group` and `keel.control_user` (default `keel-control`) to exist; otherwise it does not start.
+Started as root, Keel needs `keel.user`, `keel.group` and `keel.control_user` (default `keel-control`) to exist; otherwise it does not start. A number is a uid or gid even without a passwd entry; a uid used that way takes the gid of the same number.
+
+The container image carries `keel` (uid and gid 10001) and `keel-control` (10002) in its own `/etc/passwd` and `/etc/group`. Run as root, it drops privileges like any host. Run as non-root (`--user 10001`, Kubernetes `restricted`), every process keeps that one uid: nothing is dropped, and workers can read the control worker's state, CA keys included.

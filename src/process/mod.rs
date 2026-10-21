@@ -140,26 +140,49 @@ struct Accounts {
 /// Resolve both users up front, so a missing one fails startup instead of
 /// every forked child.
 fn resolve_accounts(cfg: &Config) -> Result<Option<Accounts>> {
-    use nix::unistd::{Group, User};
     if !nix::unistd::getuid().is_root() {
         return Ok(None);
     }
-    let Ok(Some(group)) = Group::from_name(&cfg.keel.group) else {
+    let Some(gid) = group_id(&cfg.keel.group) else {
         anyhow::bail!("group '{}' not found — cannot drop privileges (set keel.group)", cfg.keel.group);
     };
-    let Ok(Some(user)) = User::from_name(&cfg.keel.user) else {
+    let Some(user) = user_of(&cfg.keel.user) else {
         anyhow::bail!("user '{}' not found — cannot drop privileges (set keel.user)", cfg.keel.user);
     };
-    let Ok(Some(control)) = User::from_name(&cfg.keel.control_user) else {
+    let Some(control) = user_of(&cfg.keel.control_user) else {
         anyhow::bail!(
             "user '{}' not found — the control worker runs as its own user (create it, or set keel.control_user)",
             cfg.keel.control_user
         );
     };
     Ok(Some(Accounts {
-        worker: Account { name: user.name, uid: user.uid, gid: group.gid, groups: Vec::new() },
-        control: Account { name: control.name, uid: control.uid, gid: control.gid, groups: vec![group.gid] },
+        worker: Account { gid, ..user },
+        control: Account { groups: vec![gid], ..control },
     }))
+}
+
+/// A user by name, or by number when the system knows no such name (a
+/// container without /etc/passwd): that uid, with the gid of the same number.
+fn user_of(name: &str) -> Option<Account> {
+    use nix::unistd::{Gid, Uid, User};
+    let account = |name: String, uid, gid| Account { name, uid, gid, groups: Vec::new() };
+    if let Ok(Some(u)) = User::from_name(name) {
+        return Some(account(u.name, u.uid, u.gid));
+    }
+    let id: u32 = name.parse().ok()?;
+    Some(match User::from_uid(Uid::from_raw(id)) {
+        Ok(Some(u)) => account(u.name, u.uid, u.gid),
+        _ => account(name.to_owned(), Uid::from_raw(id), Gid::from_raw(id)),
+    })
+}
+
+/// A group by name, or by number.
+fn group_id(name: &str) -> Option<nix::unistd::Gid> {
+    use nix::unistd::{Gid, Group};
+    match Group::from_name(name) {
+        Ok(Some(group)) => Some(group.gid),
+        _ => name.parse().ok().map(Gid::from_raw),
+    }
 }
 
 /// Make every directory Keel uses at runtime exist, owned by the process
@@ -665,6 +688,18 @@ fn install_signal_handlers() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{group_id, user_of};
+
+    #[test]
+    fn users_and_groups_by_name_or_number() {
+        assert_eq!(user_of("0").map(|a| (a.uid.as_raw(), a.gid.as_raw())), Some((0, 0)));
+        let unknown = user_of("424242").expect("a number is a user");
+        assert_eq!((unknown.name.as_str(), unknown.uid.as_raw(), unknown.gid.as_raw()), ("424242", 424242, 424242));
+        assert!(user_of("keel-no-such-user").is_none());
+        assert_eq!(group_id("424242").map(|g| g.as_raw()), Some(424242));
+        assert!(group_id("keel-no-such-group").is_none());
+    }
+
     #[test]
     fn quick_deaths_back_off_and_a_long_run_resets() {
         let mut b = super::Backoff::default();

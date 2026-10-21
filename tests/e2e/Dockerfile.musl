@@ -1,0 +1,18 @@
+# A static MUSL keel for the release image test: the binary only, exported
+# with `docker build --output`. Debug profile, vendored OpenSSL, as release.yml
+# builds it apart from the profile.
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev perl make cmake g++ linux-headers
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY src ./src
+COPY tests/e2e ./tests/e2e
+ARG CARGO_BUILD_JOBS=3
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build -p keel --features vendored-openssl \
+    && cp target/debug/keel /keel
+
+FROM scratch
+COPY --from=builder /keel /keel

@@ -54,7 +54,7 @@ curl http://localhost:8080
 curl http://localhost:10790/metrics
 
 docker compose exec keel keel status
-docker compose exec keel keel backend drain backend1:80 --wait
+docker compose exec keel keel backend drain 172.29.100.11:80 --wait
 ```
 
 ---
@@ -66,6 +66,8 @@ docker compose exec keel keel backend drain backend1:80 --wait
 ```bash
 docker run -v /etc/keel:/etc/keel -p 80:80 -p 443:443 ghcr.io/allmend/keel:<version>
 ```
+
+`FROM scratch`: a static binary at `/keel`, CA certificates, and users `keel` (10001) and `keel-control` (10002). Started as root it drops to them; see [Users](docs/security.md#users). Client commands run without a shell: `docker exec <container> /keel status`.
 
 ### Binaries
 
