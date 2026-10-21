@@ -44,6 +44,8 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- rustls-webpki 0.103.16 and webpki-root-certs 1.0.10: distrusted emSign
+  intermediates are rejected (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
 - A WebSocket the client dropped was logged as `upstream_connect` and
   counted against the backend.
 
