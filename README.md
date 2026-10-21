@@ -96,9 +96,17 @@ keel {
 
 ```hcl
 # /etc/keel/config/keel.hcl
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0", "::"]
+  port      = 80
+}
 
-listener "https" "0.0.0.0:443" {}
+listener "https" {
+  protocol  = "https"
+  addresses = ["0.0.0.0", "::"]
+  port      = 443
+}
 
 pool "web" {
   backend "10.0.0.1:8080" {}

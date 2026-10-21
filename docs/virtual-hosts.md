@@ -45,7 +45,11 @@ A vhost has `pool` or `route` blocks, not both. The same path twice in one vhost
 Served on `https` listeners, with a certificate per vhost.
 
 ```hcl
-listener "https" "0.0.0.0:443" {}
+listener "https" {
+  protocol  = "https"
+  addresses = ["0.0.0.0", "::"]
+  port      = 443
+}
 
 vhost "api.example.com" {
   pool = "api"
@@ -108,7 +112,10 @@ WebSocket over HTTP/2 (RFC 8441) is not supported. Clients offered `h2` open Web
 With `proxy_protocol = true` a listener reads a PROXY protocol header (v1 or v2) before anything else and uses its address as the client's: in forwarded headers, logs, the consistent-hash key and passive health.
 
 ```hcl
-listener "http" "0.0.0.0:80" {
+listener "http" {
+  protocol       = "http"
+  addresses      = ["0.0.0.0"]
+  port           = 80
   proxy_protocol = true
 }
 ```
@@ -136,9 +143,12 @@ vhost "admin.example.com" {
   }
 }
 
-listener "tcp" "0.0.0.0:5432" {
-  pool  = "postgres"
-  allow = ["10.1.0.0/16"]
+listener "postgres" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 5432
+  pool      = "postgres"
+  allow     = ["10.1.0.0/16"]
 }
 ```
 

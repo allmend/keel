@@ -5,8 +5,11 @@ A `udp` listener forwards datagrams to a pool. No vhosts or routes apply. Algori
 UDP has no connection, so Keel keeps a **flow** per client `ip:port`: the first datagram picks a backend, later ones go to the same backend, and replies go back to the client. A flow ends after `keel.udp_flow_timeout` (default `30s`) without traffic; then its backend is released and its log entry written.
 
 ```hcl
-listener "udp" "0.0.0.0:53" {
-  pool = "resolvers"
+listener "dns" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 53
+  pool      = "resolvers"
 }
 ```
 
@@ -29,12 +32,18 @@ keel {
   udp_flow_timeout = "10s"
 }
 
-listener "udp" "0.0.0.0:53" {
-  pool = "resolvers"
+listener "dns-udp" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 53
+  pool      = "resolvers"
 }
 
-listener "tcp" "0.0.0.0:53" {
-  pool = "resolvers"
+listener "dns-tcp" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 53
+  pool      = "resolvers"
 }
 
 pool "resolvers" {
@@ -61,8 +70,11 @@ A stub resolver sends each query from a new source port: one flow per query.
 One datagram per message, no reply: `bytes_out` and `packets_out` stay 0.
 
 ```hcl
-listener "udp" "0.0.0.0:514" {
-  pool = "syslog"
+listener "syslog" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 514
+  pool      = "syslog"
 }
 
 pool "syslog" {

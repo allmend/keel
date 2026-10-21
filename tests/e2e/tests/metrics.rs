@@ -38,7 +38,11 @@ metrics {
 "#;
 
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "web" {
   backend "172.29.87.20:80" {}
@@ -120,7 +124,11 @@ fn one_endpoint_counts_every_worker_and_outlives_a_killed_one() -> Result<()> {
 
 // `spare` has nothing listening: its check fails.
 const POOLS_CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http-80" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "web" {
   backend "172.29.87.20:80" {}
@@ -184,7 +192,11 @@ metrics {
 "#;
 
 const CACHE_CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http-80" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 access_log {
   dir = "-"

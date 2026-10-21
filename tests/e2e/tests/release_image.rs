@@ -40,7 +40,11 @@ keel {
 "#;
 
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "web" {
   backend "172.29.95.20:80" {}

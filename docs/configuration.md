@@ -150,7 +150,7 @@ Every setting in the `keel` block requires a process restart. See [Hot reload](#
 
 ## listener
 
-One block per port and protocol. The labels are the protocol and the address:
+One block per listener, labelled by its name. Names appear in logs, metrics and `keel status`, the same on every node.
 
 | Protocol | Serves |
 |---|---|
@@ -159,34 +159,48 @@ One block per port and protocol. The labels are the protocol and the address:
 | `tcp` | Raw TCP to a pool. See [TCP proxying](tcp-proxying.md) |
 | `udp` | Datagrams to a pool. See [UDP proxying](udp-proxying.md) |
 
-On Linux the master binds every listener before forking, and the workers inherit the sockets: ports below 1024 need root in the master only, and every worker accepts on the same socket. Elsewhere each worker binds its own with `SO_REUSEPORT`.
-
 ```hcl
-listener "http" "0.0.0.0:80" {}
-
-listener "https" "0.0.0.0:443" {}
-
-listener "tcp" "0.0.0.0:5432" { # raw TCP spliced to a pool
-  pool = "postgres"
+listener "web" {
+  protocol  = "https"
+  addresses = ["194.56.78.90", "194.56.78.91", "194.56.78.92"]
+  port      = 443
 }
 
-listener "tcp" "0.0.0.0:6379" { # TLS terminated by Keel, plaintext to the pool
-  pool     = "redis"
-  tls_mode = "terminate"
-  tls_host = "cache.example.com"
+# Raw TCP spliced to a pool.
+listener "postgres" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 5432
+  pool      = "postgres"
 }
 
-listener "udp" "0.0.0.0:53" {
-  pool = "resolvers"
+# TLS terminated by Keel, plaintext to the pool.
+listener "redis" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 6379
+  pool      = "redis"
+  tls_mode  = "terminate"
+  tls_host  = "cache.example.com"
 }
 
-listener "tcp" "0.0.0.0:53" {
-  pool = "resolvers"
+listener "dns" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 53
+  pool      = "resolvers"
 }
 ```
 
+`addresses` is the same on every node; each node binds the ones it has and skips the rest, logged once at start (`master: addresses not on this node`). Per-node IPs are expressed by listing all of them. A listener none of whose addresses a node has is not served there, which is how a listener runs on some nodes only. Wildcards are written out, both families: `["0.0.0.0", "::"]`; IPv6 sockets are IPv6 only. `keel status` lists what each listener bound and skipped, and `keel_listener_bound{listener,address}` is `1` or `0`.
+
+On Linux the master binds every listener before forking, and the workers inherit the sockets: ports below 1024 need root in the master only, and every worker accepts on the same socket. Elsewhere each worker binds its own with `SO_REUSEPORT`.
+
 | Attribute | Type | Default | Notes |
 |---|---|---|---|
+| `protocol` | string | required | `http`, `https`, `tcp` or `udp` |
+| `addresses` | list | required | IPs, at least one |
+| `port` | number | required | 1–65535 |
 | `pool` | string | none | `tcp` and `udp`: the pool to forward to; required. Refused on `http` and `https`, which route by vhost |
 | `proxy_protocol` | bool | `false` | Expect a PROXY protocol v1/v2 header from the load balancer in front and take the client address from it. Every protocol. See [Virtual hosts](virtual-hosts.md#proxy-protocol) |
 | `allow`, `deny` | list | none | `tcp` and `udp`: client networks or addresses. See [Access lists](virtual-hosts.md#access-lists) |
@@ -196,13 +210,13 @@ listener "tcp" "0.0.0.0:53" {
 | `tls_ca` | string | none | `reencrypt` with `tls_verify`: PEM bundle of extra trusted CAs. A relative path is a file of the config directory; see [Files the config names](#files-the-config-names) |
 | `idle_timeout` | duration | `1h` | `tcp`: close a connection with no bytes either way for this long; error `idle_timeout` |
 
-`http`, `https` and `tcp` share TCP ports, so two of them on one address is a load error; `udp` and `tcp` can share an address. A `tcp` or `udp` listener's pool is an ordinary `pool` block — health checks, weights, algorithms, and drain behave the same as for HTTP.
+`http`, `https` and `tcp` share TCP ports, so two of them on one address and port, or on a wildcard and an address of its family, is a load error; `udp` and `tcp` can share them. A `tcp` or `udp` listener's pool is an ordinary `pool` block — health checks, weights, algorithms, and drain behave the same as for HTTP.
 
 For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and hands each worker its own; a replacement worker takes over the socket of the one it replaces.
 
 Each worker hands its inherited TCP sockets to Pingora over `workers/upgrade-<index>.sock` beside the control socket. Pingora checks for them once a second and logs `No incoming socket transfer, sleep 1s and try again` once per worker meanwhile; `handed inherited listeners to pingora` follows. Workers serve about one second after the fork.
 
-Changing listeners requires a process restart.
+Changing listeners, their addresses or ports included, requires a restart.
 
 ---
 

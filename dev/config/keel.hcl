@@ -1,5 +1,9 @@
 # Local dev stack (docker compose): the load balancer.
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 access_log {
   enabled = true

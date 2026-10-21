@@ -179,7 +179,7 @@ pub fn changes(old: &Config, new: &Config, node_file_changed: bool) -> Vec<(bool
     if json(&old.keel) != json(&new.keel) {
         note(true, "keel".into());
     }
-    let listener = |l: &super::Listener| format!("listener \"{}\" \"{}\"", json(&l.protocol).as_str().unwrap_or_default(), l.address);
+    let listener = |l: &super::Listener| format!("listener \"{}\"", l.name);
     let listeners = |c: &Config| c.listeners.iter().map(|l| (listener(l), json(l))).collect::<BTreeMap<_, _>>();
     for (name, (o, n)) in pair(&listeners(old), &listeners(new)) {
         if o != n {
@@ -391,11 +391,11 @@ mod tests {
 
     #[test]
     fn changes_are_marked_reload_or_restart() {
-        let old = cfg("listener \"http\" \"0.0.0.0:80\" {}\npool \"web\" {\n  backend \"10.0.0.1:80\" {}\n  backend \"10.0.0.2:80\" {}\n}\nvhost \"*\" {\n  pool = \"web\"\n}\n");
-        let new = cfg("listener \"http\" \"0.0.0.0:80\" {}\nlistener \"https\" \"0.0.0.0:443\" {}\npool \"web\" {\n  algorithm = \"random\"\n  backend \"10.0.0.1:80\" { weight = 2 }\n  backend \"10.0.0.3:80\" {}\n}\npool \"api\" {\n  backend \"10.0.0.9:80\" {}\n}\nvhost \"*\" {\n  pool = \"api\"\n}\n");
+        let old = cfg("listener \"http\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n}\npool \"web\" {\n  backend \"10.0.0.1:80\" {}\n  backend \"10.0.0.2:80\" {}\n}\nvhost \"*\" {\n  pool = \"web\"\n}\n");
+        let new = cfg("listener \"http\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n}\nlistener \"https\" {\n  protocol  = \"https\"\n  addresses = [\"0.0.0.0\"]\n  port      = 443\n}\npool \"web\" {\n  algorithm = \"random\"\n  backend \"10.0.0.1:80\" { weight = 2 }\n  backend \"10.0.0.3:80\" {}\n}\npool \"api\" {\n  backend \"10.0.0.9:80\" {}\n}\nvhost \"*\" {\n  pool = \"api\"\n}\n");
         let got = changes(&old, &new, false);
         let want = [
-            (true, "listener \"https\" \"0.0.0.0:443\" added"),
+            (true, "listener \"https\" added"),
             (true, "pool \"api\" added"),
             (true, "pool \"web\": algorithm"),
             (true, "pool \"web\": backend \"10.0.0.1:80\" weight"),

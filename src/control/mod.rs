@@ -78,11 +78,31 @@ impl ControlServer {
 /// Where a control command is answered: the control worker, which asks the
 /// workers for their view (connections, health, drain progress live in each
 /// worker) and commits changes through the cluster.
+/// Per listener, the endpoints this node bound and those it does not have,
+/// as the master decided at start; each also set in `keel_listener_bound`.
+pub fn listeners_bound(cfg: &crate::config::Config) -> serde_json::Value {
+    cfg.listeners
+        .iter()
+        .map(|l| {
+            let (bound, skipped) = l.split_here();
+            for (endpoints, here) in [(&bound, true), (&skipped, false)] {
+                for e in endpoints {
+                    crate::metrics::set_listener_bound(&l.name, &e.to_string(), here);
+                }
+            }
+            let text = |v: &[std::net::SocketAddr]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+            serde_json::json!({ "name": l.name, "protocol": l.protocol, "bound": text(&bound), "skipped": text(&skipped) })
+        })
+        .collect()
+}
+
 pub struct Dispatch {
     pub fanout: WorkerFanout,
     pub cluster: crate::cluster::ClusterHandle,
     /// The config this node serves.
     pub applied: tokio::sync::watch::Receiver<Arc<crate::config::Config>>,
+    /// What the master bound at start, per listener, for `status`.
+    pub listeners: serde_json::Value,
 }
 
 impl Dispatch {
@@ -90,8 +110,9 @@ impl Dispatch {
         fanout: WorkerFanout,
         cluster: crate::cluster::ClusterHandle,
         applied: tokio::sync::watch::Receiver<Arc<crate::config::Config>>,
+        listeners: serde_json::Value,
     ) -> Arc<Self> {
-        Arc::new(Dispatch { fanout, cluster, applied })
+        Arc::new(Dispatch { fanout, cluster, applied, listeners })
     }
 
     /// Drain `address` on this node's workers at once, then commit it so every
@@ -158,7 +179,11 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 
     match request {
         ControlRequest::Status => {
-            write_line(&mut writer, &dispatch.fanout.status().await).await?;
+            let mut status: serde_json::Value = serde_json::from_str(&dispatch.fanout.status().await)?;
+            if let Some(data) = status.get_mut("data").and_then(serde_json::Value::as_object_mut) {
+                data.insert("listeners".into(), dispatch.listeners.clone());
+            }
+            write_line(&mut writer, &status.to_string()).await?;
         }
 
         ControlRequest::BackendList { pool } => {

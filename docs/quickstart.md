@@ -21,7 +21,11 @@ keel {
 and `config/keel.hcl`:
 
 ```hcl
-listener "http" "0.0.0.0:8080" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0", "::"]
+  port      = 8080
+}
 
 pool "web" {
   backend "127.0.0.1:3000" {}

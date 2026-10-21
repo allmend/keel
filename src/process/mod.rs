@@ -303,30 +303,37 @@ fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<Bound
         info!(v4 = icmp4.is_some(), v6 = icmp6.is_some(), "master: opened ICMP sockets for health checks");
     }
     for l in &cfg.listeners {
-        if l.protocol == crate::config::Protocol::Udp {
-            let socks = (0..per_listener)
-                .map(|_| crate::udp::bind_reuseport(&l.address))
-                .collect::<std::io::Result<Vec<_>>>()
-                .with_context(|| format!("master: cannot bind UDP listener {}", l.address))?;
-            info!(address = l.address, sockets = socks.len(), "master: bound UDP listener");
-            udp.push((l.address.clone(), socks));
-            continue;
+        let (here, elsewhere) = l.split_here();
+        if !elsewhere.is_empty() {
+            let skipped: Vec<String> = elsewhere.iter().map(ToString::to_string).collect();
+            info!(listener = l.name, skipped = skipped.join(", "), "master: addresses not on this node");
         }
-        let bound = (|| -> std::io::Result<std::net::TcpListener> {
-            let addr: std::net::SocketAddr = l
-                .address
-                .parse()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not an ip:port"))?;
-            let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-            s.set_reuse_address(true)?; // what Pingora sets on its own listeners
-            s.set_nonblocking(true)?;
-            s.bind(&addr.into())?;
-            s.listen(LISTENER_BACKLOG)?;
-            Ok(s.into())
-        })()
-        .with_context(|| format!("master: cannot bind listener {}", l.address))?;
-        info!(address = l.address, "master: bound listener");
-        tcp.push((l.address.clone(), bound));
+        for addr in here {
+            let address = addr.to_string();
+            if l.protocol == crate::config::Protocol::Udp {
+                let socks = (0..per_listener)
+                    .map(|_| crate::udp::bind_reuseport(&address))
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .with_context(|| format!("master: cannot bind listener {} on {address}", l.name))?;
+                info!(listener = l.name, address, sockets = socks.len(), "master: bound UDP listener");
+                udp.push((address, socks));
+                continue;
+            }
+            let bound = (|| -> std::io::Result<std::net::TcpListener> {
+                let s = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+                s.set_reuse_address(true)?; // what Pingora sets on its own listeners
+                if addr.is_ipv6() {
+                    s.set_only_v6(true)?;
+                }
+                s.set_nonblocking(true)?;
+                s.bind(&addr.into())?;
+                s.listen(LISTENER_BACKLOG)?;
+                Ok(s.into())
+            })()
+            .with_context(|| format!("master: cannot bind listener {} on {address}", l.name))?;
+            info!(listener = l.name, address, "master: bound listener");
+            tcp.push((address, bound));
+        }
     }
     Ok(BoundListeners { tcp, udp, icmp4, icmp6 })
 }

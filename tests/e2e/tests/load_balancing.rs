@@ -38,7 +38,11 @@ keel {
 "#;
 
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 access_log {
   dir = "-"
@@ -107,7 +111,11 @@ services:
 // Nothing listens on port 81. `checked` probes it and goes unhealthy;
 // `unchecked` has no health check, so Keel tries the backend and fails.
 const EMPTY_CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "checked" {
   health_check "tcp" {
@@ -147,10 +155,17 @@ fn a_pool_without_available_backends_answers_503_and_a_failed_upstream_502() -> 
 
 // Nothing listens on port 9: the pool's only backend fails its check.
 const DEAD_UDP_CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
-listener "udp" "0.0.0.0:5353" {
-  pool = "dead"
+listener "dns" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0"]
+  port      = 5353
+  pool      = "dead"
 }
 
 access_log {

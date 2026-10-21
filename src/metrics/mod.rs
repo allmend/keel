@@ -101,6 +101,7 @@ families! {
     CACHE_REQUESTS = "keel_cache_requests_total", Kind::Counter, &["pool", "vhost", "result"], "HTTP requests with caching on, by result (hit, miss)";
     CACHE_HITS = "keel_cache_hits_total", Kind::Counter, &["tier"], "Cache hits by the tier that served them (memory, disk)";
     UDP_ERRORS = "keel_udp_errors_total", Kind::Counter, POOL_REASON, "UDP (L4) datagrams dropped or flows ended by an error";
+    LISTENER_BOUND = "keel_listener_bound", Kind::State(Merge::Max), &["listener", "address"], "Listener address bound on this node (1) or not on this node (0)";
     UPSTREAM_RETRIES = "keel_upstream_retries_total", Kind::Counter, &["pool"], "HTTP requests retried on another backend after a failed connect";
 }
 
@@ -538,6 +539,11 @@ pub fn record_lb_error(pool: &str, vhost: &str, reason: &str) {
 
 pub fn record_tcp_error(pool: &str, reason: &str) {
     Counter::of(F::TCP_ERRORS, &[pool, reason]).inc();
+}
+
+/// Control worker: whether this node bound a listener's address.
+pub fn set_listener_bound(listener: &str, address: &str, bound: bool) {
+    State(&cells(F::LISTENER_BOUND, &[listener, address])[0]).set(bound as u64);
 }
 
 pub fn record_upstream_retry(pool: &str) {

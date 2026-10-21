@@ -27,6 +27,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Breaking: named listeners.** `listener "<name>" { protocol, addresses,
+  port }` replaces `listener "<protocol>" "<ip:port>"`. `addresses` is the
+  same on every node; each node binds those it has and skips the rest.
+  `keel status` and `keel_listener_bound` show which. Logs and metrics
+  label listeners by name. IPv6 sockets are IPv6 only.
 - **Breaking: addresses are `ip:port`.** Backends, listeners, `metrics`,
   `control.remote` and `cluster` refuse host names at load. Keel resolves
   no names.

@@ -48,9 +48,16 @@ keel {
   max_header_size   = "2K"
 }
 
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
-listener "tcp" "0.0.0.0:6000" {
+listener "web" {
+  protocol     = "tcp"
+  addresses    = ["0.0.0.0"]
+  port         = 6000
   pool         = "web"
   idle_timeout = "2s"
 }

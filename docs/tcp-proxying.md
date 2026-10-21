@@ -3,8 +3,11 @@
 A `tcp` listener proxies TCP connections to a pool. No vhosts or routes apply. Algorithms, weights, health checks, drain and connection counts work as for HTTP.
 
 ```hcl
-listener "tcp" "0.0.0.0:5432" {
-  pool = "postgres"
+listener "postgres" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 5432
+  pool      = "postgres"
 }
 ```
 
@@ -34,8 +37,11 @@ Protocols that start TLS at byte zero (Redis `tls-port`, LDAPS, MQTT over TLS) w
 ## PostgreSQL (passthrough)
 
 ```hcl
-listener "tcp" "0.0.0.0:5432" {
-  pool = "postgres"
+listener "postgres" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 5432
+  pool      = "postgres"
 }
 
 pool "postgres" {
@@ -55,10 +61,13 @@ The client verifies the database's own certificate. A [`certificate` block](acme
 ## Redis (terminate)
 
 ```hcl
-listener "tcp" "0.0.0.0:6379" {
-  pool     = "redis"
-  tls_mode = "terminate"
-  tls_host = "cache.example.com"
+listener "redis" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0", "::"]
+  port      = 6379
+  pool      = "redis"
+  tls_mode  = "terminate"
+  tls_host  = "cache.example.com"
 }
 
 certificate "cache.example.com" {}
@@ -85,7 +94,10 @@ Keel serves an ACME certificate for `cache.example.com`; Redis runs without TLS.
 ## LDAPS (reencrypt)
 
 ```hcl
-listener "tcp" "0.0.0.0:636" {
+listener "ldap" {
+  protocol   = "tcp"
+  addresses  = ["0.0.0.0"]
+  port       = 636
   pool       = "ldap"
   tls_mode   = "reencrypt"
   tls_host   = "ldap.example.com"

@@ -54,7 +54,11 @@ locals {
   check_every  = "1s"
 }
 
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 vhost "*" {
   pool = "web"
@@ -79,7 +83,11 @@ const BROKEN: &str = r#"pool "web" {
     algorithmn = "round_robin"
 }
 
-listener "http" "0.0.0.0:80" {}
+listener "http-80" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 "#;
 
 const MESSY: &str = "pool \"web\" {\nalgorithm=\"round_robin\"\n  backend \"172.29.88.21:80\" { weight=2 }\n}\n";

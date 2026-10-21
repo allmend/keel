@@ -4,15 +4,20 @@
 # directory is the replicated config: identical on every node. How this node
 # is run and reached lives in /etc/keel/node.hcl.
 
-listener "http" "0.0.0.0:80" {}
+# Every node binds the addresses it has: list each node's own IPs, or the
+# wildcards. Enable proxy_protocol when Keel sits behind a load balancer or
+# proxy that sends the real client address that way.
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0", "::"]
+  port      = 80
+}
 
-listener "https" "0.0.0.0:443" {}
-
-# Enable PROXY protocol on a listener when Keel sits behind a load balancer
-# or proxy that sends the real client address that way:
-# listener "http" "0.0.0.0:80" {
-#   proxy_protocol = true
-# }
+listener "https" {
+  protocol  = "https"
+  addresses = ["0.0.0.0", "::"]
+  port      = 443
+}
 
 access_log {
   enabled = true

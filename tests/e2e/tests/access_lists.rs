@@ -43,26 +43,42 @@ metrics {
 
 // Requests come from inside the keel container, from 127.0.0.1.
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
-
-listener "tcp" "0.0.0.0:2201" {
-  pool  = "web"
-  allow = ["127.0.0.1"]
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
 }
 
-listener "tcp" "0.0.0.0:2202" {
-  pool = "web"
-  deny = ["127.0.0.0/8"]
+listener "tcp-in" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0"]
+  port      = 2201
+  pool      = "web"
+  allow     = ["127.0.0.1"]
 }
 
-listener "udp" "0.0.0.0:5301" {
-  pool  = "dead"
-  allow = ["127.0.0.1"]
+listener "tcp-out" {
+  protocol  = "tcp"
+  addresses = ["0.0.0.0"]
+  port      = 2202
+  pool      = "web"
+  deny      = ["127.0.0.0/8"]
 }
 
-listener "udp" "0.0.0.0:5302" {
-  pool = "dead"
-  deny = ["127.0.0.0/8"]
+listener "udp-in" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0"]
+  port      = 5301
+  pool      = "dead"
+  allow     = ["127.0.0.1"]
+}
+
+listener "udp-out" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0"]
+  port      = 5302
+  pool      = "dead"
+  deny      = ["127.0.0.0/8"]
 }
 
 access_log {
@@ -154,7 +170,7 @@ fn allow_and_deny_on_vhosts_routes_and_listeners() -> Result<()> {
     // Drops are logged once a second.
     let logs = wait_until("the UDP drop logged", Duration::from_secs(10), || {
         let logs = stack.logs("keel")?;
-        Ok(logs.contains(r#""listener":"0.0.0.0:5302""#).then_some(logs))
+        Ok(logs.contains(r#""listener":"udp-out""#).then_some(logs))
     })?;
     let denied: Vec<&str> = logs.lines().filter(|l| l.contains(r#""error":"denied""#)).collect();
     let of = |kind: &str| denied.iter().filter(|l| l.contains(&format!(r#""type":"{kind}""#))).count();
@@ -163,7 +179,7 @@ fn allow_and_deny_on_vhosts_routes_and_listeners() -> Result<()> {
     for series in [r#"keel_lb_errors_total{pool="web",vhost="closed.test",reason="denied"} 1"#, r#"keel_tcp_errors_total{pool="web",reason="denied"} 1"#, r#"keel_udp_errors_total{pool="dead",reason="denied"} 1"#] {
         assert!(metrics.contains(series), "{series} in:\n{metrics}");
     }
-    assert!(!denied.iter().any(|l| l.contains("0.0.0.0:5301")), "{logs}");
+    assert!(!denied.iter().any(|l| l.contains(r#""listener":"udp-in""#)), "{logs}");
     assert!(denied.iter().all(|l| l.contains(r#""client_addr":"127.0.0.1:"#)), "{logs}");
 
     // A push without the vhost list lets the client in, no restart.

@@ -1191,14 +1191,14 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         info!("no listeners configured, defaulting to 0.0.0.0:8080");
         listen(&mut svc, "0.0.0.0:8080");
     } else {
-        for l in plain {
-            info!(address = l.address, "adding listener");
-            listen(&mut svc, &l.address);
+        for (l, address) in here(plain) {
+            info!(listener = l.name, address, "adding listener");
+            listen(&mut svc, &address);
         }
-        for l in tls {
-            let settings = build_tls_settings(&cert_store, &l.address);
-            info!(address = l.address, "adding TLS listener");
-            svc.add_tls_with_settings(&l.address, socket_options(), settings);
+        for (l, address) in here(tls) {
+            let settings = build_tls_settings(&cert_store, &address);
+            info!(listener = l.name, address, "adding TLS listener");
+            svc.add_tls_with_settings(&address, socket_options(), settings);
         }
     }
 
@@ -1290,15 +1290,21 @@ fn add_proxy_protocol_tls_services(
     proxy: KProxy,
     cert_store: &Arc<CertStore>,
 ) {
-    for l in cfg.listeners.iter().filter(|l| l.tls() && l.proxy_protocol) {
-        info!(address = l.address, "adding TLS listener (PROXY protocol)");
+    for (l, address) in here(cfg.listeners.iter().filter(|l| l.tls() && l.proxy_protocol)) {
+        info!(listener = l.name, address, "adding TLS listener (PROXY protocol)");
         let mut svc = http_proxy_service(&server.configuration, proxy.clone());
         svc.endpoints()
-            .set_pre_tls_callback(Arc::new(ProxyProtocolPreTls { listener: l.address.clone() }));
-        let settings = build_tls_settings(cert_store, &l.address);
-        svc.add_tls_with_settings(&l.address, socket_options(), settings);
+            .set_pre_tls_callback(Arc::new(ProxyProtocolPreTls { listener: l.name.clone() }));
+        let settings = build_tls_settings(cert_store, &address);
+        svc.add_tls_with_settings(&address, socket_options(), settings);
         server.add_service(svc);
     }
+}
+
+/// Every endpoint of `listeners` this node has, with its listener: what
+/// the master bound (process::bind_listeners).
+fn here<'a>(listeners: impl IntoIterator<Item = &'a crate::config::Listener>) -> Vec<(&'a crate::config::Listener, String)> {
+    listeners.into_iter().flat_map(|l| l.split_here().0.into_iter().map(move |e| (l, e.to_string()))).collect()
 }
 
 /// Socket options for a listener a worker binds itself. On Linux the master
@@ -1323,18 +1329,14 @@ fn listen<A>(svc: &mut pingora::services::listening::Service<A>, address: &str) 
 
 /// One service per plain HTTP listener with `proxy_protocol: true`.
 fn add_proxy_protocol_services(server: &mut Server, cfg: &Config, proxy: KProxy) {
-    for l in cfg
-        .listeners
-        .iter()
-        .filter(|l| l.proxy_protocol && l.protocol == Protocol::Http)
-    {
-        info!(address = l.address, "adding listener (PROXY protocol)");
+    for (l, address) in here(cfg.listeners.iter().filter(|l| l.proxy_protocol && l.protocol == Protocol::Http)) {
+        info!(listener = l.name, address, "adding listener (PROXY protocol)");
         let app = ProxyProtocolApp {
             inner: Arc::new(pingora::proxy::HttpProxy::new(proxy.clone(), server.configuration.clone())),
-            listener: l.address.clone(),
+            listener: l.name.clone(),
         };
-        let mut svc = pingora::services::listening::Service::new(format!("proxy-pp-{}", l.address), app);
-        listen(&mut svc, &l.address);
+        let mut svc = pingora::services::listening::Service::new(format!("proxy-pp-{address}"), app);
+        listen(&mut svc, &address);
         server.add_service(svc);
     }
 }
@@ -1366,7 +1368,7 @@ fn add_l4_services(
                     let ca = l
                         .tls_ca
                         .as_ref()
-                        .map(|p| cfg.read_file(p).map_err(|e| anyhow::anyhow!("listener '{}': tls_ca: {e:#}", l.address)))
+                        .map(|p| cfg.read_file(p).map_err(|e| anyhow::anyhow!("listener \"{}\": tls_ca: {e:#}", l.name)))
                         .transpose()?;
                     Some(crate::tls::verifying_client_config(ca.as_deref())?)
                 }
@@ -1378,14 +1380,13 @@ fn add_l4_services(
         let (server_tls, client_tls) = match built {
             Ok(v) => v,
             Err(e) => {
-                error!(address = l.address, error = %e, "tcp: cannot build TLS listener");
+                error!(listener = l.name, error = %e, "tcp: cannot build TLS listener");
                 std::process::exit(1);
             }
         };
-        info!(address = l.address, pool, mode = ?l.tls_mode, "adding TCP listener");
         let connect_timeout = cfg.pools[&pool].connect_timeout;
         let app = crate::l4::TcpProxyApp {
-            listener: l.address.clone(),
+            listener: l.name.clone(),
             pool,
             pools: Arc::clone(pools),
             access_logger: Arc::clone(access_logger),
@@ -1397,11 +1398,11 @@ fn add_l4_services(
             connect_timeout,
             idle_timeout: l.idle_timeout.unwrap_or(std::time::Duration::from_secs(3600)),
         };
-        let mut svc = pingora::services::listening::Service::new(
-            format!("tcp-{}", l.address),
-            app,
-        );
-        listen(&mut svc, &l.address);
+        let mut svc = pingora::services::listening::Service::new(format!("tcp-{}", l.name), app);
+        for (_, address) in here([l]) {
+            info!(listener = l.name, address, pool = l.pool.as_deref(), mode = ?l.tls_mode, "adding TCP listener");
+            listen(&mut svc, &address);
+        }
         server.add_service(svc);
     }
 }
@@ -1418,12 +1419,13 @@ fn add_udp_services(
     routing: &Arc<ArcSwap<RoutingTable>>,
     mut inherited: Option<&mut HashMap<String, std::net::UdpSocket>>,
 ) {
-    for l in cfg.listeners.iter() {
+    for (l, address) in here(cfg.listeners.iter()) {
         let Some(pool) = l.udp_pool().map(str::to_owned) else { continue };
-        let socket = inherited.as_mut().and_then(|m| m.remove(&l.address));
-        info!(address = l.address, pool, inherited = socket.is_some(), "adding UDP listener");
+        let socket = inherited.as_mut().and_then(|m| m.remove(&address));
+        info!(listener = l.name, address, pool, inherited = socket.is_some(), "adding UDP listener");
         let svc = crate::udp::UdpProxyService {
-            listener: l.address.clone(),
+            listener: l.name.clone(),
+            address: address.clone(),
             pool,
             pools: Arc::clone(pools),
             access_logger: Arc::clone(access_logger),
@@ -1433,6 +1435,6 @@ fn add_udp_services(
             proxy_protocol: l.proxy_protocol,
             routing: Arc::clone(routing),
         };
-        server.add_service(background_service(&format!("udp-{}", l.address), svc));
+        server.add_service(background_service(&format!("udp-{address}"), svc));
     }
 }

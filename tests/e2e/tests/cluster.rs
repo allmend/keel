@@ -127,9 +127,17 @@ cluster {{
 fn lb_config(extra_vhosts: &str) -> String {
     format!(
         r#"
-listener "http" "0.0.0.0:80" {{}}
+listener "http" {{
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}}
 
-listener "https" "0.0.0.0:443" {{}}
+listener "https" {{
+  protocol  = "https"
+  addresses = ["0.0.0.0"]
+  port      = 443
+}}
 
 pool "web" {{
   backend "172.29.83.20:80" {{}}

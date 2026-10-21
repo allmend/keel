@@ -100,7 +100,7 @@ One entry per connection, written when it closes:
   "timestamp":    "2026-07-06T12:52:00.812Z",
   "type":         "tls",
   "client_addr":  "203.0.113.42:57811",
-  "listener":     "0.0.0.0:6379",
+  "listener":     "redis",
   "pool":         "redis",
   "backend_addr": "10.0.0.21:6379",
   "bytes_in":     6420,
@@ -117,7 +117,7 @@ One entry per connection, written when it closes:
 | Field | Notes |
 |---|---|
 | `type` | `tcp` in passthrough, `tls` when Keel terminates TLS |
-| `listener` | Address that accepted the connection |
+| `listener` | Name of the listener that accepted the connection |
 | `bytes_in`, `bytes_out` | Application bytes from and to the client |
 | `duration_ms` | Accept to close |
 | `tls_sni`, `tls_version`, `tls_cipher` | When Keel terminates TLS; `null` otherwise |
@@ -132,7 +132,7 @@ One entry per flow, written when it ends:
   "timestamp":    "2026-07-06T12:52:00.812Z",
   "type":         "udp",
   "client_addr":  "203.0.113.42:41230",
-  "listener":     "0.0.0.0:53",
+  "listener":     "dns",
   "pool":         "dns",
   "backend_addr": "10.0.0.11:53",
   "bytes_in":     64,

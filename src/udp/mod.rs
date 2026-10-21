@@ -47,7 +47,10 @@ const MAX_DATAGRAM: usize = 65_535;
 const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct UdpProxyService {
+    /// The listener's name.
     pub listener: String,
+    /// The `ip:port` this service receives on.
+    pub address: String,
     pub pool: String,
     pub pools: Arc<PoolRegistry>,
     pub access_logger: Arc<AccessLogger>,
@@ -361,17 +364,18 @@ impl BackgroundService for UdpProxyService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         let bound = match self.socket.as_ref() {
             Some(s) => s.try_clone(),
-            None => bind_reuseport(&self.listener),
+            None => bind_reuseport(&self.address),
         };
         let downstream = match bound.and_then(UdpSocket::from_std) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                error!(address = self.listener, pool = self.pool, error = %e, "udp: failed to bind");
+                error!(listener = self.listener, address = self.address, pool = self.pool, error = %e, "udp: failed to bind");
                 return;
             }
         };
         info!(
-            address = self.listener,
+            listener = self.listener,
+            address = self.address,
             pool = self.pool,
             inherited = self.socket.is_some(),
             "udp: listening"
@@ -393,7 +397,7 @@ impl BackgroundService for UdpProxyService {
                             self.close_flow(client, flow, Some("shutdown"));
                         }
                         self.log_drops(&mut drops);
-                        info!(address = self.listener, pool = self.pool, "udp: listener stopped");
+                        info!(listener = self.listener, address = self.address, pool = self.pool, "udp: listener stopped");
                         return;
                     }
                 }
@@ -432,7 +436,7 @@ impl BackgroundService for UdpProxyService {
                         }
                         // Transient (e.g. ICMP surfaced on some platforms); the
                         // listener socket itself is not affected.
-                        Err(e) => debug!(address = self.listener, error = %e, "udp: receive failed"),
+                        Err(e) => debug!(listener = self.listener, address = self.address, error = %e, "udp: receive failed"),
                     }
                 }
             }
@@ -508,6 +512,9 @@ pub fn bind_reuseport(addr: &str) -> std::io::Result<std::net::UdpSocket> {
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("'{addr}' is not an ip:port")))?;
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;

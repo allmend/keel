@@ -18,7 +18,7 @@
 
 | Command | Object |
 |---|---|
-| `status` | `uptime_secs`, `pools`: `[{name, backends}]` |
+| `status` | `uptime_secs`, `listeners`: `[{name, protocol, bound, skipped}]`, `pools`: `[{name, backends}]` |
 | `backend list` | `pool`, `backends` |
 | `backend drain` | `pools`, `workers`, `workers_acknowledged`, `done`; with `--wait` then one `{connections, done}` per update until `done` |
 | `backend activate` | `pools` |
@@ -47,10 +47,12 @@ Is keel running?
 
 ## keel status
 
-Uptime, and every backend's drain state, health and open connections.
+Uptime, what each listener bound on this node, and every backend's drain state, health and open connections.
 
 ```
 keel — uptime 2h 14m 30s
+  listener web (https): 194.56.78.90:443; not on this node: 194.56.78.91:443, 194.56.78.92:443
+  listener dns (udp): 0.0.0.0:53, [::]:53
 
   web (3 backends)
     10.0.0.1:8080              active      healthy     12 conn

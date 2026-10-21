@@ -25,7 +25,7 @@ pub struct RoutingTable {
     access: HashMap<String, AccessList>,
     /// host → `forwarded_headers.trusted_proxies`, parsed.
     trusted: HashMap<String, Vec<ipnet::IpNet>>,
-    /// `tcp` and `udp` listener address → its access list.
+    /// `tcp` and `udp` listener name → its access list.
     listener_access: HashMap<String, AccessList>,
 }
 
@@ -116,7 +116,7 @@ impl RoutingTable {
         let listener_access = cfg
             .listeners
             .iter()
-            .filter_map(|l| Some((l.address.clone(), list(&l.allow, &l.deny)?)))
+            .filter_map(|l| Some((l.name.clone(), list(&l.allow, &l.deny)?)))
             .collect();
         let acme_challenge_dir = cfg.acme_effective().map(|_| crate::acme::challenge_dir(&cfg.keel));
         RoutingTable { vhosts, forwarded, cache, redirect_http, default_actions, acme_challenge_dir, access, trusted, listener_access }
@@ -141,8 +141,8 @@ impl RoutingTable {
     }
 
     /// The access list of a `tcp` or `udp` listener.
-    pub fn listener_access(&self, address: &str) -> Option<&AccessList> {
-        self.listener_access.get(address)
+    pub fn listener_access(&self, name: &str) -> Option<&AccessList> {
+        self.listener_access.get(name)
     }
 
     pub fn acme_challenge_dir(&self) -> Option<&std::path::Path> {
@@ -342,7 +342,7 @@ mod tests {
     fn a_route_list_replaces_its_vhosts() {
         let cfg = crate::config::parse(
             "pool \"web\" {\n  backend \"10.0.0.1:80\" {}\n}\n\
-             listener \"tcp\" \"0.0.0.0:22\" {\n  pool = \"web\"\n  allow = [\"10.0.0.0/8\"]\n}\n\
+             listener \"ssh\" {\n  protocol  = \"tcp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 22\n  pool      = \"web\"\n  allow     = [\"10.0.0.0/8\"]\n}\n\
              vhost \"a.test\" {\n  allow = [\"10.0.0.0/8\"]\n\n  route \"/\" {\n    pool = \"web\"\n  }\n\n  \
              route \"/open/\" {\n    pool = \"web\"\n    deny = [\"192.0.2.1\"]\n  }\n}\n\
              vhost \"*\" {\n  deny = [\"10.0.0.0/8\"]\n\n  default_action {\n    status = 404\n  }\n}\n",
@@ -353,7 +353,7 @@ mod tests {
         assert!(permits("a.test", "/", "10.1.1.1") && !permits("a.test", "/", "192.0.2.2"));
         assert!(permits("a.test", "/open/x", "192.0.2.2") && !permits("a.test", "/open/x", "192.0.2.1"));
         assert!(!permits("other.test", "/", "10.1.1.1") && permits("other.test", "/", "192.0.2.2"));
-        assert!(t.listener_access("0.0.0.0:22").is_some_and(|l| !l.permits("192.0.2.2".parse().unwrap())));
+        assert!(t.listener_access("ssh").is_some_and(|l| !l.permits("192.0.2.2".parse().unwrap())));
     }
 
     #[test]

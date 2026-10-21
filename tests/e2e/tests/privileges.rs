@@ -37,10 +37,17 @@ keel {
 "#;
 
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
-listener "udp" "0.0.0.0:53" {
-  pool = "dns"
+listener "dns" {
+  protocol  = "udp"
+  addresses = ["0.0.0.0"]
+  port      = 53
+  pool      = "dns"
 }
 
 pool "web" {
@@ -171,7 +178,10 @@ fn killed_worker_is_replaced_under_its_index() -> Result<()> {
 // Every worker fails to build its TCP listener: an absolute tls_ca is read
 // when used, and this one does not exist.
 const FAILING_CONFIG: &str = r#"
-listener "tcp" "0.0.0.0:6380" {
+listener "web" {
+  protocol   = "tcp"
+  addresses  = ["0.0.0.0"]
+  port       = 6380
   pool       = "web"
   tls_mode   = "reencrypt"
   tls_host   = "failing.test"
@@ -329,7 +339,11 @@ keel {
 }
 "#;
     const CONFIG: &str = r#"
-listener "http" "0.0.0.0:8080" {}
+listener "http-8080" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 8080
+}
 
 access_log {
   dir = "/tmp/keel/log"

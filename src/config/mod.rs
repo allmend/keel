@@ -259,7 +259,15 @@ impl Config {
             }
         }
         for l in &self.listeners {
-            literal("listener".into(), &l.address)?;
+            if l.addresses.is_empty() {
+                anyhow::bail!("listener \"{}\": addresses lists none; a wildcard is [\"0.0.0.0\", \"::\"]", l.name);
+            }
+            if let Some(a) = l.addresses.iter().find(|a| a.parse::<std::net::IpAddr>().is_err()) {
+                anyhow::bail!("listener \"{}\": '{a}' is not an IP", l.name);
+            }
+            if l.port == 0 {
+                anyhow::bail!("listener \"{}\": port must be 1-65535", l.name);
+            }
         }
         for (name, pool) in &self.pools {
             for b in &pool.backends {
@@ -325,12 +333,23 @@ impl Config {
         if self.keel.udp_max_flows == 0 {
             anyhow::bail!("keel.udp_max_flows must be at least 1");
         }
-        let mut bound: HashSet<(bool, &str)> = HashSet::new();
+        let mut names = HashSet::new();
+        // http, https and tcp listeners share TCP ports; udp has its own.
+        let mut bound: Vec<(bool, std::net::SocketAddr, &str)> = Vec::new();
         for l in &self.listeners {
-            let id = format!("listener \"{}\" \"{}\"", serde_json::to_value(l.protocol).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default(), l.address);
-            // http, https and tcp listeners share TCP ports; udp has its own.
-            if !bound.insert((l.protocol == Protocol::Udp, l.address.as_str())) {
-                anyhow::bail!("{id}: another listener already uses {}", l.address);
+            let id = format!("listener \"{}\"", l.name);
+            if l.name.is_empty() || !l.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                anyhow::bail!("{id}: a name is letters, digits, - and _");
+            }
+            if !names.insert(l.name.as_str()) {
+                anyhow::bail!("{id} is defined twice");
+            }
+            let udp = l.protocol == Protocol::Udp;
+            for e in l.endpoints() {
+                if let Some((_, _, other)) = bound.iter().find(|(u, b, _)| *u == udp && overlaps(*b, e)) {
+                    anyhow::bail!("{id}: {e} is also listener \"{other}\"'s");
+                }
+                bound.push((udp, e, l.name.as_str()));
             }
             match (l.protocol, &l.pool) {
                 (Protocol::Tcp | Protocol::Udp, None) => anyhow::bail!("{id} needs a pool"),
@@ -517,9 +536,6 @@ impl Config {
     /// is also in `listeners:` would race for the port at bind time.
     fn check_port_collisions(&self) -> Result<()> {
         use std::net::SocketAddr;
-        let overlaps = |a: SocketAddr, b: SocketAddr| {
-            a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
-        };
         let own = [
             ("control.remote.address", self.control.as_ref().and_then(|c| c.remote.as_ref()).map(|r| r.address.as_str())),
             ("cluster.addr", self.cluster.as_ref().map(|c| c.addr.as_str())),
@@ -528,8 +544,8 @@ impl Config {
             let Some(address) = address else { continue };
             let Ok(ours) = address.parse::<SocketAddr>() else { continue };
             for l in self.listeners.iter().filter(|l| l.protocol != Protocol::Udp) {
-                if l.address.parse::<SocketAddr>().is_ok_and(|theirs| overlaps(ours, theirs)) {
-                    anyhow::bail!("{field} {address} collides with listener {}", l.address);
+                if l.endpoints().into_iter().any(|theirs| overlaps(ours, theirs)) {
+                    anyhow::bail!("{field} {address} collides with listener \"{}\"", l.name);
                 }
             }
         }
@@ -556,7 +572,7 @@ impl Config {
             carried(format!("certificate '{}'", c.host), "key", &c.key)?;
         }
         for l in &self.listeners {
-            carried(format!("listener '{}'", l.address), "tls_ca", &l.tls_ca)?;
+            carried(format!("listener \"{}\"", l.name), "tls_ca", &l.tls_ca)?;
         }
         if let Some(acme) = &self.acme {
             for (name, issuer) in &acme.issuers {
@@ -815,13 +831,20 @@ fn default_group() -> String { "keel".into() }
 fn default_control_user() -> String { "keel-control".into() }
 fn default_control_socket() -> String { "/var/run/keel/keel.sock".into() }
 
-/// `listener "<protocol>" "<address>" { ... }`.
+/// `listener "<name>" { ... }`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
+    /// The label: the same on every node, for logs, metrics and status.
+    pub name: String,
+
     pub protocol: Protocol,
 
-    pub address: String,
+    /// IPs to listen on. The same on every node; each node binds those it
+    /// has.
+    pub addresses: Vec<String>,
+
+    pub port: u16,
 
     /// The pool a `tcp` or `udp` listener forwards to. HTTP listeners route
     /// by vhost instead.
@@ -881,6 +904,16 @@ pub enum Protocol {
 }
 
 impl Listener {
+    /// Every `ip:port` the listener names. Validated: the addresses are IPs.
+    pub fn endpoints(&self) -> Vec<std::net::SocketAddr> {
+        self.addresses.iter().filter_map(|a| a.parse().ok()).map(|ip| std::net::SocketAddr::new(ip, self.port)).collect()
+    }
+
+    /// The endpoints this node has, and those it has not.
+    pub fn split_here(&self) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+        self.endpoints().into_iter().partition(|e| on_this_node(e.ip()))
+    }
+
     /// Terminates TLS for HTTP.
     pub fn tls(&self) -> bool {
         self.protocol == Protocol::Https
@@ -895,6 +928,20 @@ impl Listener {
     pub fn udp_pool(&self) -> Option<&str> {
         self.pool.as_deref().filter(|_| self.protocol == Protocol::Udp)
     }
+}
+
+/// Two sockets on one port that cannot both be bound: the same IP, or a
+/// wildcard and anything of the same family.
+fn overlaps(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || (a.is_ipv4() == b.is_ipv4() && (a.ip().is_unspecified() || b.ip().is_unspecified())))
+}
+
+/// Whether this machine holds `ip`: a wildcard always, else what binding it
+/// says. Only "not available" means no; any other error is the real bind's
+/// to report.
+pub fn on_this_node(ip: std::net::IpAddr) -> bool {
+    ip.is_unspecified()
+        || std::net::UdpSocket::bind((ip, 0)).map_or_else(|e| e.kind() != std::io::ErrorKind::AddrNotAvailable, |_| true)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
@@ -1694,7 +1741,11 @@ mod tests {
   grace_period = "3s"
 }
 
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "web" {
   backend "10.0.0.1:80" {}
@@ -1736,7 +1787,7 @@ vhost "a.test" {
         assert!(e.starts_with("keel.hcl:2:3: expected a duration such as \"30s\", got 3"), "{e}");
         let set = files(&[("keel.hcl", &ROOT.replace("pool = \"web\"", "pool = 7"))]);
         let e = assemble_err("", &set);
-        assert!(e.starts_with("keel.hcl:12:3: invalid type: integer `7`, expected a string"), "{e}");
+        assert!(e.starts_with("keel.hcl:16:3: invalid type: integer `7`, expected a string"), "{e}");
         let e = assemble_err("keel {\n  workers = \"many\"\n}\n", &files(&[("keel.hcl", ROOT)]));
         assert!(e.starts_with("node.hcl:2:3: invalid type: string \"many\""), "{e}");
         let set = files(&[("keel.hcl", &ROOT.replace("vhost \"a.test\" {", "vhost \"a.test\" {\n  tls {}"))]);
@@ -1754,7 +1805,7 @@ vhost "a.test" {
     #[test]
     fn replicated_sections_are_refused_in_the_node_file() {
         let set = files(&[("keel.hcl", ROOT)]);
-        let e = assemble_err("listener \"http\" \"0.0.0.0:81\" {}\n", &set);
+        let e = assemble_err("listener \"http-81\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 81\n}\n", &set);
         assert!(e.contains("`listener` belongs in the config directory"), "{e}");
         let e = assemble_err("keel {\n  grace_period = \"5s\"\n}\n", &set);
         assert!(e.contains("`keel.grace_period` belongs in the config directory"), "{e}");
@@ -1763,7 +1814,7 @@ vhost "a.test" {
     #[test]
     fn node_sections_are_refused_in_the_config_directory() {
         let e = assemble_err("", &files(&[("keel.hcl", &format!("{ROOT}cluster {{\n  addr = \"10.0.0.1:7654\"\n}}\n"))]));
-        assert!(e.contains("keel.hcl:14:1: `cluster` belongs in the node file"), "{e}");
+        assert!(e.contains("keel.hcl:18:1: `cluster` belongs in the node file"), "{e}");
         let e = assemble_err("", &files(&[("keel.hcl", &ROOT.replace("grace_period = \"3s\"", "workers = 2"))]));
         assert!(e.contains("`keel.workers` belongs in the node file"), "{e}");
     }
@@ -1796,7 +1847,11 @@ vhost "a.test" {
         let _ = std::fs::remove_file(&node);
     }
 
-    const TLS_ROOT: &str = r#"listener "https" "0.0.0.0:443" {}
+    const TLS_ROOT: &str = r#"listener "https" {
+      protocol  = "https"
+      addresses = ["0.0.0.0"]
+      port      = 443
+    }
 
 pool "web" {
   backend "10.0.0.1:80" {}
@@ -1844,16 +1899,19 @@ vhost "a.test" {
 
     #[test]
     fn control_and_peer_ports_must_not_be_listeners() {
-        let listening = |address: &str| format!("{WEB}listener \"http\" \"{address}\" {{}}\n");
+        let listening = |address: &str| {
+            let (ip, port) = address.rsplit_once(':').unwrap();
+            format!("{WEB}listener \"http\" {{\n  protocol  = \"http\"\n  addresses = [\"{ip}\"]\n  port      = {port}\n}}\n")
+        };
         let remote = "control {\n  remote {\n    address = \"0.0.0.0:10789\"\n  }\n}\n";
         let e = assemble_err(remote, &files(&[("keel.hcl", &listening("10.0.0.1:10789"))]));
-        assert!(e.contains("control.remote.address 0.0.0.0:10789 collides with listener 10.0.0.1:10789"), "{e}");
+        assert!(e.contains("control.remote.address 0.0.0.0:10789 collides with listener \"http\""), "{e}");
         let peer = "cluster {\n  addr   = \"10.0.0.1:7654\"\n  secret = \"s\"\n}\n";
         let e = assemble_err(peer, &files(&[("keel.hcl", &listening("0.0.0.0:7654"))]));
         assert!(e.contains("cluster.addr 10.0.0.1:7654 collides"), "{e}");
         // Another address on the same port, or a UDP listener, is no collision.
         assemble(peer, &files(&[("keel.hcl", &listening("10.0.0.2:7654"))])).unwrap();
-        let udp = format!("{WEB}listener \"udp\" \"0.0.0.0:7654\" {{\n  pool = \"web\"\n}}\n");
+        let udp = format!("{WEB}listener \"web\" {{\n  protocol  = \"udp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 7654\n  pool      = \"web\"\n}}\n");
         assemble(peer, &files(&[("keel.hcl", &udp)])).unwrap();
     }
 
@@ -1963,8 +2021,9 @@ vhost "a.test" {
         let e = |text: &str| err(&parse(text).unwrap());
         assert_eq!(e("pool \"web\" {\n  backend \"web1:80\" {}\n}\n"), "pool 'web': backend: 'web1:80' is not an ip:port");
         assert_eq!(e("pool \"web\" {\n  backend \"10.0.0.1\" {}\n}\n"), "pool 'web': backend: '10.0.0.1' is not an ip:port");
-        assert_eq!(e(&format!("{POOL}listener \"http\" \"localhost:80\" {{}}\n")), "listener: 'localhost:80' is not an ip:port");
-        parse("pool \"web\" {\n  backend \"[2001:db8::1]:8080\" {}\n}\nlistener \"http\" \"[::]:80\" {}\n").unwrap().validate().unwrap();
+        assert_eq!(e(&format!("{POOL}listener \"web\" {{\n  protocol  = \"http\"\n  addresses = [\"localhost\"]\n  port      = 80\n}}\n")), "listener \"web\": 'localhost' is not an IP");
+        assert!(e(&format!("{POOL}listener \"web\" {{\n  protocol  = \"http\"\n  addresses = []\n  port      = 80\n}}\n")).contains("addresses lists none"));
+        parse("pool \"web\" {\n  backend \"[2001:db8::1]:8080\" {}\n}\nlistener \"web\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\", \"::\"]\n  port      = 80\n}\n").unwrap().validate().unwrap();
     }
 
     #[test]
@@ -1975,8 +2034,8 @@ vhost "a.test" {
             e("vhost \"a\" {\n  route \"/x/\" {\n    pool = \"dns\"\n    deny = [\"10.0.0.0/33\"]\n  }\n}\n"),
             "vhost 'a': route '/x/': '10.0.0.0/33' is not an IP network or address"
         );
-        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  allow = [\"10.0.0.0/8\"]\n}\n").contains("allow and deny apply to tcp and udp listeners"));
-        with_pool("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n  allow = [\"10.0.0.0/8\", \"2001:db8::1\"]\n}\n").validate().unwrap();
+        assert!(e("listener \"http-80\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n  allow     = [\"10.0.0.0/8\"]\n}\n").contains("allow and deny apply to tcp and udp listeners"));
+        with_pool("listener \"dns\" {\n  protocol  = \"udp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 53\n  pool      = \"dns\"\n  allow     = [\"10.0.0.0/8\", \"2001:db8::1\"]\n}\n").validate().unwrap();
     }
 
     #[test]
@@ -1984,8 +2043,8 @@ vhost "a.test" {
         let e = |text: &str| err(&with_pool(text));
         assert!(e("keel {\n  max_header_size = \"lots\"\n}\n").starts_with("keel.max_header_size:"));
         assert!(e("vhost \"a\" {\n  pool          = \"dns\"\n  max_body_size = \"x\"\n}\n").starts_with("vhost 'a': max_body_size:"));
-        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  idle_timeout = \"5s\"\n}\n").contains("idle_timeout applies to tcp listeners"));
-        let cfg = with_pool("listener \"tcp\" \"0.0.0.0:53\" {\n  pool         = \"dns\"\n  idle_timeout = \"5m\"\n}\n");
+        assert!(e("listener \"http-80\" {\n  protocol     = \"http\"\n  addresses    = [\"0.0.0.0\"]\n  port         = 80\n  idle_timeout = \"5s\"\n}\n").contains("idle_timeout applies to tcp listeners"));
+        let cfg = with_pool("listener \"dns-53\" {\n  protocol     = \"tcp\"\n  addresses    = [\"0.0.0.0\"]\n  port         = 53\n  pool         = \"dns\"\n  idle_timeout = \"5m\"\n}\n");
         cfg.validate().unwrap();
         assert_eq!(cfg.listeners[0].idle_timeout, Some(Duration::from_secs(300)));
         let p = &cfg.pools["dns"];
@@ -1993,26 +2052,41 @@ vhost "a.test" {
     }
 
     #[test]
+    fn a_node_binds_the_addresses_it_has() {
+        let cfg = with_pool("listener \"web\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\", \"127.0.0.1\", \"192.0.2.1\"]\n  port      = 80\n}\n");
+        let (here, elsewhere) = cfg.listeners[0].split_here();
+        let text = |v: Vec<std::net::SocketAddr>| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(text(here), ["0.0.0.0:80", "127.0.0.1:80"]);
+        assert_eq!(text(elsewhere), ["192.0.2.1:80"], "a documentation address is on no machine");
+    }
+
+    #[test]
     fn listeners_by_protocol() {
-        let cfg = with_pool("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n}\nlistener \"tcp\" \"0.0.0.0:53\" {\n  pool = \"dns\"\n}\n");
+        let cfg = with_pool("listener \"dns-udp\" {\n  protocol  = \"udp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 53\n  pool      = \"dns\"\n}\nlistener \"dns-tcp\" {\n  protocol  = \"tcp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 53\n  pool      = \"dns\"\n}\n");
         cfg.validate().expect("udp and tcp share an address and a pool");
         assert_eq!((cfg.listeners[0].udp_pool(), cfg.listeners[0].tcp_pool()), (Some("dns"), None));
         assert_eq!((cfg.listeners[1].udp_pool(), cfg.listeners[1].tcp_pool()), (None, Some("dns")));
 
         let e = |text: &str| err(&with_pool(text));
-        assert!(e("listener \"udp\" \"0.0.0.0:53\" {\n  pool = \"resolvers\"\n}\n").contains("references unknown pool 'resolvers'"));
-        assert!(e("listener \"tcp\" \"0.0.0.0:53\" {}\n").contains("needs a pool"));
-        assert!(e("listener \"http\" \"0.0.0.0:80\" {\n  pool = \"dns\"\n}\n").contains("takes no pool"));
-        assert!(e("listener \"http\" \"0.0.0.0:80\" {}\nlistener \"tcp\" \"0.0.0.0:80\" {\n  pool = \"dns\"\n}\n").contains("another listener already uses 0.0.0.0:80"));
-        assert!(e("listener \"https\" \"0.0.0.0:443\" {\n  tls_mode = \"terminate\"\n}\n").contains("tcp listeners only"));
-        let e = parse_err("listener \"quic\" \"0.0.0.0:443\" {}\n");
-        assert!(e.contains("keel.hcl:1:10: unknown variant `quic`"), "{e}");
+        assert!(e("listener \"resolvers\" {\n  protocol  = \"udp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 53\n  pool      = \"resolvers\"\n}\n").contains("references unknown pool 'resolvers'"));
+        assert!(e("listener \"tcp\" {\n  protocol  = \"tcp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 53\n}\n").contains("needs a pool"));
+        assert!(e("listener \"http-80\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n  pool      = \"dns\"\n}\n").contains("takes no pool"));
+        assert!(e("listener \"http-80\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n}\nlistener \"dns-80\" {\n  protocol  = \"tcp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n  pool      = \"dns\"\n}\n").contains("listener \"dns-80\": 0.0.0.0:80 is also listener \"http-80\"'s"));
+        assert!(e("listener \"a\" {\n  protocol  = \"http\"\n  addresses = [\"10.0.0.1\"]\n  port      = 80\n}\nlistener \"a\" {\n  protocol  = \"http\"\n  addresses = [\"10.0.0.2\"]\n  port      = 80\n}\n").contains("listener \"a\" is defined twice"));
+        assert!(e("listener \"a b\" {\n  protocol  = \"http\"\n  addresses = [\"10.0.0.1\"]\n  port      = 80\n}\n").contains("a name is letters, digits"));
+        // Different IPs on one port, or IPv4 and IPv6 wildcards, are separate sockets.
+        with_pool("listener \"a\" {\n  protocol  = \"http\"\n  addresses = [\"10.0.0.1\", \"0.0.0.0\", \"::\"]\n  port      = 80\n}\n").validate().expect_err("a wildcard and an IP of its family share the port");
+        with_pool("listener \"a\" {\n  protocol  = \"http\"\n  addresses = [\"10.0.0.1\", \"10.0.0.2\", \"::\"]\n  port      = 80\n}\n").validate().unwrap();
+        assert!(e("listener \"https-443\" {\n  protocol  = \"https\"\n  addresses = [\"0.0.0.0\"]\n  port      = 443\n  tls_mode  = \"terminate\"\n}\n").contains("tcp listeners only"));
+        let e = parse_err("listener \"q\" {\n  protocol  = \"quic\"\n  addresses = [\"0.0.0.0\"]\n  port      = 443\n}\n");
+        assert!(e.contains("keel.hcl:2:3: unknown variant `quic`"), "{e}");
     }
 
     #[test]
     fn proxy_protocol_allowed_on_every_listener_kind() {
         for (protocol, body) in [("http", ""), ("https", ""), ("udp", "  pool = \"dns\"\n"), ("tcp", "  pool = \"dns\"\n")] {
-            with_pool(&format!("listener \"{protocol}\" \"0.0.0.0:5353\" {{\n{body}  proxy_protocol = true\n}}\n")).validate().expect(protocol);
+            let head = format!("  protocol  = \"{protocol}\"\n  addresses = [\"0.0.0.0\"]\n  port      = 5353\n");
+            with_pool(&format!("listener \"pp\" {{\n{head}{body}  proxy_protocol = true\n}}\n")).validate().expect(protocol);
         }
     }
 
@@ -2154,7 +2228,7 @@ vhost "a.test" {
     }
 
     fn tcp_tls(listener: &str, certificate: &str) -> Config {
-        with_pool(&format!("listener \"tcp\" \"0.0.0.0:6379\" {{\n  pool = \"dns\"\n{listener}}}\ncertificate \"cache.example.com\" {{\n{certificate}}}\n"))
+        with_pool(&format!("listener \"cache\" {{\n  protocol  = \"tcp\"\n  addresses = [\"0.0.0.0\"]\n  port      = 6379\n  pool      = \"dns\"\n{listener}}}\ncertificate \"cache.example.com\" {{\n{certificate}}}\n"))
     }
 
     #[test]

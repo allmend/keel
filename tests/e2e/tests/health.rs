@@ -44,7 +44,11 @@ keel {
 
 // Nothing answers at 172.29.89.99.
 const CONFIG: &str = r#"
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 
 pool "counted" {
   health_check "http" {

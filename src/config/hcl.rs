@@ -134,7 +134,7 @@ const BLOCKS: &[BlockSpec] = &[
     spec("", "access_log", "access_log", &[], Many::One, "access_log"),
     spec("", "acme", "acme", &[], Many::One, "acme"),
     spec("", "cache", "cache", &[], Many::One, "cache"),
-    spec("", "listener", "listeners", &["protocol", "address"], Many::List, "listener"),
+    spec("", "listener", "listeners", &["name"], Many::List, "listener"),
     spec("", "pool", "pools", &["name"], Many::Map, "pool"),
     spec("", "vhost", "vhosts", &["host"], Many::List, "vhost"),
     spec("", "certificate", "certificates", &["host"], Many::List, "certificate"),
@@ -560,7 +560,11 @@ pool "web" {
   backend "10.0.0.1:80" { weight = 2 }
   backend "10.0.0.2:80" {}
 }
-listener "http" "0.0.0.0:80" {}
+listener "http" {
+  protocol  = "http"
+  addresses = ["0.0.0.0"]
+  port      = 80
+}
 vhost "a.test" {
   route "/api/" { pool = "web" }
 }
@@ -569,7 +573,7 @@ vhost "a.test" {
         let v = Value::Object(d.value.clone());
         assert_eq!(v["pools"]["web"]["backends"][0], serde_json::json!({"address": "10.0.0.1:80", "weight": 2}));
         assert_eq!(v["pools"]["web"]["backends"][1], serde_json::json!({"address": "10.0.0.2:80"}));
-        assert_eq!(v["listeners"][0], serde_json::json!({"protocol": "http", "address": "0.0.0.0:80"}));
+        assert_eq!(v["listeners"][0], serde_json::json!({"name": "http", "protocol": "http", "addresses": ["0.0.0.0"], "port": 80}));
         assert_eq!(v["vhosts"][0]["routes"][0], serde_json::json!({"path": "/api/", "pool": "web"}));
         assert_eq!(d.locate("pools.web.backends[0].weight").unwrap().to_string(), "keel.hcl:3:27");
         assert_eq!(d.locate("pools.web.backends[1].nothing").unwrap().to_string(), "keel.hcl:4:3");
@@ -665,7 +669,7 @@ certificate "a.test" {
             ("pool \"p\" {\n  passive = {}\n}", "keel.hcl:2:3: `passive` is a block here"),
             ("pool \"p\" {\n  backend \"a:1\" { address = \"b:1\" }\n}", "keel.hcl:2:19: `address` is set by the block's label"),
             ("pool \"p\" {\n  backend {}\n}", "keel.hcl:2:3: a `backend` block takes 1 label: address"),
-            ("listener \"http\" {}", "keel.hcl:1:1: a `listener` block takes 2 labels: protocol, address"),
+            ("listener \"http\" \"0.0.0.0:80\" {}", "keel.hcl:1:1: a `listener` block takes 1 label: name"),
             ("pool \"p\" {}\npool \"p\" {}", "keel.hcl:2:1: pool \"p\" is already defined at keel.hcl:1:1"),
             ("pool \"p\" {\n  passive {}\n  passive {}\n}", "keel.hcl:3:3: only one `passive` block"),
             ("pool \"p\" {\n  frobnicate {}\n}", "keel.hcl:2:3: unknown block `frobnicate`"),

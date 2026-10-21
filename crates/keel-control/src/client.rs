@@ -43,6 +43,17 @@ pub fn status<S: Read + Write>(stream: &mut S, json: bool) -> Result<()> {
     let uptime = data["uptime_secs"].as_u64().unwrap_or(0);
     println!("keel — uptime {}", format_duration(uptime));
 
+    for l in data["listeners"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let list = |key: &str| l[key].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let (bound, skipped) = (list("bound"), list("skipped"));
+        let name = format!("{} ({})", l["name"].as_str().unwrap_or("?"), l["protocol"].as_str().unwrap_or("?"));
+        match (bound.is_empty(), skipped.is_empty()) {
+            (false, true) => println!("  listener {name}: {bound}"),
+            (false, false) => println!("  listener {name}: {bound}; not on this node: {skipped}"),
+            (true, _) => println!("  listener {name}: none of {skipped} on this node"),
+        }
+    }
+
     if let Some(pools) = data["pools"].as_array() {
         if pools.is_empty() {
             println!("No pools configured.");

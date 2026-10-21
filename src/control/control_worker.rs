@@ -162,7 +162,7 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
     let fanout = WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers).with_health(health);
-    let dispatch = Dispatch::new(fanout, cluster.clone(), applied_rx);
+    let dispatch = Dispatch::new(fanout, cluster.clone(), applied_rx, crate::control::listeners_bound(&cfg));
     {
         let server = ControlServer { listener: inherited.control_socket, dispatch: Arc::clone(&dispatch) };
         let mut shutdown = shutdown.clone();
