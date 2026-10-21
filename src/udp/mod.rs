@@ -213,7 +213,7 @@ impl UdpProxyService {
         };
 
         // A selected backend is always in the registry.
-        let counters = *self.pools.series(&self.pool, backend).ok_or(None)?.udp();
+        let counters = *self.pools.backend(&self.pool, backend).ok_or(None)?.series().udp();
         counters.flow();
         let stats = Arc::new(FlowStats::new(now));
         let reply_task = tokio::spawn(reply_loop(

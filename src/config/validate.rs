@@ -194,24 +194,27 @@ pub fn changes(old: &Config, new: &Config, node_file_changed: bool) -> Vec<(bool
     }
     for (name, (o, n)) in pair(&old.pools.iter().collect(), &new.pools.iter().collect::<BTreeMap<_, _>>()) {
         let (Some(o), Some(n)) = (o, n) else {
-            note(true, format!("pool \"{name}\" {}", verb(o.is_some(), n.is_some())));
+            let what = if o.is_some() { "removed, drains" } else { "added" };
+            note(false, format!("pool \"{name}\" {what}"));
             continue;
         };
         for (field, a, b) in [
             ("algorithm", json(&o.algorithm), json(&n.algorithm)),
             ("health_check", json(&o.health_check), json(&n.health_check)),
             ("passive", json(&o.passive), json(&n.passive)),
+            ("timeouts", json(&(o.connect_timeout, o.read_timeout, o.write_timeout, o.idle_timeout, o.retry)),
+             json(&(n.connect_timeout, n.read_timeout, n.write_timeout, n.idle_timeout, n.retry))),
         ] {
             if a != b {
-                note(true, format!("pool \"{name}\": {field}"));
+                note(false, format!("pool \"{name}\": {field}"));
             }
         }
         let backends = |p: &super::Pool| p.backends.iter().map(|b| (b.address.clone(), b.weight)).collect::<BTreeMap<_, _>>();
         for (address, (o, n)) in pair(&backends(o), &backends(n)) {
             match (o, n) {
-                (None, Some(_)) => note(true, format!("pool \"{name}\": backend \"{address}\" added")),
+                (None, Some(_)) => note(false, format!("pool \"{name}\": backend \"{address}\" added")),
                 (Some(_), None) => note(false, format!("pool \"{name}\": backend \"{address}\" removed, drains")),
-                (Some(a), Some(b)) if a != b => note(true, format!("pool \"{name}\": backend \"{address}\" weight")),
+                (Some(a), Some(b)) if a != b => note(false, format!("pool \"{name}\": backend \"{address}\" weight")),
                 _ => {}
             }
         }
@@ -396,11 +399,11 @@ mod tests {
         let got = changes(&old, &new, false);
         let want = [
             (true, "listener \"https\" added"),
-            (true, "pool \"api\" added"),
-            (true, "pool \"web\": algorithm"),
-            (true, "pool \"web\": backend \"10.0.0.1:80\" weight"),
+            (false, "pool \"api\" added"),
+            (false, "pool \"web\": algorithm"),
+            (false, "pool \"web\": backend \"10.0.0.1:80\" weight"),
             (false, "pool \"web\": backend \"10.0.0.2:80\" removed, drains"),
-            (true, "pool \"web\": backend \"10.0.0.3:80\" added"),
+            (false, "pool \"web\": backend \"10.0.0.3:80\" added"),
             (false, "vhosts"),
         ];
         assert_eq!(got, want.iter().map(|(r, w)| (*r, w.to_string())).collect::<Vec<_>>());

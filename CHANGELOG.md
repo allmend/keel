@@ -8,6 +8,12 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Pools reload live: pools and backends added or removed, weights,
+  algorithms, `health_check`, `passive`, timeouts and `retry`. Open
+  connections are untouched; what stays keeps its state; what goes drains.
+
 ## [0.27.0] — 2026-10-21
 
 ### Changed

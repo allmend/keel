@@ -572,17 +572,13 @@ Output is colored on a terminal; `--no-color` or `NO_COLOR` turns it off.
 
 `SIGHUP` to the master or `keel config reload` pushes the node's config directory as the next version, one node or many; see [In a cluster](#in-a-cluster). A directory that does not load is refused and nothing changes. Every node's control worker applies the version and hands it to its workers without dropping connections. A worker started later gets the applied version from the control worker. The node file is read at start only.
 
-What reloads without restart:
-- Virtual host rules: hosts, routes and the pools they reference, `forwarded_headers`, cache rules, `redirect_http`, `default_action`
+What reloads without restart, open connections untouched:
+- Virtual host rules: hosts, routes, `forwarded_headers`, cache rules, `redirect_http`, `default_action`, access lists, body limits
+- Pools: added and removed, backends added and removed, weights, algorithms, `health_check`, `passive`, timeouts and `retry`. A removed backend or pool drains: no new connections, open ones finish. A backend that stays keeps its connections, drain, health and ejection. A new backend in a checked pool gets traffic after its first probe; a changed check keeps the verdicts and counts its thresholds afresh
 - TLS certificates: certificate files of vhosts and `certificate` blocks are re-read with every applied version
-- Backends removed from a pool — they are moved to `draining`
 - ACME: hosts, issuers and `certificate` blocks. A new host is issued at once; a vhost switched from its own certificate to `tls.acme` serves the old one until the issued one arrives
 
 What requires a process restart:
-- Backends added to a pool — logged as a warning (`hot reload: new backend requires restart to take effect`) and otherwise ignored
-- Backend weights and pool algorithms — ignored without a log line
-- Pools added to or removed from the config. A new pool has no backends until restart, so a route to it fails with `no_backend`; the backends of a removed pool are not drained
-- `health_check` and `passive` settings — the running checks and rules keep their startup values
 - `cache` storage, `access_log`, `metrics` and `control`
 - Every setting in the node file
 - Listeners

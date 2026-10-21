@@ -153,11 +153,11 @@ fn a_node_configured_in_hcl_serves_traffic_and_validate_checks_files() -> Result
     assert!(out.contains("# file /etc/keel/node.hcl\n") && out.contains("# file /etc/keel/config/pools/web.hcl\n"), "{out}");
     assert!(out.find("config/keel.hcl").unwrap() < out.find("pools/web.hcl").unwrap(), "load order: {out}");
 
-    // Against what the node serves: the new backend waits for a restart.
+    // Against what the node serves: the new backend applies on reload.
     let (code, out, err) = run(&["/edited-node.hcl", "--diff"])?;
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("+  backend \"172.29.88.22:80\" {}"), "{out}");
-    assert!(out.contains("restart pool \"web\": backend \"172.29.88.22:80\" added"), "{out}");
+    assert!(out.contains("reload  pool \"web\": backend \"172.29.88.22:80\" added"), "{out}");
     assert!(out.contains("restart the node file"), "{out}");
     assert!(!out.contains("\x1b["), "no colors when not on a terminal: {out}");
 

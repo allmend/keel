@@ -182,4 +182,4 @@ Transitions are logged at `warn` (unhealthy, with the reason) and `info` (health
 - With no available backend, HTTP gets 503, TCP connections are closed and UDP datagrams are dropped, all as `no_backend`.
 - Health, ejection and drain are independent: a draining backend is still probed, an unhealthy one can be drained.
 - Selection reads the health state each time: a change applies to the next request, connection or flow.
-- `health_check` and `passive` changes take a restart.
+- `health_check` and `passive` changes apply on reload. A changed check keeps each backend's verdict and counts its thresholds afresh; a new backend waits for its first probe.

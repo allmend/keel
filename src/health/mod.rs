@@ -64,7 +64,7 @@ pub struct HealthService {
 /// The health of every checked backend on this node.
 #[derive(Default)]
 pub struct HealthTable {
-    backends: HashMap<(String, SocketAddr), Checked>,
+    backends: std::sync::RwLock<HashMap<(String, SocketAddr), Arc<Checked>>>,
 }
 
 /// One backend's probe results and verdict.
@@ -93,6 +93,12 @@ impl Checked {
             consecutive_fail: AtomicU32::new(0),
             reason: Mutex::new(None),
         }
+    }
+
+    /// A changed check counts its thresholds afresh; the verdict stays.
+    fn reset_streaks(&self) {
+        self.consecutive_ok.store(0, Ordering::Relaxed);
+        self.consecutive_fail.store(0, Ordering::Relaxed);
     }
 
     /// Apply one probe result with the pool's thresholds. Returns
@@ -129,7 +135,7 @@ impl Checked {
 impl HealthTable {
     /// Record one probe result; a flip is published to the workers and logged.
     fn observe(&self, pool: &str, addr: SocketAddr, result: &ProbeResult, healthy_after: u32, unhealthy_after: u32) {
-        let Some(c) = self.backends.get(&(pool.to_owned(), addr)) else { return };
+        let Some(c) = self.checked(pool, addr) else { return };
         let reason = result.as_ref().err().map(String::as_str);
         match c.observe(result.is_ok(), reason, healthy_after, unhealthy_after) {
             Some(true) => {
@@ -147,31 +153,72 @@ impl HealthTable {
     /// Why the last probe of a backend failed, for `keel status`.
     pub fn reason(&self, pool: &str, address: &str) -> Option<String> {
         let addr: SocketAddr = address.parse().ok()?;
-        self.backends.get(&(pool.to_owned(), addr))?.reason.lock().unwrap().clone()
+        self.checked(pool, addr)?.reason.lock().unwrap().clone()
     }
 }
 
-/// The node's health table and one prober per pool with a health check.
-pub fn probers(cfg: &Config) -> (Arc<HealthTable>, Vec<HealthService>) {
-    let mut table = HealthTable::default();
-    let mut plans = Vec::new();
-    for (name, pool) in &cfg.pools {
-        let Some(hc) = &pool.health_check else { continue };
-        let mut addrs = Vec::new();
-        for b in &pool.backends {
-            // Validated as ip:port.
-            let Ok(addr) = b.address.parse::<SocketAddr>() else { continue };
-            table.backends.insert((name.clone(), addr), Checked::new(name, addr));
-            addrs.push(addr);
-        }
-        plans.push((name.clone(), hc.clone(), addrs));
+impl HealthTable {
+    fn checked(&self, pool: &str, addr: SocketAddr) -> Option<Arc<Checked>> {
+        self.backends.read().unwrap().get(&(pool.to_owned(), addr)).cloned()
     }
-    let table = Arc::new(table);
-    let services = plans
-        .into_iter()
-        .map(|(pool, hc, addrs)| HealthService::build(&hc, &pool, &addrs, Arc::clone(&table)))
-        .collect();
-    (table, services)
+}
+
+/// The node's prober: one task per pool with a health check, following the
+/// applied config. A pool whose check and backends did not change keeps its
+/// task; a changed one restarts with the new settings, its backends keeping
+/// their verdict; a new backend starts without one.
+pub struct Supervisor {
+    pub table: Arc<HealthTable>,
+    /// Pool → (check and backends it runs with, its task).
+    running: HashMap<String, (String, tokio::task::JoinHandle<()>)>,
+    shutdown: ShutdownWatch,
+}
+
+impl Supervisor {
+    pub fn new(shutdown: ShutdownWatch) -> Self {
+        Supervisor { table: Arc::default(), running: HashMap::new(), shutdown }
+    }
+
+    /// Run the checks `cfg` asks for. Call within a tokio runtime.
+    pub fn apply(&mut self, cfg: &Config) {
+        let mut wanted = HashMap::new();
+        for (name, pool) in &cfg.pools {
+            let Some(hc) = &pool.health_check else { continue };
+            // Validated as ip:port.
+            let addrs: Vec<SocketAddr> = pool.backends.iter().filter_map(|b| b.address.parse().ok()).collect();
+            let recipe = serde_json::to_string(&(hc, &addrs)).unwrap_or_default();
+            wanted.insert(name.clone(), (recipe, hc.clone(), addrs));
+        }
+        self.running.retain(|pool, (recipe, task)| {
+            let keep = wanted.get(pool).is_some_and(|(r, _, _)| r == recipe);
+            if !keep {
+                task.abort();
+                info!(pool, "health: checks stopped");
+            }
+            keep
+        });
+        {
+            let mut backends = self.table.backends.write().unwrap();
+            backends.retain(|(pool, addr), _| wanted.get(pool).is_some_and(|(_, _, addrs)| addrs.contains(addr)));
+            for (pool, (_, _, addrs)) in &wanted {
+                for addr in addrs {
+                    let c = backends.entry((pool.clone(), *addr)).or_insert_with(|| Arc::new(Checked::new(pool, *addr)));
+                    if !self.running.contains_key(pool) {
+                        c.reset_streaks();
+                    }
+                }
+            }
+        }
+        for (pool, (recipe, hc, addrs)) in wanted {
+            if self.running.contains_key(&pool) {
+                continue;
+            }
+            let service = HealthService::build(&hc, &pool, &addrs, Arc::clone(&self.table));
+            let shutdown = self.shutdown.clone();
+            let task = tokio::spawn(async move { pingora::services::background::BackgroundService::start(&service, shutdown).await });
+            self.running.insert(pool, (recipe, task));
+        }
+    }
 }
 
 impl HealthService {
@@ -465,8 +512,8 @@ mod tests {
     #[test]
     fn verdicts_flip_on_thresholds_and_are_published() {
         let addr: SocketAddr = "127.0.0.7:1".parse().unwrap();
-        let mut table = HealthTable::default();
-        table.backends.insert(("hc".to_owned(), addr), Checked::new("hc", addr));
+        let table = HealthTable::default();
+        table.backends.write().unwrap().insert(("hc".to_owned(), addr), Arc::new(Checked::new("hc", addr)));
         let worker_view = crate::metrics::BackendSeries::new("hc", "127.0.0.7:1");
         assert_eq!(worker_view.verdict(), None, "no verdict before the first probe");
         let fail: ProbeResult = Err("refused".into());
@@ -485,7 +532,7 @@ mod tests {
         assert_eq!(worker_view.verdict(), Some(true));
         assert_eq!(table.reason("hc", "127.0.0.7:1"), None);
         let other: SocketAddr = "127.0.0.7:2".parse().unwrap();
-        table.backends.insert(("hc".to_owned(), other), Checked::new("hc", other));
+        table.backends.write().unwrap().insert(("hc".to_owned(), other), Arc::new(Checked::new("hc", other)));
         table.observe("hc", other, &fail, 2, 3);
         assert_eq!(crate::metrics::BackendSeries::new("hc", "127.0.0.7:2").verdict(), Some(false), "a first failure is unhealthy at once");
         // A restarted prober continues from the verdict it left.
@@ -493,6 +540,28 @@ mod tests {
         assert!(!Checked::new("hc", addr).healthy.load(Ordering::Relaxed));
     }
 
+
+    #[tokio::test]
+    async fn the_supervisor_follows_the_config() {
+        let cfg = |backends: &str, path: &str| {
+            crate::config::parse(&format!("pool \"sv\" {{\n  health_check \"http\" {{\n    path = \"{path}\"\n  }}\n\n{backends}}}\n")).unwrap()
+        };
+        let (_tx, shutdown) = tokio::sync::watch::channel(false);
+        let mut sv = Supervisor::new(shutdown);
+        let a: SocketAddr = "127.0.3.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.3.2:1".parse().unwrap();
+        sv.apply(&cfg("  backend \"127.0.3.1:1\" {}\n", "/"));
+        sv.table.observe("sv", a, &Err("refused".into()), 1, 1);
+        let task = sv.running["sv"].1.id();
+        sv.apply(&cfg("  backend \"127.0.3.1:1\" {}\n", "/"));
+        assert_eq!(sv.running["sv"].1.id(), task, "unchanged: the same task");
+        sv.apply(&cfg("  backend \"127.0.3.1:1\" {}\n  backend \"127.0.3.2:1\" {}\n", "/health"));
+        assert_ne!(sv.running["sv"].1.id(), task, "changed: a new task");
+        assert_eq!(sv.table.checked("sv", a).map(|c| c.healthy.load(Ordering::Relaxed)), Some(false), "a's verdict kept");
+        assert!(sv.table.checked("sv", b).is_some_and(|c| c.initializing.load(Ordering::Relaxed)), "b starts without one");
+        sv.apply(&crate::config::parse("pool \"sv\" {\n  backend \"127.0.3.1:1\" {}\n}\n").unwrap());
+        assert!(sv.running.is_empty() && sv.table.checked("sv", a).is_none(), "check removed: stopped");
+    }
 
     #[test]
     fn rng_stays_in_range_and_varies() {

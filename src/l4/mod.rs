@@ -315,7 +315,8 @@ impl ServerApp for TcpProxyApp {
             self.log(client_addr, None, &out, started);
             return None;
         };
-        let series = self.pools.series(&self.pool, backend).map(|s| s.tcp());
+        let entry = self.pools.backend(&self.pool, backend);
+        let series = entry.as_ref().map(|e| e.series().tcp());
         if let Some(s) = series {
             s.connection();
         }

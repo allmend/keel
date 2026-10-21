@@ -1,8 +1,8 @@
 use crate::{
     access_log::{AccessLogEntry, AccessLogger},
-    backend::{build_drain_entries, build_lb, LeastConnPool, Pool, PoolRegistry},
+    backend::PoolRegistry,
     cache::CacheHandle,
-    config::{CacheConfig, Config, ForwardedMode, LbAlgorithm, Protocol, VhostCacheConfig},
+    config::{CacheConfig, Config, ForwardedMode, Protocol, VhostCacheConfig},
     tls::CertStore,
     vhost::RoutingTable,
 };
@@ -18,7 +18,6 @@ use pingora::{
         key::HashBinary,
         CacheKey, CacheMeta, CacheMetaDefaults, RespCacheable, VarianceBuilder,
     },
-    lb::selection::{BackendIter, BackendSelection},
     proxy::{http_proxy_service, ProxyHttp, Session},
     server::Server,
     services::background::background_service,
@@ -92,7 +91,7 @@ pub struct KProxy {
     access_logger: Arc<AccessLogger>,
     cache: Option<CacheHandle>,
     /// Pool name → its upstream timeouts and retry setting.
-    upstream: Arc<HashMap<String, Upstream>>,
+    upstream: Arc<ArcSwap<HashMap<String, Upstream>>>,
     /// The `keel` block's settings toward clients.
     downstream: Downstream,
 }
@@ -105,9 +104,21 @@ struct Downstream {
     max_header: usize,
 }
 
+/// Every pool's settings toward its backends.
+pub(crate) fn upstream_settings(cfg: &Config) -> HashMap<String, Upstream> {
+    let upstream = |p: &crate::config::Pool| Upstream {
+        connect: p.connect_timeout,
+        read: p.read_timeout,
+        write: p.write_timeout,
+        idle: p.idle_timeout,
+        retry: p.retry,
+    };
+    cfg.pools.iter().map(|(name, p)| (name.clone(), upstream(p))).collect()
+}
+
 /// A pool's settings toward its backends.
-struct Upstream {
-    connect: std::time::Duration,
+pub(crate) struct Upstream {
+    pub(crate) connect: std::time::Duration,
     read: std::time::Duration,
     write: std::time::Duration,
     idle: std::time::Duration,
@@ -555,7 +566,7 @@ impl ProxyHttp for KProxy {
         ctx.backend_started_at = Some(Instant::now());
 
         let mut peer = HttpPeer::new(addr, false, String::new());
-        if let Some(u) = self.upstream.get(&pool_name) {
+        if let Some(u) = self.upstream.load().get(&pool_name) {
             peer.options.connection_timeout = Some(u.connect);
             peer.options.read_timeout = Some(u.read);
             peer.options.write_timeout = Some(u.write);
@@ -730,7 +741,7 @@ impl ProxyHttp for KProxy {
         let Some(addr) = ctx.backend else { return e };
         self.pools.report_failure(&ctx.pool, addr, "connect");
         // Once, on another backend: nothing reached this one.
-        let retry = self.upstream.get(&ctx.pool).is_some_and(|u| u.retry);
+        let retry = self.upstream.load().get(&ctx.pool).is_some_and(|u| u.retry);
         if retry && ctx.retried_from.is_none() && self.pools.has_available_except(&ctx.pool, addr) {
             self.pools.release(&ctx.pool, addr);
             ctx.backend = None;
@@ -786,7 +797,8 @@ impl ProxyHttp for KProxy {
         if let Some(addr) = backend {
             self.pools.release(&ctx.pool, addr);
         }
-        let backend_series = backend.and_then(|a| self.pools.series(&ctx.pool, a));
+        let backend_entry = backend.and_then(|a| self.pools.backend(&ctx.pool, a));
+        let backend_series = backend_entry.as_deref().map(crate::backend::BackendEntry::series);
 
         let reason = e.map(error_reason);
         // Proxying failed on the backend's side: count it against the backend.
@@ -878,67 +890,6 @@ pub struct WorkerSockets {
     pub upgrade_sock: String,
 }
 
-// Builds all pools from config. Health checks are registered separately
-// (`add_health_services`) once the registry exists.
-fn build_pools(cfg: &Config) -> anyhow::Result<PoolRegistry> {
-    let mut pools: HashMap<String, Pool> = HashMap::new();
-    let mut drain = crate::backend::DrainTable::new();
-    let mut passive: HashMap<String, crate::backend::PassiveRule> = HashMap::new();
-
-    for (name, pool_cfg) in &cfg.pools {
-        if pool_cfg.passive.enabled {
-            passive.insert(
-                name.clone(),
-                crate::backend::PassiveRule {
-                    failures: pool_cfg.passive.failures,
-                    eject_for: pool_cfg.passive.eject_for,
-                },
-            );
-        }
-        let addrs: Vec<&str> = pool_cfg.backends.iter().map(|b| b.address.as_str()).collect();
-        let weights: Vec<usize> = pool_cfg.backends.iter().map(|b| b.weight as usize).collect();
-        build_drain_entries(name, &addrs, &mut drain)?;
-
-        let pool = match pool_cfg.algorithm {
-            LbAlgorithm::RoundRobin => {
-                Pool::RoundRobin(build_pool_lb::<pingora::lb::selection::RoundRobin>(name, &addrs, &weights)?)
-            }
-            LbAlgorithm::Random => {
-                Pool::Random(build_pool_lb::<pingora::lb::selection::Random>(name, &addrs, &weights)?)
-            }
-            LbAlgorithm::ConsistentHash => {
-                Pool::ConsistentHash(build_pool_lb::<pingora::lb::selection::Consistent>(name, &addrs, &weights)?)
-            }
-            LbAlgorithm::LeastConnections => {
-                Pool::LeastConn(Arc::new(
-                    LeastConnPool::build(&addrs, &weights)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?,
-                ))
-            }
-        };
-
-        pools.insert(name.clone(), pool);
-    }
-
-    Ok(PoolRegistry::new(pools, drain, passive))
-}
-
-// Build a typed `LoadBalancer` behind an `Arc`. No Pingora health check is
-// attached: Keel runs its own (see `health`), so the balancer needs no
-// background service and `select_with` sees every backend as healthy.
-fn build_pool_lb<S>(
-    name: &str,
-    addrs: &[&str],
-    weights: &[usize],
-) -> anyhow::Result<Arc<pingora::lb::LoadBalancer<S>>>
-where
-    S: BackendSelection + Send + Sync + 'static,
-    S::Iter: BackendIter,
-{
-    let lb = build_lb::<S>(addrs, weights).map_err(|e| anyhow::anyhow!("pool '{name}': {e}"))?;
-    Ok(Arc::new(lb))
-}
-
 /// Clears expired passive ejections once a second so the re-admission is
 /// logged and `keel_backend_ejected` drops (selection ignores expired
 /// ejections on its own).
@@ -981,15 +932,9 @@ fn wait_for_first_probes(cfg: &Config, pools: &PoolRegistry) {
     }
 }
 
-fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
-    if cfg.pools.values().any(|p| p.passive.enabled) {
-        server.add_service(background_service("passive-sweep", EjectionSweeper { pools: Arc::clone(pools) }));
-    }
-    for (name, pool_cfg) in &cfg.pools {
-        if pool_cfg.health_check.is_some() {
-            pools.mark_checked(name);
-        }
-    }
+fn add_ejection_sweeper(server: &mut Server, pools: &Arc<PoolRegistry>) {
+    // Always: a reload may turn passive detection on.
+    server.add_service(background_service("passive-sweep", EjectionSweeper { pools: Arc::clone(pools) }));
 }
 
 // Build TLS listener settings that resolve the certificate from the live store
@@ -1100,6 +1045,7 @@ struct WorkerApplier {
     routing: Arc<ArcSwap<RoutingTable>>,
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
+    upstream: Arc<ArcSwap<HashMap<String, Upstream>>>,
     /// The last applied state, to skip what did not change.
     last: std::sync::Mutex<Option<crate::control::fanout::Applied>>,
 }
@@ -1112,11 +1058,16 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
             .as_ref()
             .is_none_or(|l| l.version != next.version || l.files != next.files || l.node_file != next.node_file);
         if config_changed {
+            let pools = self.pools.prepare(&cfg).map_err(|e| format!("{e:#}"))?;
             self.routing.store(Arc::new(RoutingTable::build(&cfg)));
-            self.pools.sync_from_config(&cfg);
+            self.pools.commit(pools);
+            self.upstream.store(Arc::new(upstream_settings(&cfg)));
         }
         let certs = self.cert_store.reload(&cfg, &next.certs);
-        for address in next.drained.iter().filter(|a| last.as_ref().is_none_or(|l| !l.drained.contains(*a))) {
+        // After a reload every drain is applied again: a backend the config
+        // just added back starts active.
+        let known = last.as_ref().filter(|_| !config_changed).map(|l| &l.drained);
+        for address in next.drained.iter().filter(|a| known.is_none_or(|d| !d.contains(*a))) {
             self.pools.drain_by_address(address);
         }
         if let Some(last) = last.as_ref() {
@@ -1143,14 +1094,14 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     send_inherited_fds(inherited.as_ref());
     server.bootstrap();
 
-    let pools = match build_pools(cfg) {
-        Ok(p) => Arc::new(p),
+    let pools = match crate::backend::Pools::build(cfg, None) {
+        Ok(p) => Arc::new(PoolRegistry::from_pools(p)),
         Err(e) => {
             error!(error = %e, "failed to build pool registry");
             std::process::exit(1);
         }
     };
-    add_health_services(&mut server, cfg, &pools);
+    add_ejection_sweeper(&mut server, &pools);
 
     // ACME certificates arrive from the control worker; until then an ACME
     // host has none.
@@ -1176,20 +1127,14 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store, &routing);
     add_udp_services(&mut server, cfg, &pools, &access_logger, &routing, inherited.as_mut().map(|w| &mut w.udp));
 
+    let upstream = Arc::new(ArcSwap::from_pointee(upstream_settings(cfg)));
     let applier = WorkerApplier {
         routing: Arc::clone(&routing),
         pools: Arc::clone(&pools),
         cert_store: Arc::clone(&cert_store),
+        upstream: Arc::clone(&upstream),
         last: std::sync::Mutex::new(None),
     };
-    let upstream = cfg
-        .pools
-        .iter()
-        .map(|(name, p)| {
-            let u = Upstream { connect: p.connect_timeout, read: p.read_timeout, write: p.write_timeout, idle: p.idle_timeout, retry: p.retry };
-            (name.clone(), u)
-        })
-        .collect();
     let downstream = Downstream {
         keepalive: cfg.keel.keepalive_timeout,
         body: cfg.keel.body_timeout,
@@ -1197,7 +1142,7 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         max_header: crate::cache::parse_size(&cfg.keel.max_header_size).unwrap_or(64 * 1024),
     };
     let proxy = KProxy {
-        upstream: Arc::new(upstream),
+        upstream: Arc::clone(&upstream),
         downstream,
         routing,
         pools: Arc::clone(&pools),

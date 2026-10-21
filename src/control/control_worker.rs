@@ -75,11 +75,11 @@ pub fn run(cfg: Config, inherited: Inherited, force_new_cluster: bool) -> ! {
 }
 
 async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluster: bool) -> Result<()> {
-    // The node's only prober. Its pools are the master's copy, the config the
-    // workers run; health checks change with a restart.
+    // The node's only prober. It starts from the master's copy, the config
+    // the workers start with, and follows every applied version.
     crate::metrics::init_prober();
     crate::health::icmp::init(std::mem::take(&mut inherited.icmp));
-    let (health, probers) = crate::health::probers(&inherited_cfg);
+    let first_checks = inherited_cfg.clone();
 
     // Read afresh: a control worker the master restarts must start from the
     // files as they are now, not as they were when the master forked it.
@@ -108,10 +108,9 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
         });
     }
 
-    for prober in probers {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { pingora::services::background::BackgroundService::start(&prober, shutdown).await });
-    }
+    let mut supervisor = crate::health::Supervisor::new(shutdown.clone());
+    supervisor.apply(&first_checks);
+    let health = Arc::clone(&supervisor.table);
 
     let state_dir = PathBuf::from(&cfg.keel.state_dir);
     let config_dir = PathBuf::from(&cfg.keel.config_dir);
@@ -161,6 +160,15 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
     };
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
+    {
+        let mut applied = applied_rx.clone();
+        tokio::spawn(async move {
+            while applied.changed().await.is_ok() {
+                let cfg = Arc::clone(&applied.borrow_and_update());
+                supervisor.apply(&cfg);
+            }
+        });
+    }
     let fanout = WorkerFanout::new(&cfg.keel.control_socket, cfg.keel.workers).with_health(health);
     let dispatch = Dispatch::new(fanout, cluster.clone(), applied_rx, crate::control::listeners_bound(&cfg));
     {

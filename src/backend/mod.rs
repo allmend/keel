@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use pingora::lb::{
     discovery::Static,
     selection::{Consistent, RoundRobin, Random},
@@ -59,6 +60,8 @@ pub struct BackendEntry {
     label: String,
     /// This backend's metric series, resolved once.
     series: crate::metrics::BackendSeries,
+    /// Kept only to finish its connections: the config no longer has it.
+    orphan: AtomicBool,
 }
 
 impl BackendEntry {
@@ -73,7 +76,13 @@ impl BackendEntry {
             health: HealthState::new(),
             series,
             label,
+            orphan: AtomicBool::new(false),
         }
+    }
+
+    /// This backend's metric series.
+    pub fn series(&self) -> &crate::metrics::BackendSeries {
+        &self.series
     }
 
     /// Stop new connections; a backend this worker holds no connection to is
@@ -133,6 +142,7 @@ pub struct BackendStatus {
 
 // Pool variants
 
+#[derive(Clone)]
 pub enum Pool {
     RoundRobin(Arc<LoadBalancer<RoundRobin>>),
     Random(Arc<LoadBalancer<Random>>),
@@ -145,42 +155,133 @@ pub enum Pool {
 /// Drain state and counters per pool, per resolved backend address. Keyed by
 /// pool first so the same address can appear in several pools, and so the
 /// per-request lookups take the address as it is, without formatting it.
-pub type DrainTable = HashMap<String, HashMap<SocketAddr, BackendEntry>>;
+/// Entries are shared between versions, so a backend that stays keeps its
+/// connections, drain state, health and ejection across a reload.
+pub type DrainTable = HashMap<String, HashMap<SocketAddr, Arc<BackendEntry>>>;
 
-/// Manages all configured backend pools, their selection algorithms, and per-backend
-/// drain state / connection counters.
-pub struct PoolRegistry {
+/// One version of the pools, built from one config.
+pub struct Pools {
     pools: HashMap<String, Pool>,
     drain: DrainTable,
     /// Pools with passive detection enabled.
     passive: HashMap<String, PassiveRule>,
+    /// Pool name → the backends, weights and algorithm it was built from,
+    /// so a reload rebuilds only the balancers that changed.
+    built: HashMap<String, String>,
+}
+
+impl Pools {
+    /// Build every pool of `cfg`. Entries and balancers of `previous` are
+    /// kept where nothing changed; backends and pools `cfg` no longer has
+    /// stay as draining entries until their last connection ends.
+    pub fn build(cfg: &crate::config::Config, previous: Option<&Pools>) -> Result<Pools> {
+        let mut pools = HashMap::new();
+        let mut drain = DrainTable::new();
+        let mut passive = HashMap::new();
+        let mut built = HashMap::new();
+        for (name, pool_cfg) in &cfg.pools {
+            if pool_cfg.passive.enabled {
+                passive.insert(name.clone(), PassiveRule { failures: pool_cfg.passive.failures, eject_for: pool_cfg.passive.eject_for });
+            }
+            let recipe = serde_json::to_string(&(&pool_cfg.algorithm, &pool_cfg.backends))?;
+            let old = previous.filter(|p| p.built.get(name) == Some(&recipe)).and_then(|p| p.pools.get(name));
+            let pool = match old {
+                Some(pool) => pool.clone(),
+                None => build_pool(name, pool_cfg)?,
+            };
+            let entries = drain.entry(name.clone()).or_default();
+            for b in &pool_cfg.backends {
+                let addr: SocketAddr = b.address.parse().with_context(|| format!("invalid address: {}", b.address))?;
+                let kept = previous.and_then(|p| p.drain.get(name)?.get(&addr)).cloned();
+                let entry = kept.unwrap_or_else(|| Arc::new(BackendEntry::new(name, addr)));
+                if entry.orphan.swap(false, Ordering::Relaxed) {
+                    // Removed earlier and back now: active again. A drain the
+                    // cluster holds is applied after this, by the applier.
+                    entry.drain_state.store(DRAIN_ACTIVE, Ordering::Release);
+                    entry.series.set_drain_state(DRAIN_ACTIVE);
+                }
+                entry.health.checked.store(pool_cfg.health_check.is_some(), Ordering::Relaxed);
+                entries.insert(addr, entry);
+            }
+            pools.insert(name.clone(), pool);
+            built.insert(name.clone(), recipe);
+        }
+        // What the config dropped drains, and goes once nothing is open.
+        for (name, old_entries) in previous.map(|p| &p.drain).into_iter().flatten() {
+            for (addr, entry) in old_entries {
+                if drain.get(name).is_some_and(|e| e.contains_key(addr)) {
+                    continue;
+                }
+                if !entry.orphan.swap(true, Ordering::Relaxed) && entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
+                    entry.start_drain();
+                    tracing::info!(pool = name, backend = entry.label, "reload: backend removed from config, draining");
+                }
+                if entry.drain_state.load(Ordering::Relaxed) != DRAIN_REMOVED {
+                    drain.entry(name.clone()).or_default().insert(*addr, Arc::clone(entry));
+                }
+            }
+        }
+        Ok(Pools { pools, drain, passive, built })
+    }
+}
+
+/// The selection algorithm of one pool, over its configured backends.
+fn build_pool(name: &str, cfg: &crate::config::Pool) -> Result<Pool> {
+    use crate::config::LbAlgorithm;
+    let addrs: Vec<&str> = cfg.backends.iter().map(|b| b.address.as_str()).collect();
+    let weights: Vec<usize> = cfg.backends.iter().map(|b| b.weight as usize).collect();
+    let lb = |e: anyhow::Error| anyhow::anyhow!("pool '{name}': {e}");
+    Ok(match cfg.algorithm {
+        LbAlgorithm::RoundRobin => Pool::RoundRobin(Arc::new(build_lb(&addrs, &weights).map_err(lb)?)),
+        LbAlgorithm::Random => Pool::Random(Arc::new(build_lb(&addrs, &weights).map_err(lb)?)),
+        LbAlgorithm::ConsistentHash => Pool::ConsistentHash(Arc::new(build_lb(&addrs, &weights).map_err(lb)?)),
+        LbAlgorithm::LeastConnections => Pool::LeastConn(Arc::new(LeastConnPool::build(&addrs, &weights).map_err(lb)?)),
+    })
+}
+
+/// Manages all configured backend pools, their selection algorithms, and per-backend
+/// drain state / connection counters. A reload swaps in a new [`Pools`].
+pub struct PoolRegistry {
+    state: ArcSwap<Pools>,
     /// Reference point for ejection deadlines (ms since here fit an atomic).
     epoch: Instant,
 }
 
 impl PoolRegistry {
-    /// Construct from pre-built pools (see proxy::build_pools).
-    pub fn new(
-        pools: HashMap<String, Pool>,
-        drain: DrainTable,
-        passive: HashMap<String, PassiveRule>,
-    ) -> Self {
-        PoolRegistry { pools, drain, passive, epoch: Instant::now() }
+    /// Construct from pre-built pools.
+    #[cfg(test)]
+    pub fn new(pools: HashMap<String, Pool>, drain: DrainTable, passive: HashMap<String, PassiveRule>) -> Self {
+        Self::from_pools(Pools { pools, drain, passive, built: HashMap::new() })
+    }
+
+    pub fn from_pools(pools: Pools) -> Self {
+        PoolRegistry { state: ArcSwap::from_pointee(pools), epoch: Instant::now() }
+    }
+
+    /// Build the pools of a new config against the current ones: pools,
+    /// backends, weights, algorithms, passive rules and health-check
+    /// coverage. Fallible; nothing changes until [`commit`](Self::commit).
+    pub fn prepare(&self, cfg: &crate::config::Config) -> Result<Pools> {
+        Pools::build(cfg, Some(&self.state.load()))
+    }
+
+    pub fn commit(&self, pools: Pools) {
+        self.state.store(Arc::new(pools));
     }
 
     fn now_ms(&self) -> u64 {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    fn entry(&self, pool_name: &str, addr: SocketAddr) -> Option<&BackendEntry> {
-        self.drain.get(pool_name)?.get(&addr)
+    /// A backend's entry in the current version.
+    pub fn backend(&self, pool_name: &str, addr: SocketAddr) -> Option<Arc<BackendEntry>> {
+        self.state.load().drain.get(pool_name)?.get(&addr).cloned()
     }
 
     /// Every backend entry with the pool it belongs to.
-    fn entries(&self) -> impl Iterator<Item = (&str, &BackendEntry)> {
-        self.drain
-            .iter()
-            .flat_map(|(pool, entries)| entries.values().map(move |e| (pool.as_str(), e)))
+    fn entries(&self) -> Vec<(String, Arc<BackendEntry>)> {
+        let s = self.state.load();
+        s.drain.iter().flat_map(|(pool, entries)| entries.values().map(move |e| (pool.clone(), Arc::clone(e)))).collect()
     }
 
     /// Select a backend from the named pool. Skips draining/removed backends.
@@ -192,15 +293,16 @@ impl PoolRegistry {
     /// Another backend of the pool than `addr` can take traffic.
     pub fn has_available_except(&self, pool_name: &str, addr: SocketAddr) -> bool {
         let now = self.now_ms();
-        self.drain.get(pool_name).is_some_and(|entries| entries.iter().any(|(a, e)| *a != addr && e.available(now)))
+        self.state.load().drain.get(pool_name).is_some_and(|entries| entries.iter().any(|(a, e)| *a != addr && e.available(now)))
     }
 
     /// As [`select`](Self::select), never picking `except`: a retry's
     /// other backend.
     pub fn select_except(&self, pool_name: &str, key: &[u8], except: Option<SocketAddr>) -> Option<SocketAddr> {
-        let pool = self.pools.get(pool_name)?;
+        let s = self.state.load();
+        let pool = s.pools.get(pool_name)?;
         let empty = HashMap::new();
-        let entries = self.drain.get(pool_name).unwrap_or(&empty);
+        let entries = s.drain.get(pool_name).unwrap_or(&empty);
         let now = self.now_ms();
 
         // Pingora's own `healthy` flag is always true here: no Pingora
@@ -226,8 +328,9 @@ impl PoolRegistry {
     /// failures the backend is ejected for `eject_for` — unless it is the
     /// last available backend of the pool, which is never ejected.
     pub fn report_failure(&self, pool_name: &str, addr: SocketAddr, what: &str) {
-        let Some(rule) = self.passive.get(pool_name) else { return };
-        let Some(entry) = self.entry(pool_name, addr) else { return };
+        let s = self.state.load();
+        let Some(rule) = s.passive.get(pool_name) else { return };
+        let Some(entry) = s.drain.get(pool_name).and_then(|e| e.get(&addr)) else { return };
         let now = self.now_ms();
         if entry.health.ejected_at(now) {
             return;
@@ -237,7 +340,8 @@ impl PoolRegistry {
             return;
         }
         entry.health.passive_failures.store(0, Ordering::Relaxed);
-        if self.available_count(pool_name, now) <= 1 {
+        let available = s.drain.get(pool_name).map_or(0, |entries| entries.values().filter(|e| e.available(now)).count());
+        if available <= 1 {
             tracing::debug!(pool = pool_name, backend = %addr, "passive: last available backend, not ejecting");
             return;
         }
@@ -257,10 +361,11 @@ impl PoolRegistry {
 
     /// Passive detection: traffic to `addr` succeeded; the failure streak ends.
     pub fn report_success(&self, pool_name: &str, addr: SocketAddr) {
-        if !self.passive.contains_key(pool_name) {
+        let s = self.state.load();
+        if !s.passive.contains_key(pool_name) {
             return;
         }
-        if let Some(entry) = self.entry(pool_name, addr) {
+        if let Some(entry) = s.drain.get(pool_name).and_then(|e| e.get(&addr)) {
             if entry.health.passive_failures.load(Ordering::Relaxed) != 0 {
                 entry.health.passive_failures.store(0, Ordering::Relaxed);
             }
@@ -285,16 +390,10 @@ impl PoolRegistry {
         readmitted
     }
 
-    fn available_count(&self, pool_name: &str, now_ms: u64) -> usize {
-        self.drain
-            .get(pool_name)
-            .map_or(0, |entries| entries.values().filter(|e| e.available(now_ms)).count())
-    }
-
     /// Decrement the connection counter for `addr` in `pool_name`.
     /// If the backend is draining and this was the last connection, marks it removed.
     pub fn release(&self, pool_name: &str, addr: SocketAddr) {
-        if let Some(entry) = self.entry(pool_name, addr) {
+        if let Some(entry) = self.backend(pool_name, addr) {
             let prev = entry.connections.fetch_sub(1, Ordering::Relaxed);
             if prev > 0 {
                 entry.series.connection_closed();
@@ -308,62 +407,35 @@ impl PoolRegistry {
         }
     }
 
-    /// Re-activate a backend (re-add after drain).
-    #[allow(dead_code)]
-    pub fn activate_backend(&self, pool_name: &str, addr: SocketAddr) -> bool {
-        if let Some(entry) = self.entry(pool_name, addr) {
-            entry.drain_state.store(DRAIN_ACTIVE, Ordering::Release);
-            entry.series.set_drain_state(DRAIN_ACTIVE);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Record an active-check result. Flips the backend when the pool's
-    /// threshold is reached; logs and updates `keel_backend_healthy` on flips.
-    /// Mark every backend of a pool as covered by an active check: its
     /// Whether a checked backend still waits for its first probe.
     pub fn initializing(&self) -> bool {
-        self.drain.values().flat_map(HashMap::values).any(BackendEntry::initializing)
+        self.state.load().drain.values().flat_map(HashMap::values).any(|e| e.initializing())
     }
 
+    /// Mark every backend of a pool as covered by an active check: its
     /// health is the control worker's verdict, and status says so.
+    #[cfg(test)]
     pub fn mark_checked(&self, pool_name: &str) {
-        for entry in self.drain.get(pool_name).into_iter().flat_map(HashMap::values) {
+        for entry in self.state.load().drain.get(pool_name).into_iter().flat_map(HashMap::values) {
             entry.health.checked.store(true, Ordering::Relaxed);
         }
-    }
-
-    /// Current active connections for a backend (used for status reporting).
-    #[allow(dead_code)]
-    pub fn connections(&self, pool_name: &str, addr: SocketAddr) -> i64 {
-        self.entry(pool_name, addr)
-            .map(|e| e.connections.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-
-    /// The metric series of a backend.
-    pub fn series(&self, pool_name: &str, addr: SocketAddr) -> Option<&crate::metrics::BackendSeries> {
-        self.entry(pool_name, addr).map(|e| &e.series)
     }
 
     /// The pool selects by the key passed to `select` (consistent hashing);
     /// the other algorithms ignore it, so callers can skip building it.
     pub fn uses_key(&self, pool_name: &str) -> bool {
-        matches!(self.pools.get(pool_name), Some(Pool::ConsistentHash(_)))
+        matches!(self.state.load().pools.get(pool_name), Some(Pool::ConsistentHash(_)))
     }
 
     /// Returns true if the named pool exists.
     pub fn has_pool(&self, pool_name: &str) -> bool {
-        self.pools.contains_key(pool_name)
+        self.state.load().pools.contains_key(pool_name)
     }
 
     /// All backends across all pools, sorted by pool then address.
     pub fn all_backends(&self) -> Vec<BackendStatus> {
         let now = self.now_ms();
-        let mut result: Vec<BackendStatus> =
-            self.entries().map(|(pool, entry)| status_of(pool, entry, now)).collect();
+        let mut result: Vec<BackendStatus> = self.entries().iter().map(|(pool, entry)| status_of(pool, entry, now)).collect();
         result.sort_by(|a, b| a.pool.cmp(&b.pool).then(a.address.cmp(&b.address)));
         result
     }
@@ -371,13 +443,9 @@ impl PoolRegistry {
     /// All backends in a specific pool, sorted by address.
     pub fn backends_for_pool(&self, pool_name: &str) -> Vec<BackendStatus> {
         let now = self.now_ms();
-        let mut result: Vec<BackendStatus> = self
-            .drain
-            .get(pool_name)
-            .into_iter()
-            .flat_map(HashMap::values)
-            .map(|entry| status_of(pool_name, entry, now))
-            .collect();
+        let s = self.state.load();
+        let mut result: Vec<BackendStatus> =
+            s.drain.get(pool_name).into_iter().flat_map(HashMap::values).map(|entry| status_of(pool_name, entry, now)).collect();
         result.sort_by(|a, b| a.address.cmp(&b.address));
         result
     }
@@ -400,55 +468,17 @@ impl PoolRegistry {
         })
     }
 
+    /// Backends a reload dropped are no longer the operator's to drain or
+    /// activate; they only finish.
     fn each_named(&self, addr: &str, mut f: impl FnMut(&str, &BackendEntry)) -> Vec<String> {
         let mut found = Vec::new();
-        for (pool, entry) in self.entries().filter(|(_, e)| names(addr, &e.label)) {
+        for (pool, entry) in self.entries().iter().filter(|(_, e)| !e.orphan.load(Ordering::Relaxed) && names(addr, &e.label)) {
             f(pool, entry);
-            found.push(pool.to_owned());
+            found.push(pool.clone());
         }
         found.sort();
         found.dedup();
         found
-    }
-
-    /// Sync drain state after a config reload.
-    ///
-    /// Backends present in the drain table but absent from `cfg` are moved to
-    /// DRAINING so no new connections are sent to them. New backends and
-    /// algorithm/weight changes require a restart and are logged accordingly.
-    pub fn sync_from_config(&self, cfg: &crate::config::Config) {
-        use std::collections::HashSet;
-
-        for (pool_name, pool_cfg) in &cfg.pools {
-            let entries = self.drain.get(pool_name.as_str());
-            // Validated as ip:port.
-            let configured: HashSet<SocketAddr> =
-                pool_cfg.backends.iter().filter_map(|b| b.address.parse().ok()).collect();
-
-            // Drain backends removed from config.
-            for (addr, entry) in entries.into_iter().flatten() {
-                let gone = !configured.contains(addr);
-                if gone && entry.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE {
-                    entry.start_drain();
-                    tracing::info!(
-                        pool = pool_name,
-                        backend = entry.label,
-                        "hot reload: backend removed from config, draining"
-                    );
-                }
-            }
-
-            // Warn about additions that need a restart.
-            for addr in &configured {
-                if !entries.is_some_and(|e| e.contains_key(addr)) {
-                    tracing::warn!(
-                        pool = pool_name,
-                        backend = %addr,
-                        "hot reload: new backend requires restart to take effect"
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -465,7 +495,7 @@ pub fn names(addr: &str, label: &str) -> bool {
     }
 }
 
-fn is_available(entries: &HashMap<SocketAddr, BackendEntry>, addr: &SocketAddr, now_ms: u64) -> bool {
+fn is_available(entries: &HashMap<SocketAddr, Arc<BackendEntry>>, addr: &SocketAddr, now_ms: u64) -> bool {
     entries
         .get(addr)
         .map(|e| e.available(now_ms))
@@ -513,7 +543,7 @@ impl LeastConnPool {
 
     /// The available backend with the fewest connections per unit of
     /// weight, as nginx's weighted least_conn; ties go to the first listed.
-    fn select(&self, entries: &HashMap<SocketAddr, BackendEntry>, now_ms: u64, except: Option<SocketAddr>) -> Option<SocketAddr> {
+    fn select(&self, entries: &HashMap<SocketAddr, Arc<BackendEntry>>, now_ms: u64, except: Option<SocketAddr>) -> Option<SocketAddr> {
         let conns = |e: &LeastConnEntry| entries.get(&e.addr).map(|d| d.connections.load(Ordering::Relaxed)).unwrap_or(0);
         let addr = self
             .backends
@@ -560,11 +590,12 @@ where
 }
 
 /// Create the drain entries for a pool's backends.
+#[cfg(test)]
 pub fn build_drain_entries(pool_name: &str, addrs: &[&str], drain: &mut DrainTable) -> Result<()> {
     let entries = drain.entry(pool_name.to_owned()).or_default();
     for address in addrs {
         let addr: SocketAddr = address.parse().with_context(|| format!("invalid address: {address}"))?;
-        entries.entry(addr).or_insert_with(|| BackendEntry::new(pool_name, addr));
+        entries.entry(addr).or_insert_with(|| Arc::new(BackendEntry::new(pool_name, addr)));
     }
     Ok(())
 }
@@ -619,48 +650,73 @@ mod tests {
         let cfg: crate::config::Config =
             crate::config::parse("pool \"web\" {\n  backend \"[2001:db8:0::7]:80\" {}\n}\n")
                 .expect("config parses");
-        reg.sync_from_config(&cfg);
+        reg.commit(reg.prepare(&cfg).unwrap());
         assert_eq!(
-            reg.drain["web"][&"[2001:db8::7]:80".parse().unwrap()].drain_state.load(Ordering::Relaxed),
+            reg.backend("web", "[2001:db8::7]:80".parse().unwrap()).unwrap().drain_state.load(Ordering::Relaxed),
             DRAIN_ACTIVE
         );
     }
 
-    /// A backend gone from config drains.
+    fn pools(text: &str) -> crate::config::Config {
+        crate::config::parse(text).expect("config parses")
+    }
+
+    fn drain_state(reg: &PoolRegistry, pool: &str, addr: &str) -> Option<u8> {
+        reg.backend(pool, addr.parse().unwrap()).map(|e| e.drain_state.load(Ordering::Relaxed))
+    }
+
+    /// Pools, backends and weights change live; what stays keeps its state.
     #[test]
-    fn reload_drains_backends_removed_from_config() {
-        let mut drain = HashMap::new();
-        build_drain_entries(
-            "web",
-            &["127.0.0.1:8080", "127.0.0.2:8080"],
-            &mut drain,
-        )
-        .unwrap();
-        let reg = PoolRegistry::new(HashMap::new(), drain, HashMap::new());
+    fn a_reload_adds_removes_and_keeps_backends() {
+        let one = "pool \"web\" {\n  backend \"127.0.1.1:80\" {}\n  backend \"127.0.1.2:80\" {}\n}\n";
+        let reg = PoolRegistry::from_pools(Pools::build(&pools(one), None).unwrap());
+        // An open connection to .2, and an operator's drain of .1.
+        let two: SocketAddr = "127.0.1.2:80".parse().unwrap();
+        reg.backend("web", two).unwrap().acquire();
+        reg.drain_by_address("127.0.1.1:80");
 
-        let cfg: crate::config::Config =
-            crate::config::parse("pool \"web\" {\n  backend \"127.0.0.1:8080\" {}\n}\n")
-                .expect("config parses");
-        reg.sync_from_config(&cfg);
+        // .2 gone, .3 new, a pool added.
+        let next = "pool \"web\" {\n  backend \"127.0.1.1:80\" {}\n  backend \"127.0.1.3:80\" { weight = 3 }\n}\npool \"api\" {\n  backend \"127.0.1.9:80\" {}\n}\n";
+        reg.commit(reg.prepare(&pools(next)).unwrap());
+        assert_eq!(drain_state(&reg, "web", "127.0.1.1:80"), Some(DRAIN_REMOVED), "a kept backend keeps its drain");
+        assert_eq!(drain_state(&reg, "web", "127.0.1.2:80"), Some(DRAIN_DRAINING), "removed, one connection still open");
+        assert_eq!(reg.select("web", b""), Some("127.0.1.3:80".parse().unwrap()), "the new backend takes traffic");
+        assert_eq!(reg.select("api", b""), Some("127.0.1.9:80".parse().unwrap()), "and the new pool");
+        assert!(reg.drain_by_address("127.0.1.2:80").is_empty(), "a removed backend is not the operator's to drain");
 
-        assert_eq!(
-            reg.drain["web"][&"127.0.0.1:8080".parse().unwrap()].drain_state.load(Ordering::Relaxed),
-            DRAIN_ACTIVE
-        );
-        assert_eq!(
-            reg.drain["web"][&"127.0.0.2:8080".parse().unwrap()].drain_state.load(Ordering::Relaxed),
-            DRAIN_REMOVED,
-            "no connection open: removed at once"
-        );
+        // Its last connection ends: gone from the next version.
+        reg.release("web", two);
+        assert_eq!(drain_state(&reg, "web", "127.0.1.2:80"), Some(DRAIN_REMOVED));
+        reg.commit(reg.prepare(&pools(next)).unwrap());
+        assert_eq!(drain_state(&reg, "web", "127.0.1.2:80"), None);
+
+        // Back in the config: active again.
+        reg.commit(reg.prepare(&pools(one)).unwrap());
+        assert_eq!(drain_state(&reg, "web", "127.0.1.2:80"), Some(DRAIN_ACTIVE));
+        assert!(!reg.has_pool("api"));
+    }
+
+    /// A pool that gains a health check stops sending to backends without a
+    /// verdict; one that loses its check sends to all.
+    #[test]
+    fn a_reload_follows_health_check_coverage() {
+        let plain = "pool \"web\" {\n  backend \"127.0.2.1:80\" {}\n}\n";
+        let checked = "pool \"web\" {\n  health_check \"tcp\" {}\n\n  backend \"127.0.2.1:80\" {}\n}\n";
+        let reg = PoolRegistry::from_pools(Pools::build(&pools(plain), None).unwrap());
+        assert!(reg.select("web", b"").is_some());
+        reg.commit(reg.prepare(&pools(checked)).unwrap());
+        assert!(reg.initializing() && reg.select("web", b"").is_none());
+        reg.commit(reg.prepare(&pools(plain)).unwrap());
+        assert!(!reg.initializing() && reg.select("web", b"").is_some());
     }
 
     #[test]
     fn a_drain_with_open_connections_ends_with_the_last_one() {
         let reg = registry_of(["127.0.0.8:1", "127.0.0.8:2"], Duration::from_secs(60));
         let a: SocketAddr = "127.0.0.8:1".parse().unwrap();
-        let state = |reg: &PoolRegistry| reg.drain["p"][&a].drain_state.load(Ordering::Relaxed);
-        reg.drain["p"][&a].acquire();
-        reg.drain["p"][&a].acquire();
+        let state = |reg: &PoolRegistry| reg.backend("p", a).unwrap().drain_state.load(Ordering::Relaxed);
+        reg.backend("p", a).unwrap().acquire();
+        reg.backend("p", a).unwrap().acquire();
         assert_eq!(reg.drain_by_address("127.0.0.8:1"), ["p"]);
         assert_eq!(state(&reg), DRAIN_DRAINING);
         reg.release("p", a);
@@ -669,7 +725,7 @@ mod tests {
         assert_eq!(state(&reg), DRAIN_REMOVED);
         // Drained with nothing open: removed at once.
         assert_eq!(reg.drain_by_address("127.0.0.8:2"), ["p"]);
-        assert_eq!(reg.drain["p"][&"127.0.0.8:2".parse().unwrap()].drain_state.load(Ordering::Relaxed), DRAIN_REMOVED);
+        assert_eq!(reg.backend("p", "127.0.0.8:2".parse().unwrap()).unwrap().drain_state.load(Ordering::Relaxed), DRAIN_REMOVED);
     }
 
     #[test]
