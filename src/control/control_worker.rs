@@ -32,8 +32,14 @@ const NO_PEERS_ADDR: &str = "127.0.0.1:7654";
 pub enum MasterMessage {
     /// SIGHUP reached the master: push the config directory.
     Reload,
-    /// The master replaced worker `index`; it needs the applied config.
-    WorkerRestarted { index: usize },
+    /// The master started worker `index`, `pid` when known; it needs the
+    /// applied config. Until that pid answers on the index's socket, the
+    /// socket may still be an older generation's.
+    WorkerRestarted {
+        index: usize,
+        #[serde(default)]
+        pid: Option<u32>,
+    },
 }
 
 /// Longest line the master sends.
@@ -157,6 +163,7 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
         applied: applied_tx,
         certs_changed,
         startup_files: Some(cfg.files.clone()),
+        nudge: inherited.master.try_clone().ok(),
     };
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
@@ -241,13 +248,13 @@ async fn liveness(fanout: WorkerFanout) {
     }
 }
 
-/// Read the master's messages. The master never reads anything back: no
-/// input reaches the root process. It closing the link means it is gone,
+/// Read the master's messages. The master reads no data back: the one thing
+/// written to it is the fixed replace nudge (see ApplyDriver). It closing the link means it is gone,
 /// and so is the reason to run.
 async fn master_link(
     stream: std::os::unix::net::UnixStream,
     cluster: crate::cluster::ClusterHandle,
-    restarted: mpsc::UnboundedSender<usize>,
+    restarted: mpsc::UnboundedSender<(usize, Option<u32>)>,
     shutdown: Arc<watch::Sender<bool>>,
 ) {
     let stream = match stream.set_nonblocking(true).and_then(|()| tokio::net::UnixStream::from_std(stream)) {
@@ -289,8 +296,8 @@ async fn master_link(
                     }
                 });
             }
-            Ok(MasterMessage::WorkerRestarted { index }) => {
-                let _ = restarted.send(index);
+            Ok(MasterMessage::WorkerRestarted { index, pid }) => {
+                let _ = restarted.send((index, pid));
             }
             Err(e) => warn!(error = %e, "control: unknown message from the master"),
         }
@@ -317,10 +324,17 @@ struct ApplyDriver {
     /// applied. A version with exactly these files came from this directory:
     /// it is not written back, so edits made since are not overwritten.
     startup_files: Option<crate::config::FileSet>,
+    /// Our end of the master link, to nudge it when a version needs new
+    /// workers. The one thing the control worker writes there.
+    nudge: Option<std::os::unix::net::UnixStream>,
 }
 
+/// The whole message to the master: read the replace file and start new
+/// workers with it.
+pub const REPLACE_NUDGE: &[u8] = b"replace\n";
+
 impl ApplyDriver {
-    async fn run(mut self, mut restarted: mpsc::UnboundedReceiver<usize>, mut shutdown: watch::Receiver<bool>) {
+    async fn run(mut self, mut restarted: mpsc::UnboundedReceiver<(usize, Option<u32>)>, mut shutdown: watch::Receiver<bool>) {
         let mut versions = self.cluster.config_rx.clone();
         let mut drained = self.cluster.drained_rx.clone();
         let mut version = crate::cluster::applied::read(&self.state_dir).ok().flatten().map_or(0, |a| a.version);
@@ -348,8 +362,8 @@ impl ApplyDriver {
                 }
                 // Awaited, like every hand-over here, so an older state can
                 // never overtake a newer one on its way to a worker.
-                Some(index) = restarted.recv() => {
-                    if self.fanout.apply_to(index, &self.state(version)).await {
+                Some((index, pid)) = restarted.recv() => {
+                    if self.fanout.apply_to(index, pid, &self.state(version)).await {
                         info!(index, version, "control: restarted worker has the applied config");
                     }
                 }
@@ -376,8 +390,15 @@ impl ApplyDriver {
         let mut cfg = cfg;
         cfg.node_file = self.node_file.clone();
         cfg.path = self.applied.borrow().path.clone();
+        let previous = self.applied.borrow().clone();
+        let replace = crate::config::validate::needs_new_workers(&previous, &cfg);
+        let workers = cfg.keel.workers;
         self.applied.send_replace(Arc::new(cfg));
         let acked = self.send_all(next.version).await;
+        if replace {
+            crate::control::fanout::set_workers(workers);
+            self.ask_for_new_workers(next);
+        }
         let from_here = self.startup_files.take().is_some_and(|files| files == next.files);
         let written = if from_here { Ok(()) } else { crate::cluster::applied::write_config_dir(&self.config_dir, &next.files) }
             .and_then(|()| crate::cluster::applied::save(&self.state_dir, next.version, &next.files));
@@ -390,6 +411,20 @@ impl ApplyDriver {
             ),
         }
         true
+    }
+
+    /// The version changes what workers cannot change in place (listeners,
+    /// the keel block, cache, access_log): the master starts a new
+    /// generation of workers with it, and the current one drains.
+    fn ask_for_new_workers(&self, next: &ConfigVersion) {
+        use std::io::Write;
+        let Some(link) = &self.nudge else { return };
+        let asked = crate::cluster::applied::save_for_master(&self.state_dir, &next.files)
+            .and_then(|()| (&*link).write_all(REPLACE_NUDGE).context("write to the master"));
+        match asked {
+            Ok(()) => info!(version = next.version, "control: version needs new workers; asked the master"),
+            Err(e) => error!(version = next.version, error = %format!("{e:#}"), "control: cannot ask the master for new workers"),
+        }
     }
 
     /// What the workers serve: the applied config, its ACME certificates
@@ -441,7 +476,7 @@ mod tests {
 
     #[test]
     fn master_messages_are_one_line_of_json() {
-        for m in [MasterMessage::Reload, MasterMessage::WorkerRestarted { index: 3 }] {
+        for m in [MasterMessage::Reload, MasterMessage::WorkerRestarted { index: 3, pid: Some(42) }] {
             let line = serde_json::to_string(&m).unwrap();
             assert!(!line.contains('\n'));
             assert_eq!(serde_json::from_str::<MasterMessage>(&line).unwrap(), m);

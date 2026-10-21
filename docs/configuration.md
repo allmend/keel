@@ -134,6 +134,7 @@ keel {
 | `grace_period` | config directory | duration | `10s` |
 | `udp_flow_timeout` | config directory | duration | `30s` |
 | `udp_max_flows` | config directory | number | `8192` |
+| `drain_timeout` | config directory | duration | `1h` |
 | `keepalive_timeout` | config directory | duration | `75s` |
 | `body_timeout` | config directory | duration | `60s` |
 | `max_header_size` | config directory | size | `64K` |
@@ -578,12 +579,10 @@ What reloads without restart, open connections untouched:
 - TLS certificates: certificate files of vhosts and `certificate` blocks are re-read with every applied version
 - ACME: hosts, issuers and `certificate` blocks. A new host is issued at once; a vhost switched from its own certificate to `tls.acme` serves the old one until the issued one arrives
 
-What requires a process restart:
-- `cache` storage, `access_log`, `metrics` and `control`
-- Every setting in the node file
-- Listeners
-- Every setting in the `keel` block, including worker count, user/group and the UDP flow settings
+What starts new workers, also without dropping a connection: listeners, `cache` storage, `access_log`, and the `keel` block of the config directory. The master binds new listener addresses (unchanged ones are shared, never closed) and starts a new generation of workers. Once every new worker has the node's state, the old ones stop accepting and finish what they hold: requests, WebSockets and TCP connections. A worker exits when nothing is open, at most `keel.drain_timeout` (default `1h`); at most two replaced generations drain at once, and a third closes the oldest's connections. New workers that do not start or are not ready within 60s are stopped; the old ones keep serving, and `keel_worker_replacements_failed_total` counts it. `keel_workers_draining` shows replaced workers still finishing. The memory cache starts empty in new workers. UDP flows move to the new workers, which pick their backend again (with `consistent_hash`, the same one).
+
+What requires a process restart: every setting in the node file.
 
 Backends are matched on IP and port: `[2001:db8::1]:80` and `[2001:db8:0::1]:80` are the same backend.
 
-A version applies the same way on every node: what reloads live above takes effect on push, the rest needs a restart of each node.
+A version applies the same way on every node.

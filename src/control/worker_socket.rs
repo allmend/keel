@@ -46,6 +46,9 @@ impl pingora::services::background::BackgroundService for WorkerSocket {
             return;
         }
         info!(path = self.path, "worker: control socket ready");
+        // A newer generation's worker takes the path over: removing it on
+        // exit is only for the path still ours.
+        let ours = file_id(&self.path);
         let started_at = Instant::now();
 
         loop {
@@ -73,8 +76,15 @@ impl pingora::services::background::BackgroundService for WorkerSocket {
                 }
             }
         }
-        let _ = std::fs::remove_file(&self.path);
+        if ours.is_some() && file_id(&self.path) == ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+fn file_id(path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 fn answer(request: WorkerRequest, pools: &PoolRegistry, applier: &dyn Apply, started_at: Instant) -> String {

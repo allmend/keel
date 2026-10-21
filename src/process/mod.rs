@@ -282,13 +282,19 @@ fn take_tree(path: &std::path::Path, uid: Uid, gid: Gid) -> Result<()> {
 /// privilege drop). `per_listener` UDP sockets are opened per listener —
 /// one per worker (an unread SO_REUSEPORT socket would swallow its share of
 /// datagrams).
-fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<BoundListeners> {
+/// Bind every listener of `cfg` on this node. With `previous`, a socket it
+/// already holds for an address is shared, not bound again: old and new
+/// workers then accept from the same queue.
+fn bind_listeners(cfg: &Config, per_listener: usize, root: bool, previous: Option<&BoundListeners>) -> Result<BoundListeners> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let mut tcp = Vec::new();
     let mut udp = Vec::new();
     let (mut icmp4, mut icmp6) = (None, None);
-    if crate::health::icmp::needed(cfg) {
+    if let Some(p) = previous.filter(|_| crate::health::icmp::needed(cfg)) {
+        icmp4 = p.icmp4.as_ref().map(|s| s.try_clone()).transpose()?;
+        icmp6 = p.icmp6.as_ref().map(|s| s.try_clone()).transpose()?;
+    } else if crate::health::icmp::needed(cfg) {
         match crate::health::icmp::open_socket(false) {
             Ok(s) => icmp4 = Some(s),
             Err(e) if root => return Err(e).context("master: cannot open ICMPv4 socket"),
@@ -311,12 +317,21 @@ fn bind_listeners(cfg: &Config, per_listener: usize, root: bool) -> Result<Bound
         for addr in here {
             let address = addr.to_string();
             if l.protocol == crate::config::Protocol::Udp {
+                let held = previous.and_then(|p| p.udp.iter().find(|(a, s)| *a == address && s.len() == per_listener));
+                if let Some((_, socks)) = held {
+                    udp.push((address, socks.iter().map(|s| s.try_clone()).collect::<std::io::Result<_>>()?));
+                    continue;
+                }
                 let socks = (0..per_listener)
                     .map(|_| crate::udp::bind_reuseport(&address))
                     .collect::<std::io::Result<Vec<_>>>()
                     .with_context(|| format!("master: cannot bind listener {} on {address}", l.name))?;
                 info!(listener = l.name, address, sockets = socks.len(), "master: bound UDP listener");
                 udp.push((address, socks));
+                continue;
+            }
+            if let Some((_, held)) = previous.and_then(|p| p.tcp.iter().find(|(a, _)| *a == address)) {
+                tcp.push((address, held.try_clone()?));
                 continue;
             }
             let bound = (|| -> std::io::Result<std::net::TcpListener> {
@@ -437,7 +452,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     // shared socket all workers but one would wait for a port that never
     // frees.
     let bound = if cfg!(target_os = "linux") {
-        Some(bind_listeners(&cfg, cfg.keel.workers, accounts.is_some())?)
+        Some(bind_listeners(&cfg, cfg.keel.workers, accounts.is_some(), None)?)
     } else {
         None
     };
@@ -448,23 +463,28 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     let mut control_backoff = Backoff::default();
     let mut control_due: Option<Instant> = None;
 
-    let worker_cfg = cfg.for_workers();
-    let n = cfg.keel.workers;
-    info!(workers = n, "master: spawning workers");
-    // (pid, index, started): a replacement worker keeps the index of the one
-    // it replaces, so it inherits the same UDP socket of the SO_REUSEPORT
-    // group. Each index backs off on its own.
-    let mut pids: Vec<(Pid, usize, Instant)> = Vec::with_capacity(n);
-    let mut backoff = vec![Backoff::default(); n];
-    // Worker indexes waiting for their restart, and when it is due.
+    let root = accounts.is_some();
+    let mut bound = bound;
+    let mut current = Generation::new(0, cfg.for_workers());
+    info!(workers = current.cfg.keel.workers, "master: spawning workers");
+    // Worker indexes waiting for their restart, and when it is due. Only the
+    // current generation's workers come back; each index backs off on its own.
+    let mut backoff = vec![Backoff::default(); current.cfg.keel.workers];
     let mut due: Vec<(usize, Instant)> = Vec::new();
-    for i in 0..n {
+    for i in 0..current.cfg.keel.workers {
         let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
-        let pid = spawn_worker(&worker_cfg, i, bound.as_ref(), accounts.as_ref(), &private)?;
+        let pid = spawn_worker(&current.cfg, i, current.stripe(i), bound.as_ref(), accounts.as_ref(), &private)?;
         info!(pid = pid.as_raw(), index = i, "master: worker started");
-        pids.push((pid, i, Instant::now()));
+        current.workers.push((pid, i, Instant::now()));
     }
-    crate::metrics::set_workers(pids.len());
+    crate::metrics::set_workers(current.workers.len());
+    // A generation being started for a new version, with its sockets, and
+    // the generations a newer one replaced, finishing their connections.
+    let mut pending: Option<(Generation, Option<BoundListeners>, Instant)> = None;
+    let mut draining: Vec<Generation> = Vec::new();
+    let mut nudged = Vec::new();
+    // A nudge that came while a generation was starting waits for it.
+    let mut wanted = false;
 
     loop {
         std::thread::sleep(TICK);
@@ -473,7 +493,9 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             info!("master: shutdown signal received, stopping");
             // SIGTERM = Pingora's plain graceful exit (finish in-flight, no
             // upgrade-socket handoff like SIGQUIT).
-            let children: Vec<Pid> = pids.iter().map(|(p, _, _)| *p).chain(control.as_ref().map(|c| c.pid)).collect();
+            let generations = std::iter::once(&current).chain(pending.as_ref().map(|(g, _, _)| g)).chain(&draining);
+            let children: Vec<Pid> =
+                generations.flat_map(|g| g.workers.iter().map(|(p, _, _)| *p)).chain(control.as_ref().map(|c| c.pid)).collect();
             for pid in &children {
                 let _ = signal::kill(*pid, Signal::SIGTERM);
             }
@@ -495,6 +517,22 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             }
         }
 
+        // The control worker's one message: a version needs new workers.
+        if let Some(c) = &control {
+            wanted |= read_nudge(&c.link, &mut nudged);
+            if wanted && pending.is_none() {
+                wanted = false;
+                let busy: Vec<usize> = std::iter::once(&current).chain(&draining).map(|g| g.slot).collect();
+                match start_generation(&cfg, &busy, bound.as_ref(), root, &control_listeners, Some(c), accounts.as_ref()) {
+                    Ok((generation, sockets)) => pending = Some((generation, sockets, Instant::now())),
+                    Err(e) => {
+                        error!(error = %format!("{e:#}"), "master: new workers not started; the current ones keep serving");
+                        crate::metrics::replacement_failed();
+                    }
+                }
+            }
+        }
+
         loop {
             let (dead, how, signaled) = match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(pid, code)) => (pid, format!("exit code {code}"), false),
@@ -507,6 +545,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
                     break;
                 }
             };
+            let _ = std::fs::remove_file(crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket).join(format!("ready-{}", dead.as_raw())));
             if control.as_ref().is_some_and(|c| c.pid == dead) {
                 let c = control.take().expect("checked");
                 let delay = control_backoff.after_death(c.started.elapsed());
@@ -514,13 +553,61 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
                 control_due = Some(Instant::now() + delay);
                 continue;
             }
-            let Some(pos) = pids.iter().position(|(p, _, _)| *p == dead) else { continue };
-            let (_, index, started) = pids.remove(pos);
+            if let Some(g) = draining.iter_mut().find(|g| g.has(dead)) {
+                let index = g.remove(dead);
+                crate::metrics::clear_stripe(g.stripe(index));
+                info!(pid = dead.as_raw(), index, how, "master: replaced worker finished");
+                draining.retain(|g| !g.workers.is_empty());
+                crate::metrics::set_draining(draining.iter().map(|g| g.workers.len()).sum());
+                continue;
+            }
+            if pending.as_ref().is_some_and(|(g, _, _)| g.has(dead)) {
+                let (g, _, _) = pending.take().expect("checked");
+                error!(pid = dead.as_raw(), how, "master: a new worker died at start; the current ones keep serving");
+                g.stop(Signal::SIGKILL);
+                crate::metrics::replacement_failed();
+                continue;
+            }
+            let Some(pos) = current.workers.iter().position(|(p, _, _)| *p == dead) else { continue };
+            let (_, index, started) = current.workers.remove(pos);
             let delay = backoff[index].after_death(started.elapsed());
             warn!(index, pid = dead.as_raw(), how, delay = ?delay, "master: worker died, restarting");
-            crate::metrics::set_workers(pids.len());
+            crate::metrics::set_workers(current.workers.len());
             crate::metrics::worker_restarted(signaled);
             due.push((index, Instant::now() + delay));
+        }
+
+        // A new generation takes over once every worker has the node's state.
+        if let Some((g, _, started)) = &pending {
+            if g.ready(&cfg.keel.control_socket) {
+                let (g, sockets, _) = pending.take().expect("checked");
+                info!(workers = g.workers.len(), "master: new workers ready; the replaced ones drain");
+                let old = std::mem::replace(&mut current, g);
+                old.stop(Signal::SIGUSR1);
+                draining.push(old);
+                // Past the limit, the oldest still draining closes what it holds.
+                let open = draining.iter().filter(|g| !g.closing).count();
+                if open > MAX_DRAINING {
+                    if let Some(oldest) = draining.iter_mut().find(|g| !g.closing) {
+                        warn!(workers = oldest.workers.len(), "master: too many generations draining; closing the oldest");
+                        oldest.stop(Signal::SIGINT);
+                        oldest.closing = true;
+                    }
+                }
+                if sockets.is_some() {
+                    bound = sockets;
+                }
+                backoff = vec![Backoff::default(); current.cfg.keel.workers];
+                due.clear();
+                crate::metrics::set_workers(current.workers.len());
+                crate::metrics::set_workers_configured(current.cfg.keel.workers);
+                crate::metrics::set_draining(draining.iter().map(|g| g.workers.len()).sum());
+            } else if started.elapsed() > READY_TIMEOUT {
+                let (g, _, _) = pending.take().expect("checked");
+                error!("master: new workers not ready in time; the current ones keep serving");
+                g.stop(Signal::SIGKILL);
+                crate::metrics::replacement_failed();
+            }
         }
 
         let now = Instant::now();
@@ -528,12 +615,12 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         due.retain(|(_, at)| *at > now);
         for index in ready {
             let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
-            let pid = spawn_worker(&worker_cfg, index, bound.as_ref(), accounts.as_ref(), &private)?;
-            pids.push((pid, index, Instant::now()));
-            crate::metrics::set_workers(pids.len());
+            let pid = spawn_worker(&current.cfg, index, current.stripe(index), bound.as_ref(), accounts.as_ref(), &private)?;
+            current.workers.push((pid, index, Instant::now()));
+            crate::metrics::set_workers(current.workers.len());
             info!(index, pid = pid.as_raw(), "master: replacement worker started");
             if let Some(c) = &control {
-                control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index });
+                control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index, pid: Some(pid.as_raw() as u32) });
             }
         }
 
@@ -542,6 +629,118 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
         }
     }
+}
+
+/// Generations draining at once; a further one closes the oldest's
+/// connections first.
+const MAX_DRAINING: usize = 2;
+
+/// How long new workers may take to have the node's state.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One set of workers started from one config.
+struct Generation {
+    /// Its metrics stripes (see metrics::worker_stripe).
+    slot: usize,
+    cfg: Config,
+    /// (pid, index, started)
+    workers: Vec<(Pid, usize, Instant)>,
+    /// Told to close what it holds.
+    closing: bool,
+}
+
+impl Generation {
+    fn new(slot: usize, cfg: Config) -> Self {
+        Generation { slot, cfg, workers: Vec::new(), closing: false }
+    }
+
+    fn stripe(&self, index: usize) -> usize {
+        crate::metrics::worker_stripe(self.slot, index).expect("validated against the region")
+    }
+
+    fn has(&self, pid: Pid) -> bool {
+        self.workers.iter().any(|(p, _, _)| *p == pid)
+    }
+
+    /// Forget a worker that exited; its index.
+    fn remove(&mut self, pid: Pid) -> usize {
+        let pos = self.workers.iter().position(|(p, _, _)| *p == pid).expect("checked");
+        self.workers.remove(pos).1
+    }
+
+    fn stop(&self, sig: Signal) {
+        for (pid, _, _) in &self.workers {
+            let _ = signal::kill(*pid, sig);
+        }
+    }
+
+    /// Every worker marked itself ready: it has the node's applied state.
+    /// Only the marker's existence is read, nothing in it.
+    fn ready(&self, control_socket: &str) -> bool {
+        let dir = crate::control::fanout::worker_socket_dir(control_socket);
+        self.workers.iter().all(|(pid, _, _)| dir.join(format!("ready-{}", pid.as_raw())).exists())
+    }
+}
+
+/// Start a generation for the version the control worker handed over: the
+/// master reads it from the state directory itself and validates it like
+/// any config; sockets it already holds are shared, new ones bound.
+fn start_generation(
+    cfg: &Config,
+    busy: &[usize],
+    bound: Option<&BoundListeners>,
+    root: bool,
+    control_listeners: &ControlListeners,
+    control: Option<&Control>,
+    accounts: Option<&Accounts>,
+) -> Result<(Generation, Option<BoundListeners>)> {
+    let files = crate::cluster::applied::read_for_master(std::path::Path::new(&cfg.keel.state_dir))?;
+    let mut next = crate::config::assemble(&cfg.node_file, &files)?;
+    next.path = cfg.path.clone();
+    next.node_file = cfg.node_file.clone();
+    let slot = (0..crate::metrics::GENERATION_SLOTS).find(|s| !busy.contains(s)).context("no generation slot free")?;
+    let workers = next.keel.workers;
+    if crate::metrics::worker_stripe(slot, workers.saturating_sub(1)).is_none() {
+        anyhow::bail!("keel.workers = {workers} is more than this master can run; it needs keel upgrade");
+    }
+    let sockets = match bound {
+        Some(b) => Some(bind_listeners(&next, workers, root, Some(b))?),
+        None => None,
+    };
+    let mut g = Generation::new(slot, next.for_workers());
+    info!(workers, "master: starting new workers for a new version");
+    for index in 0..workers {
+        let private = private_fds(control_listeners, control, sockets.as_ref());
+        let pid = spawn_worker(&g.cfg, index, g.stripe(index), sockets.as_ref(), accounts, &private)?;
+        g.workers.push((pid, index, Instant::now()));
+        if let Some(c) = control {
+            control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index, pid: Some(pid.as_raw() as u32) });
+        }
+    }
+    Ok((g, sockets))
+}
+
+/// Whether the control worker sent the replace nudge since the last call.
+/// Anything else on the link is dropped unread.
+fn read_nudge(link: &std::os::unix::net::UnixStream, buf: &mut Vec<u8>) -> bool {
+    use std::io::Read;
+    let mut chunk = [0u8; 64];
+    let mut nudged = false;
+    loop {
+        match (&*link).read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        while let Some(end) = buf.iter().position(|b| *b == b'\n') {
+            nudged |= buf[..=end] == *control_worker::REPLACE_NUDGE;
+            buf.drain(..=end);
+        }
+        // A line longer than the nudge is not one.
+        if buf.len() > control_worker::REPLACE_NUDGE.len() {
+            buf.clear();
+        }
+    }
+    nudged
 }
 
 /// Descriptors a worker must not keep: the control listeners, the link to
@@ -601,6 +800,7 @@ fn spawn_control(
 fn spawn_worker(
     cfg: &Config,
     index: usize,
+    stripe: usize,
     bound: Option<&BoundListeners>,
     accounts: Option<&Accounts>,
     private: &[RawFd],
@@ -621,7 +821,7 @@ fn spawn_worker(
                 None => None,
             };
             info!(index, inherited = sockets.is_some(), "worker: started");
-            proxy::run(cfg, index, sockets)
+            proxy::run(cfg, index, stripe, sockets)
         }
     }
 }

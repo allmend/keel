@@ -222,11 +222,21 @@ where
             tokio::time::sleep(deadline - now).await;
         }
     };
+    // Keel stopping closes the connection; a worker a newer generation
+    // replaced keeps it to the end (drain::Watcher bounds how long).
     let mut shutdown = shutdown.clone();
+    let stopping = async {
+        while shutdown.changed().await.is_ok() {
+            if *shutdown.borrow() && !crate::drain::draining() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await
+    };
     let error = tokio::select! {
         (e1, e2) = async { tokio::join!(c2u, u2c) } => e1.or(e2),
         _ = idle_out => Some("idle_timeout"),
-        _ = shutdown.changed() => Some("shutdown"),
+        _ = stopping => Some("shutdown"),
     };
     (bytes_in.into_inner(), bytes_out.into_inner(), error)
 }
@@ -274,6 +284,7 @@ impl ServerApp for TcpProxyApp {
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let started = std::time::Instant::now();
+        let _open = crate::drain::Open::new();
         let mut session = session;
         let mut client_addr = session
             .get_socket_digest()

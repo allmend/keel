@@ -118,6 +118,10 @@ const G_START: usize = 4;
 const G_UNRESPONSIVE: usize = 5;
 /// Any process: series that did not fit.
 const G_DROPPED: usize = 6;
+/// Master: new generations that never took over.
+const G_REPLACEMENTS_FAILED: usize = 7;
+/// Master: workers of replaced generations still finishing.
+const G_DRAINING: usize = 8;
 
 // The region and this process's place in it
 
@@ -153,8 +157,9 @@ fn estimate(cfg: &Config) -> usize {
 
 /// Master, before forking: map the region every child inherits.
 pub fn create_region(cfg: &Config) -> anyhow::Result<()> {
-    // One stripe per worker, and the last one for the control worker.
-    let layout = layout_for(cfg.keel.workers.max(1) + 1, estimate(cfg));
+    // Per generation slot one stripe per worker, and the last one for the
+    // control worker.
+    let layout = layout_for(GENERATION_SLOTS * slot_width(cfg.keel.workers) + 1, estimate(cfg));
     let region = Region::create(layout).map_err(|e| anyhow::anyhow!("master: cannot map the metrics region: {e}"))?;
     region.global(G_WORKERS_CONFIGURED).store(cfg.keel.workers as u64, Ordering::Relaxed);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -162,14 +167,51 @@ pub fn create_region(cfg: &Config) -> anyhow::Result<()> {
     REGION.set(region).map_err(|_| anyhow::anyhow!("metrics region created twice"))
 }
 
+/// Generations of workers alive at once: the current one, one starting, and
+/// those draining.
+pub const GENERATION_SLOTS: usize = 5;
+
+/// Workers per generation slot: at least 16, so a version may raise
+/// `keel.workers` that far without a new master.
+fn slot_width(workers: usize) -> usize {
+    workers.max(16)
+}
+
+/// The stripe of worker `index` in generation slot `slot`; `None` when the
+/// region has no room for that many workers.
+pub fn worker_stripe(slot: usize, index: usize) -> Option<usize> {
+    let width = (region().layout().stripes - 1) / GENERATION_SLOTS;
+    (index < width && slot < GENERATION_SLOTS).then_some(slot * width + index)
+}
+
+/// Master: a worker that will not come back left gauges in its stripe.
+pub fn clear_stripe(stripe: usize) {
+    reset_gauges(region(), stripe);
+}
+
+/// Master: new workers for a version could not be started or were not
+/// ready in time; the current ones kept serving.
+pub fn replacement_failed() {
+    region().global(G_REPLACEMENTS_FAILED).fetch_add(1, Ordering::Relaxed);
+}
+
 /// Master: a worker exited and was replaced; `signaled` when a signal ended it.
 pub fn worker_restarted(signaled: bool) {
     region().global(if signaled { G_RESTARTS_SIGNAL } else { G_RESTARTS_EXIT }).fetch_add(1, Ordering::Relaxed);
 }
 
-/// Master: how many workers are running.
+/// Master: how many workers are running, and how many the config asks for.
 pub fn set_workers(n: usize) {
     region().global(G_WORKERS).store(n as u64, Ordering::Relaxed);
+}
+
+pub fn set_workers_configured(n: usize) {
+    region().global(G_WORKERS_CONFIGURED).store(n as u64, Ordering::Relaxed);
+}
+
+/// Master: workers of replaced generations still finishing their connections.
+pub fn set_draining(n: usize) {
+    region().global(G_DRAINING).store(n as u64, Ordering::Relaxed);
 }
 
 /// Control worker: how many workers missed the last liveness check.
@@ -687,7 +729,9 @@ fn render_globals(out: &mut String, region: &Region) {
          # HELP keel_workers_configured Worker processes configured (keel.workers)\n# TYPE keel_workers_configured gauge\nkeel_workers_configured {}\n\
          # HELP keel_workers_unresponsive Workers that did not answer the last liveness check\n# TYPE keel_workers_unresponsive gauge\nkeel_workers_unresponsive {}\n\
          # HELP keel_start_time_seconds When the master started, unix time; counters count from here\n# TYPE keel_start_time_seconds gauge\nkeel_start_time_seconds {}\n\
-         # HELP keel_metrics_series_dropped_total Series not recorded because the shared memory region was full\n# TYPE keel_metrics_series_dropped_total counter\nkeel_metrics_series_dropped_total {}",
+         # HELP keel_metrics_series_dropped_total Series not recorded because the shared memory region was full\n# TYPE keel_metrics_series_dropped_total counter\nkeel_metrics_series_dropped_total {}\n\
+         # HELP keel_workers_draining Workers a newer generation replaced, still finishing their connections\n# TYPE keel_workers_draining gauge\nkeel_workers_draining {}\n\
+         # HELP keel_worker_replacements_failed_total New workers for a version that did not start or were not ready in time\n# TYPE keel_worker_replacements_failed_total counter\nkeel_worker_replacements_failed_total {}",
         g(G_RESTARTS_EXIT),
         g(G_RESTARTS_SIGNAL),
         g(G_WORKERS),
@@ -695,6 +739,8 @@ fn render_globals(out: &mut String, region: &Region) {
         g(G_UNRESPONSIVE),
         g(G_START),
         g(G_DROPPED),
+        g(G_DRAINING),
+        g(G_REPLACEMENTS_FAILED),
     );
 }
 

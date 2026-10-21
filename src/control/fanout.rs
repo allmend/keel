@@ -73,6 +73,14 @@ pub fn worker_socket_dir(control_socket: &str) -> std::path::PathBuf {
         .join("workers")
 }
 
+/// Workers in the current generation; follows the applied config.
+static WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A version with another `keel.workers` started a generation of that size.
+pub fn set_workers(n: usize) {
+    WORKERS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The per-worker control socket for worker `index`.
 pub fn worker_socket_path(control_socket: &str, index: usize) -> String {
     worker_socket_dir(control_socket)
@@ -91,7 +99,9 @@ pub struct DrainOutcome {
 }
 
 pub struct WorkerFanout {
-    sockets: Vec<String>,
+    control_socket: String,
+    /// The workers' count when built for tests; else the applied config's.
+    fixed: Option<Vec<String>>,
     started_at: Instant,
     /// The node's health checks, for the reasons in `status`.
     health: Option<std::sync::Arc<crate::health::HealthTable>>,
@@ -99,11 +109,16 @@ pub struct WorkerFanout {
 
 impl WorkerFanout {
     pub fn new(control_socket: &str, workers: usize) -> Self {
-        WorkerFanout {
-            sockets: (0..workers).map(|i| worker_socket_path(control_socket, i)).collect(),
-            started_at: Instant::now(),
-            health: None,
+        WORKERS.store(workers, std::sync::atomic::Ordering::Relaxed);
+        WorkerFanout { control_socket: control_socket.to_owned(), fixed: None, started_at: Instant::now(), health: None }
+    }
+
+    /// One socket per worker of the current generation.
+    fn sockets(&self) -> Vec<String> {
+        if let Some(fixed) = &self.fixed {
+            return fixed.clone();
         }
+        (0..WORKERS.load(std::sync::atomic::Ordering::Relaxed)).map(|i| worker_socket_path(&self.control_socket, i)).collect()
     }
 
     /// Answer `status` with the health checks' failure reasons.
@@ -136,8 +151,9 @@ impl WorkerFanout {
                 return Vec::new();
             }
         };
-        let mut calls = Vec::with_capacity(self.sockets.len());
-        for path in &self.sockets {
+        let sockets = self.sockets();
+        let mut calls = Vec::with_capacity(sockets.len());
+        for path in &sockets {
             let (path, line) = (path.clone(), line.clone());
             calls.push(tokio::spawn(async move {
                 let result = ask_one(&path, &line).await;
@@ -240,7 +256,7 @@ impl WorkerFanout {
         Ok(DrainOutcome {
             pools,
             acknowledged: responses.iter().filter(|r| r.ok).count(),
-            workers: self.sockets.len(),
+            workers: self.sockets().len(),
         })
     }
 
@@ -262,7 +278,7 @@ impl WorkerFanout {
     pub async fn ping_all(&self) -> Vec<Result<u32, String>> {
         let Ok(line) = serde_json::to_string(&WorkerRequest::Ping) else { return Vec::new() };
         let mut calls = tokio::task::JoinSet::new();
-        for (index, path) in self.sockets.iter().enumerate() {
+        for (index, path) in self.sockets().into_iter().enumerate() {
             let (path, line) = (path.clone(), line.clone());
             calls.spawn(async move {
                 let pid = match ask_one(&path, &line).await {
@@ -282,7 +298,7 @@ impl WorkerFanout {
     pub async fn apply_all(&self, applied: &Applied) -> usize {
         let Ok(line) = serde_json::to_string(&WorkerRequest::Apply(Box::new(applied.clone()))) else { return 0 };
         let mut calls = tokio::task::JoinSet::new();
-        for path in &self.sockets {
+        for path in &self.sockets() {
             calls.spawn(apply_once_up(path.clone(), line.clone()));
         }
         calls.join_all().await.into_iter().filter(|ok| *ok).count()
@@ -290,10 +306,23 @@ impl WorkerFanout {
 
     /// Hand `applied` to worker `index`, waiting for its socket to come up —
     /// a worker the master just started takes about a second to bootstrap.
-    pub async fn apply_to(&self, index: usize, applied: &Applied) -> bool {
-        let Some(path) = self.sockets.get(index) else { return false };
+    pub async fn apply_to(&self, index: usize, pid: Option<u32>, applied: &Applied) -> bool {
+        let path = worker_socket_path(&self.control_socket, index);
+        let path = self.fixed.as_ref().and_then(|f| f.get(index).cloned()).unwrap_or(path);
         let Ok(line) = serde_json::to_string(&WorkerRequest::Apply(Box::new(applied.clone()))) else { return false };
-        apply_once_up(path.clone(), line).await
+        if let Some(pid) = pid {
+            // A new generation's worker takes the socket path over when it
+            // starts; until then it answers for the old one.
+            let Ok(ping) = serde_json::to_string(&WorkerRequest::Ping) else { return false };
+            for _ in 0..START_ATTEMPTS {
+                let answered = ask_one(&path, &ping).await.ok().and_then(|r| r.data?["pid"].as_u64());
+                if answered == Some(u64::from(pid)) {
+                    break;
+                }
+                tokio::time::sleep(START_INTERVAL).await;
+            }
+        }
+        apply_once_up(path, line).await
     }
 }
 
@@ -571,9 +600,8 @@ mod tests {
 
     fn fanout_over(dir: &std::path::Path, workers: usize) -> WorkerFanout {
         WorkerFanout {
-            sockets: (0..workers)
-                .map(|i| dir.join(format!("w{i}.sock")).to_string_lossy().into_owned())
-                .collect(),
+            control_socket: String::new(),
+            fixed: Some((0..workers).map(|i| dir.join(format!("w{i}.sock")).to_string_lossy().into_owned()).collect()),
             started_at: Instant::now(),
             health: None,
         }
@@ -597,8 +625,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fanout = fanout_over(&dir, 3);
-        fake_worker(fanout.sockets[0].clone(), status_response("10.0.0.1:80", 4)).await;
-        fake_worker(fanout.sockets[1].clone(), status_response("10.0.0.1:80", 7)).await;
+        fake_worker(fanout.sockets()[0].clone(), status_response("10.0.0.1:80", 4)).await;
+        fake_worker(fanout.sockets()[1].clone(), status_response("10.0.0.1:80", 7)).await;
         // sockets[2] is never bound — an unreachable worker is skipped.
 
         assert_eq!(fanout.connections_for("10.0.0.1:80").await, Some(11));
@@ -614,8 +642,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fanout = fanout_over(&dir, 3);
         let ok = ControlResponse::ok(json!({ "pools": ["web"], "done": true }));
-        fake_worker(fanout.sockets[0].clone(), ok.clone()).await;
-        fake_worker(fanout.sockets[1].clone(), ok).await;
+        fake_worker(fanout.sockets()[0].clone(), ok.clone()).await;
+        fake_worker(fanout.sockets()[1].clone(), ok).await;
         // sockets[2] is down.
 
         let outcome = fanout.drain("10.0.0.1:80").await.expect("drain applied somewhere");

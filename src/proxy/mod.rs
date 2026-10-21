@@ -77,6 +77,8 @@ pub struct ProxyCtx {
     retried_from: Option<SocketAddr>,
     /// The route's `max_body_size`.
     max_body: Option<usize>,
+    /// Counts the request as open while it lives.
+    _open: crate::drain::Open,
     /// Keel answered the request itself: an ACME challenge, a redirect, a
     /// default action.
     answered: bool,
@@ -383,6 +385,7 @@ impl ProxyHttp for KProxy {
             refused: None,
             retried_from: None,
             max_body: None,
+            _open: crate::drain::Open::new(),
             answered: false,
         }
     }
@@ -994,7 +997,9 @@ fn new_server(cfg: &Config, inherited: Option<&WorkerSockets>) -> Server {
     use pingora::server::configuration::Opt;
 
     let mut conf = pingora::server::configuration::ServerConf {
-        grace_period_seconds: Some(cfg.keel.grace_period.as_secs()),
+        // The longest a worker may finish its connections; drain::Watcher
+        // ends it sooner, at grace_period when Keel stops.
+        grace_period_seconds: Some(cfg.keel.grace_period.max(cfg.keel.drain_timeout).as_secs()),
         graceful_shutdown_timeout_seconds: Some(5),
         // One proxy thread per worker: a work-stealing runtime only adds
         // cross-thread bookkeeping to every task wake (≈15 % CPU per request).
@@ -1046,6 +1051,9 @@ struct WorkerApplier {
     pools: Arc<PoolRegistry>,
     cert_store: Arc<CertStore>,
     upstream: Arc<ArcSwap<HashMap<String, Upstream>>>,
+    /// Created after the first applied version: the master's sign that this
+    /// worker serves the node's current state.
+    ready: std::path::PathBuf,
     /// The last applied state, to skip what did not change.
     last: std::sync::Mutex<Option<crate::control::fanout::Applied>>,
 }
@@ -1075,6 +1083,11 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
                 self.pools.activate_by_address(address);
             }
         }
+        if last.is_none() {
+            if let Err(e) = std::fs::write(&self.ready, b"") {
+                error!(path = %self.ready.display(), error = %e, "worker: cannot mark itself ready");
+            }
+        }
         *last = Some(next.clone());
         certs.map_err(|e| format!("TLS certificates not reloaded, previous ones kept: {e:#}"))
     }
@@ -1085,8 +1098,8 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
 // `index` is the worker's position among `keel.workers`; it names the worker's
 // own control socket, where the control worker asks for its view and hands it
 // every applied config.
-pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
-    crate::metrics::init_worker(index);
+pub fn run(cfg: &Config, index: usize, stripe: usize, inherited: Option<WorkerSockets>) -> ! {
+    crate::metrics::init_worker(stripe);
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
     let mut inherited = inherited;
 
@@ -1102,6 +1115,10 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         }
     };
     add_ejection_sweeper(&mut server, &pools);
+    server.add_service(background_service(
+        "drain",
+        crate::drain::Watcher { grace_period: cfg.keel.grace_period, drain_timeout: cfg.keel.drain_timeout },
+    ));
 
     // ACME certificates arrive from the control worker; until then an ACME
     // host has none.
@@ -1133,6 +1150,7 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         pools: Arc::clone(&pools),
         cert_store: Arc::clone(&cert_store),
         upstream: Arc::clone(&upstream),
+        ready: crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket).join(format!("ready-{}", std::process::id())),
         last: std::sync::Mutex::new(None),
     };
     let downstream = Downstream {

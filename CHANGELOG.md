@@ -10,6 +10,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Listeners, `cache`, `access_log` and the `keel` block of the config
+  directory apply on push or reload by starting new workers. Old workers
+  stop accepting and finish their requests, WebSockets and TCP
+  connections, at most `keel.drain_timeout` (1h). Metrics
+  `keel_workers_draining`, `keel_worker_replacements_failed_total`.
 - Pools reload live: pools and backends added or removed, weights,
   algorithms, `health_check`, `passive`, timeouts and `retry`. Open
   connections are untouched; what stays keeps its state; what goes drains.

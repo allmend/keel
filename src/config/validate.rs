@@ -170,6 +170,11 @@ fn print_file(out: &Paint, path: &str, text: &str) {
 
 /// How the files differ from the applied version, each change marked as
 /// applied on reload (`false`) or waiting for a restart (`true`).
+/// A change from `old` to `new` the workers cannot apply in place.
+pub fn needs_new_workers(old: &Config, new: &Config) -> bool {
+    changes(old, new, false).iter().any(|(restart, _)| *restart)
+}
+
 pub fn changes(old: &Config, new: &Config, node_file_changed: bool) -> Vec<(bool, String)> {
     let mut out = Vec::new();
     let mut note = |restart: bool, what: String| out.push((restart, what));

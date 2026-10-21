@@ -43,6 +43,22 @@ pub fn read(state_dir: &Path) -> Result<Option<Applied>> {
     }
 }
 
+/// The files of a version that needs new workers, for the master to read.
+const REPLACE_FILE: &str = "replace_files.json";
+
+/// Hand the master a version to start new workers with. It reads the file
+/// itself, after the nudge on the link: the master takes no data over it.
+pub fn save_for_master(state_dir: &Path, files: &FileSet) -> Result<()> {
+    write_atomic(state_dir, REPLACE_FILE, &serde_json::to_string(files)?, 0o600)
+}
+
+/// The master: the version the control worker asked new workers for.
+pub fn read_for_master(state_dir: &Path) -> Result<FileSet> {
+    let path = state_dir.join(REPLACE_FILE);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("{} is not readable", path.display()))
+}
+
 pub fn save(state_dir: &Path, version: u64, files: &FileSet) -> Result<()> {
     let text = serde_json::to_string(&Applied { version, hash: hash(files) })?;
     write_atomic(state_dir, APPLIED_FILE, &text, 0o644)

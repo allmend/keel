@@ -166,6 +166,7 @@ impl Drops {
 /// One client `ip:port` pinned to one backend. Dropped (with the reply task
 /// aborted) when the flow ends.
 struct Flow {
+    _open: crate::drain::Open,
     backend: SocketAddr,
     upstream: Arc<UdpSocket>,
     stats: Arc<FlowStats>,
@@ -227,7 +228,7 @@ impl UdpProxyService {
             Arc::clone(&self.pools),
         ));
         debug!(pool = self.pool, client = %client, backend = %backend, "udp: flow opened");
-        Ok(Flow { backend, upstream, stats, counters, reply_task })
+        Ok(Flow { _open: crate::drain::Open::new(), backend, upstream, stats, counters, reply_task })
     }
 
     /// Forward one datagram, opening a flow for an unknown client first.

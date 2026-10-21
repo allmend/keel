@@ -755,6 +755,11 @@ pub struct KeelConfig {
     #[serde(default = "default_udp_max_flows")]
     pub udp_max_flows: usize,
 
+    /// How long workers a newer generation replaced keep serving their open
+    /// connections before those are closed.
+    #[serde(default = "default_drain_timeout", with = "duration")]
+    pub drain_timeout: Duration,
+
     /// HTTP: how long a client connection is kept open between requests.
     #[serde(default = "default_keepalive_timeout", with = "duration")]
     pub keepalive_timeout: Duration,
@@ -789,6 +794,7 @@ impl Default for KeelConfig {
             grace_period: default_grace_period(),
             udp_flow_timeout: default_udp_flow_timeout(),
             udp_max_flows: default_udp_max_flows(),
+            drain_timeout: default_drain_timeout(),
             keepalive_timeout: default_keepalive_timeout(),
             body_timeout: default_body_timeout(),
             max_header_size: default_max_header_size(),
@@ -815,6 +821,7 @@ impl KeelConfig {
 fn default_config_dir() -> String { "/etc/keel/config".into() }
 
 fn default_grace_period() -> Duration { Duration::from_secs(10) }
+fn default_drain_timeout() -> Duration { Duration::from_secs(3600) }
 fn default_keepalive_timeout() -> Duration { Duration::from_secs(75) }
 fn default_body_timeout() -> Duration { Duration::from_secs(60) }
 fn default_max_header_size() -> String { "64K".into() }
@@ -1290,9 +1297,9 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 
 /// Attributes that hold a duration; `keel config validate --write` adds the
 /// unit to a bare number there.
-pub const DURATION_ATTRIBUTES: [&str; 13] = [
+pub const DURATION_ATTRIBUTES: [&str; 14] = [
     "grace_period", "udp_flow_timeout", "eject_for", "interval", "timeout", "ttl", "min_valid", "connect_timeout",
-    "read_timeout", "write_timeout", "idle_timeout", "keepalive_timeout", "body_timeout",
+    "read_timeout", "write_timeout", "idle_timeout", "keepalive_timeout", "body_timeout", "drain_timeout",
 ];
 
 /// Serde for duration attributes: a string such as `30s`.
