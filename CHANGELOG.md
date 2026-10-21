@@ -16,6 +16,9 @@ Versioning: [Semantic Versioning](https://semver.org/).
   connections, at most `keel.drain_timeout` (1h); UDP flows move to the
   new workers with their upstream socket. Metrics
   `keel_workers_draining`, `keel_worker_replacements_failed_total`.
+- `node.hcl` applies on reload: `keel.workers` by new workers, `metrics`,
+  `control` and `cluster` by a new control worker. Users and paths still
+  need a restart; such a change is refused and logged.
 - Pools reload live: pools and backends added or removed, weights,
   algorithms, `health_check`, `passive`, timeouts and `retry`. Open
   connections are untouched; what stays keeps its state; what goes drains.

@@ -243,6 +243,8 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         }
 
         ControlRequest::ConfigReload => {
+            // The node file is the master's to read; tell it to, as SIGHUP does.
+            crate::control::control_worker::nudge_master(crate::control::control_worker::NODE_NUDGE);
             // Reloading reconciles this node's config directory into the
             // cluster: it becomes the next version, which every node applies.
             let resp = match crate::config::read_config_dir(&cluster.config_dir) {

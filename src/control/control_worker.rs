@@ -163,8 +163,10 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
         applied: applied_tx,
         certs_changed,
         startup_files: Some(cfg.files.clone()),
-        nudge: inherited.master.try_clone().ok(),
     };
+    if let Ok(link) = inherited.master.try_clone() {
+        let _ = MASTER.set(link);
+    }
     tokio::spawn(driver.run(restarted_rx, shutdown.clone()));
 
     {
@@ -324,14 +326,24 @@ struct ApplyDriver {
     /// applied. A version with exactly these files came from this directory:
     /// it is not written back, so edits made since are not overwritten.
     startup_files: Option<crate::config::FileSet>,
-    /// Our end of the master link, to nudge it when a version needs new
-    /// workers. The one thing the control worker writes there.
-    nudge: Option<std::os::unix::net::UnixStream>,
 }
 
-/// The whole message to the master: read the replace file and start new
-/// workers with it.
+/// The whole messages to the master. Replace: read the replace file and
+/// start new workers with it. Node: read node.hcl again, as on SIGHUP.
 pub const REPLACE_NUDGE: &[u8] = b"replace\n";
+pub const NODE_NUDGE: &[u8] = b"node\n";
+
+/// Our end of the master link, for the nudges.
+static MASTER: std::sync::OnceLock<std::os::unix::net::UnixStream> = std::sync::OnceLock::new();
+
+/// Send one of the fixed nudges; nothing else ever goes to the master.
+pub fn nudge_master(nudge: &'static [u8]) {
+    use std::io::Write;
+    let Some(link) = MASTER.get() else { return };
+    if let Err(e) = (&*link).write_all(nudge) {
+        warn!(error = %e, "control: cannot reach the master");
+    }
+}
 
 impl ApplyDriver {
     async fn run(mut self, mut restarted: mpsc::UnboundedReceiver<(usize, Option<u32>)>, mut shutdown: watch::Receiver<bool>) {
@@ -417,10 +429,10 @@ impl ApplyDriver {
     /// the keel block, cache, access_log): the master starts a new
     /// generation of workers with it, and the current one drains.
     fn ask_for_new_workers(&self, next: &ConfigVersion) {
-        use std::io::Write;
-        let Some(link) = &self.nudge else { return };
-        let asked = crate::cluster::applied::save_for_master(&self.state_dir, &next.files)
-            .and_then(|()| (&*link).write_all(REPLACE_NUDGE).context("write to the master"));
+        let asked = crate::cluster::applied::save_for_master(&self.state_dir, &next.files);
+        if asked.is_ok() {
+            nudge_master(REPLACE_NUDGE);
+        }
         match asked {
             Ok(()) => info!(version = next.version, "control: version needs new workers; asked the master"),
             Err(e) => error!(version = next.version, error = %format!("{e:#}"), "control: cannot ask the master for new workers"),

@@ -571,7 +571,7 @@ Output is colored on a terminal; `--no-color` or `NO_COLOR` turns it off.
 
 ## Hot reload
 
-`SIGHUP` to the master or `keel config reload` pushes the node's config directory as the next version, one node or many; see [In a cluster](#in-a-cluster). A directory that does not load is refused and nothing changes. Every node's control worker applies the version and hands it to its workers without dropping connections. A worker started later gets the applied version from the control worker. The node file is read at start only.
+`SIGHUP` to the master or `keel config reload` pushes the node's config directory as the next version, one node or many; see [In a cluster](#in-a-cluster). A directory that does not load is refused and nothing changes. Every node's control worker applies the version and hands it to its workers without dropping connections. A worker started later gets the applied version from the control worker. The master also reads the node file again; see below.
 
 What reloads without restart, open connections untouched:
 - Virtual host rules: hosts, routes, `forwarded_headers`, cache rules, `redirect_http`, `default_action`, access lists, body limits
@@ -581,7 +581,10 @@ What reloads without restart, open connections untouched:
 
 What starts new workers, also without dropping a connection: listeners, `cache` storage, `access_log`, and the `keel` block of the config directory. The master binds new listener addresses (unchanged ones are shared, never closed) and starts a new generation of workers. Once every new worker has the node's state, the old ones stop accepting and finish what they hold: requests, WebSockets and TCP connections. A worker exits when nothing is open, at most `keel.drain_timeout` (default `1h`); at most two replaced generations drain at once, and a third closes the oldest's connections. New workers that do not start or are not ready within 60s are stopped; the old ones keep serving, and `keel_worker_replacements_failed_total` counts it. `keel_workers_draining` shows replaced workers still finishing. The memory cache starts empty in new workers. UDP flows move to the new worker of the same index with their upstream socket: the flow keeps its backend, and the backend sees the same source address.
 
-What requires a process restart: every setting in the node file.
+The node file applies on the same reload, on this node:
+- `keel.workers`: new workers, as above.
+- `metrics`, `control` and `cluster`: a new control worker, with new listeners where an address changed. Traffic is not touched.
+- `keel.user`, `keel.group`, `keel.control_user`, `keel.control_socket`, `keel.state_dir` and `keel.config_dir` need a new master: a node file changing any of them is refused as a whole and logged; they take a restart.
 
 Backends are matched on IP and port: `[2001:db8::1]:80` and `[2001:db8:0::1]:80` are the same backend.
 

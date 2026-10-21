@@ -371,6 +371,28 @@ fn file_id(path: &str) -> Option<(u64, u64)> {
 }
 
 impl ControlListeners {
+    /// The listeners `next` asks for: an unchanged address keeps its socket,
+    /// a changed one is bound anew. The control socket path cannot change.
+    fn rebind(&self, cfg: &Config, next: &Config) -> Result<ControlListeners> {
+        let remote_of = |c: &Config| c.control.as_ref().and_then(|c| c.remote.as_ref()).map(|r| r.address.clone());
+        let remote = match remote_of(next) {
+            None => None,
+            Some(a) if Some(&a) == remote_of(cfg).as_ref() => self.remote.as_ref().map(|r| r.try_clone()).transpose()?,
+            Some(a) => {
+                let addr: std::net::SocketAddr = a.parse().context("control.remote.address")?;
+                Some(std::net::TcpListener::bind(addr).with_context(|| format!("master: cannot bind control.remote {addr}"))?)
+            }
+        };
+        let metrics = if next.metrics.address == cfg.metrics.address {
+            self.metrics.try_clone()?
+        } else {
+            std::net::TcpListener::bind(&next.metrics.address)
+                .with_context(|| format!("master: cannot bind metrics.address {}", next.metrics.address))?
+        };
+        info!(remote = remote.is_some(), metrics = next.metrics.address, "master: control listeners bound");
+        Ok(ControlListeners { socket: self.socket.try_clone()?, socket_file: self.socket_file, remote, metrics })
+    }
+
     /// Remove the socket file if it is still the one bound here: a new
     /// instance may already have bound the path while this one drained.
     fn remove_socket(&self, path: &str) {
@@ -416,6 +438,8 @@ fn bind_control(cfg: &Config, accounts: Option<&Accounts>) -> Result<ControlList
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+/// `keel config reload` reached the control worker: read node.hcl again.
+static NODE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -434,6 +458,7 @@ struct Control {
 
 /// Entry point for the master.
 pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
+    let mut cfg = cfg;
     install_signal_handlers()?;
     let accounts = resolve_accounts(&cfg)?;
     match &accounts {
@@ -456,7 +481,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     } else {
         None
     };
-    let control_listeners = bind_control(&cfg, accounts.as_ref())?;
+    let mut control_listeners = bind_control(&cfg, accounts.as_ref())?;
     crate::metrics::create_region(&cfg)?;
 
     let mut control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
@@ -485,6 +510,9 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     let mut nudged = Vec::new();
     // A nudge that came while a generation was starting waits for it.
     let mut wanted = false;
+    // The next generation starts from the node file, not from a version the
+    // control worker handed over.
+    let mut node_changed = false;
 
     loop {
         std::thread::sleep(TICK);
@@ -507,8 +535,43 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             return Ok(());
         }
 
-        if RELOAD.swap(false, Ordering::SeqCst) {
+        if RELOAD.load(Ordering::SeqCst) || NODE.swap(false, Ordering::SeqCst) {
+            // The node file is the operator's: the master reads it itself.
+            let node_file = crate::config::read_node_file(&cfg.path).unwrap_or_else(|_| cfg.node_file.clone());
+            if node_file != cfg.node_file {
+                match with_node_file(&cfg, &node_file, &current.cfg.files) {
+                    Err(e) => error!(error = %format!("{e:#}"), "master: node file not applied; it does not load"),
+                    Ok(next) if !needs_new_master(&cfg, &next).is_empty() => error!(
+                        settings = needs_new_master(&cfg, &next).join(", "),
+                        "master: node file not applied; these need a new master (keel upgrade)"
+                    ),
+                    Ok(next) => {
+                        info!("master: node file changed; restarting the control worker with it");
+                        let addresses = |c: &Config| (c.metrics.address.clone(), c.control.as_ref().and_then(|c| c.remote.as_ref()).map(|r| r.address.clone()));
+                        if addresses(&cfg) != addresses(&next) {
+                            match control_listeners.rebind(&cfg, &next) {
+                                Ok(l) => control_listeners = l,
+                                Err(e) => error!(error = %format!("{e:#}"), "master: new metrics or control address not bound; keeping the old ones"),
+                            }
+                        }
+                        if let Some(c) = control.take() {
+                            let _ = signal::kill(c.pid, Signal::SIGTERM);
+                            let _ = waitpid(c.pid, None);
+                        }
+                        let workers_changed = next.keel.workers != cfg.keel.workers;
+                        cfg = next;
+                        control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
+                        control_due = None;
+                        if workers_changed {
+                            wanted = true;
+                            node_changed = true;
+                        }
+                    }
+                }
+            }
             match &control {
+                // `keel config reload` reached the control worker already.
+                _ if !RELOAD.swap(false, Ordering::SeqCst) => {}
                 Some(c) => {
                     info!("master: reload signal received (SIGHUP), passing it to the control worker");
                     control_worker::send_to_control(&c.link, &MasterMessage::Reload);
@@ -523,7 +586,16 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             if wanted && pending.is_none() {
                 wanted = false;
                 let spawn = Spawn { control_listeners: &control_listeners, control: Some(c), accounts: accounts.as_ref() };
-                match start_generation(&cfg, &current, &draining, bound.as_ref(), root, &spawn) {
+                // The version the control worker handed over: the master reads
+                // it from the state directory itself and validates it like
+                // any config. A node file change runs the current files.
+                let next = if std::mem::take(&mut node_changed) {
+                    with_node_file(&cfg, &cfg.node_file, &current.cfg.files)
+                } else {
+                    crate::cluster::applied::read_for_master(std::path::Path::new(&cfg.keel.state_dir))
+                        .and_then(|files| with_node_file(&cfg, &cfg.node_file, &files))
+                };
+                match next.and_then(|next| start_generation(next, &current, &draining, bound.as_ref(), root, &spawn)) {
                     Ok((generation, sockets)) => pending = Some((generation, sockets, Instant::now())),
                     Err(e) => {
                         error!(error = %format!("{e:#}"), "master: new workers not started; the current ones keep serving");
@@ -682,6 +754,31 @@ impl Generation {
     }
 }
 
+/// `files` assembled against `node_file`, at the master's node path.
+fn with_node_file(cfg: &Config, node_file: &str, files: &crate::config::FileSet) -> Result<Config> {
+    let mut next = crate::config::assemble(node_file, files)?;
+    next.path = cfg.path.clone();
+    next.node_file = node_file.to_owned();
+    Ok(next)
+}
+
+/// Node settings only a new master can change: the process users, and the
+/// paths every process was started with.
+fn needs_new_master(old: &Config, new: &Config) -> Vec<&'static str> {
+    let (a, b) = (&old.keel, &new.keel);
+    [
+        ("keel.user", a.user != b.user),
+        ("keel.group", a.group != b.group),
+        ("keel.control_user", a.control_user != b.control_user),
+        ("keel.control_socket", a.control_socket != b.control_socket),
+        ("keel.state_dir", a.state_dir != b.state_dir),
+        ("keel.config_dir", a.config_dir != b.config_dir),
+    ]
+    .into_iter()
+    .filter_map(|(name, changed)| changed.then_some(name))
+    .collect()
+}
+
 /// What forking a worker needs besides its config.
 #[derive(Clone, Copy)]
 struct Spawn<'a> {
@@ -690,11 +787,10 @@ struct Spawn<'a> {
     accounts: Option<&'a Accounts>,
 }
 
-/// Start a generation for the version the control worker handed over: the
-/// master reads it from the state directory itself and validates it like
-/// any config; sockets it already holds are shared, new ones bound.
+/// Start a generation for `next`; sockets the master already holds are
+/// shared, new ones bound.
 fn start_generation(
-    cfg: &Config,
+    next: Config,
     current: &Generation,
     draining: &[Generation],
     bound: Option<&BoundListeners>,
@@ -705,10 +801,6 @@ fn start_generation(
     let busy: Vec<usize> = std::iter::once(current).chain(draining).map(|g| g.slot).collect();
     // A new worker whose index the current generation has gets its UDP flows.
     let predecessors: Vec<usize> = current.workers.iter().map(|(_, index, _)| *index).collect();
-    let files = crate::cluster::applied::read_for_master(std::path::Path::new(&cfg.keel.state_dir))?;
-    let mut next = crate::config::assemble(&cfg.node_file, &files)?;
-    next.path = cfg.path.clone();
-    next.node_file = cfg.node_file.clone();
     let slot = (0..crate::metrics::GENERATION_SLOTS).find(|s| !busy.contains(s)).context("no generation slot free")?;
     let workers = next.keel.workers;
     if crate::metrics::worker_stripe(slot, workers.saturating_sub(1)).is_none() {
@@ -744,6 +836,9 @@ fn read_nudge(link: &std::os::unix::net::UnixStream, buf: &mut Vec<u8>) -> bool 
         }
         while let Some(end) = buf.iter().position(|b| *b == b'\n') {
             nudged |= buf[..=end] == *control_worker::REPLACE_NUDGE;
+            if buf[..=end] == *control_worker::NODE_NUDGE {
+                NODE.store(true, Ordering::SeqCst);
+            }
             buf.drain(..=end);
         }
         // A line longer than the nudge is not one.
