@@ -92,7 +92,9 @@ fn a_flow_keeps_its_backend_and_socket_across_new_workers() -> Result<()> {
     })?;
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(ask(&stack)?, before, "after the switch: the same backend, from the same socket");
-    let logs = stack.logs("keel")?;
-    assert!(logs.contains("udp: flows handed to the new worker"), "{logs}");
+    // The old worker logs once the new one has taken the flows.
+    wait_until("the hand-over logged", Duration::from_secs(10), || {
+        Ok(stack.logs("keel")?.contains("udp: flows handed to the new worker").then_some(()))
+    })?;
     Ok(())
 }
