@@ -358,6 +358,7 @@ fn backend_json(b: &BackendStatus) -> serde_json::Value {
     };
     let health = match (b.ejected, b.healthy) {
         (true, _) => "ejected",
+        (false, _) if b.initializing => "initializing",
         (false, None) => "unchecked",
         (false, Some(true)) => "healthy",
         (false, Some(false)) => "unhealthy",

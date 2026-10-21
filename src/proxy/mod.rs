@@ -965,6 +965,22 @@ impl pingora::services::background::BackgroundService for EjectionSweeper {
 
 /// Pools with a health check follow the control worker's verdicts; the
 /// passive-ejection sweeper runs in every worker.
+/// A checked backend takes no traffic before its first probe. Serving
+/// before then would answer 503, so the worker waits: the control worker
+/// probes within a second of start, and a probe ends within its timeout.
+/// Connections meanwhile wait in the listen queue.
+fn wait_for_first_probes(cfg: &Config, pools: &PoolRegistry) {
+    let longest = cfg.pools.values().filter_map(|p| p.health_check.as_ref()).map(|h| h.timeout).max();
+    let Some(longest) = longest else { return };
+    let deadline = Instant::now() + longest + std::time::Duration::from_secs(2);
+    while pools.initializing() && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if pools.initializing() {
+        tracing::warn!("serving before every checked backend was probed");
+    }
+}
+
 fn add_health_services(server: &mut Server, cfg: &Config, pools: &Arc<PoolRegistry>) {
     if cfg.pools.values().any(|p| p.passive.enabled) {
         server.add_service(background_service("passive-sweep", EjectionSweeper { pools: Arc::clone(pools) }));
@@ -1219,11 +1235,12 @@ pub fn run(cfg: &Config, index: usize, inherited: Option<WorkerSockets>) -> ! {
         "control",
         crate::control::worker_socket::WorkerSocket {
             path: crate::control::fanout::worker_socket_path(&cfg.keel.control_socket, index),
-            pools,
+            pools: Arc::clone(&pools),
             applier: Arc::new(applier),
         },
     ));
 
+    wait_for_first_probes(cfg, &pools);
     server.run_forever()
 }
 

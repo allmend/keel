@@ -450,8 +450,9 @@ fn health_rank(health: &str) -> u8 {
     match health {
         "ejected" => 0,
         "unhealthy" => 1,
-        "healthy" => 2,
-        _ => 3,
+        "initializing" => 2,
+        "healthy" => 3,
+        _ => 4,
     }
 }
 

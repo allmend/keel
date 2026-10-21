@@ -70,6 +70,8 @@ pub struct HealthTable {
 /// One backend's probe results and verdict.
 struct Checked {
     series: crate::metrics::BackendSeries,
+    /// No verdict yet: the first probe decides.
+    initializing: AtomicBool,
     healthy: AtomicBool,
     consecutive_ok: AtomicU32,
     consecutive_fail: AtomicU32,
@@ -80,12 +82,13 @@ struct Checked {
 impl Checked {
     fn new(pool: &str, addr: SocketAddr) -> Self {
         let series = crate::metrics::BackendSeries::new(pool, &addr.to_string());
-        // A restarted control worker continues from the verdict it left.
-        let healthy = series.verdict().unwrap_or(true);
-        series.set_healthy(healthy);
+        // A restarted control worker continues from the verdict it left; a
+        // new backend has none, and gets no traffic until its first probe.
+        let verdict = series.verdict();
         Checked {
             series,
-            healthy: AtomicBool::new(healthy),
+            initializing: AtomicBool::new(verdict.is_none()),
+            healthy: AtomicBool::new(verdict.unwrap_or(false)),
             consecutive_ok: AtomicU32::new(0),
             consecutive_fail: AtomicU32::new(0),
             reason: Mutex::new(None),
@@ -95,6 +98,13 @@ impl Checked {
     /// Apply one probe result with the pool's thresholds. Returns
     /// `Some(new_state)` when the backend flipped.
     fn observe(&self, ok: bool, reason: Option<&str>, healthy_after: u32, unhealthy_after: u32) -> Option<bool> {
+        if self.initializing.swap(false, Ordering::Relaxed) {
+            *self.reason.lock().unwrap() = reason.map(str::to_owned);
+            let counter = if ok { &self.consecutive_ok } else { &self.consecutive_fail };
+            counter.store(1, Ordering::Relaxed);
+            self.healthy.store(ok, Ordering::Relaxed);
+            return Some(ok);
+        }
         if ok {
             self.consecutive_fail.store(0, Ordering::Relaxed);
             *self.reason.lock().unwrap() = None;
@@ -458,8 +468,11 @@ mod tests {
         let mut table = HealthTable::default();
         table.backends.insert(("hc".to_owned(), addr), Checked::new("hc", addr));
         let worker_view = crate::metrics::BackendSeries::new("hc", "127.0.0.7:1");
-        assert_eq!(worker_view.verdict(), Some(true), "healthy from the start");
+        assert_eq!(worker_view.verdict(), None, "no verdict before the first probe");
         let fail: ProbeResult = Err("refused".into());
+        // The first probe decides at once, either way.
+        table.observe("hc", addr, &Ok(()), 2, 3);
+        assert_eq!(worker_view.verdict(), Some(true));
         table.observe("hc", addr, &fail, 2, 3);
         table.observe("hc", addr, &fail, 2, 3);
         assert_eq!(worker_view.verdict(), Some(true), "below threshold");
@@ -471,6 +484,10 @@ mod tests {
         table.observe("hc", addr, &Ok(()), 2, 3);
         assert_eq!(worker_view.verdict(), Some(true));
         assert_eq!(table.reason("hc", "127.0.0.7:1"), None);
+        let other: SocketAddr = "127.0.0.7:2".parse().unwrap();
+        table.backends.insert(("hc".to_owned(), other), Checked::new("hc", other));
+        table.observe("hc", other, &fail, 2, 3);
+        assert_eq!(crate::metrics::BackendSeries::new("hc", "127.0.0.7:2").verdict(), Some(false), "a first failure is unhealthy at once");
         // A restarted prober continues from the verdict it left.
         worker_view.set_healthy(false);
         assert!(!Checked::new("hc", addr).healthy.load(Ordering::Relaxed));

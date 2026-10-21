@@ -27,6 +27,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A checked backend takes no traffic until its first probe, which decides
+  either way; workers serve once every checked backend has a verdict.
+  Before, backends started healthy and the first requests could reach a
+  dead one.
 - **Breaking: named listeners.** `listener "<name>" { protocol, addresses,
   port }` replaces `listener "<protocol>" "<ip:port>"`. `addresses` is the
   same on every node; each node binds those it has and skips the rest.

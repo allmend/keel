@@ -28,7 +28,7 @@
 | `config validate` | `valid`, `error` when not, `unformatted` (files), `files` with `--full` (`[{path, text}]`), `diff` and `changes` with `--diff` (`[{restart, change}]`) |
 | `credentials create` | `endpoint`, `ca_cert`, `client_cert`, `client_key` |
 
-A backend is `{address, state, health, health_reason, connections}`. `state` is `active`, `draining` or `removed`; `health` is `healthy`, `unhealthy`, `ejected` or `unchecked`; `health_reason` is `null` or why.
+A backend is `{address, state, health, health_reason, connections}`. `state` is `active`, `draining` or `removed`; `health` is `healthy`, `unhealthy`, `initializing`, `ejected` or `unchecked`; `health_reason` is `null` or why.
 
 ## Control socket
 
@@ -60,7 +60,7 @@ keel — uptime 2h 14m 30s
     10.0.0.3:8080              draining    healthy     3 conn
 ```
 
-`unchecked`: the pool has no health check. A reason in parentheses is the last failed probe or the ejection cause; it shows before `unhealthy_threshold` is reached too.
+`unchecked`: the pool has no health check. `initializing`: no probe has answered yet. A reason in parentheses is the last failed probe or the ejection cause; it shows before `unhealthy_threshold` is reached too.
 
 ## keel backend list
 

@@ -96,10 +96,15 @@ impl BackendEntry {
         self.drain_state.load(Ordering::Relaxed) == DRAIN_ACTIVE && self.healthy() && !self.health.ejected_at(now_ms)
     }
 
-    /// The control worker's verdict for a checked pool; healthy until it has
-    /// one, and without a check.
+    /// The control worker's verdict for a checked pool: no traffic until its
+    /// first probe. Without a check, healthy.
     fn healthy(&self) -> bool {
-        !self.health.checked.load(Ordering::Relaxed) || self.series.verdict().unwrap_or(true)
+        !self.health.checked.load(Ordering::Relaxed) || self.series.verdict() == Some(true)
+    }
+
+    /// Checked, and no probe has answered yet.
+    fn initializing(&self) -> bool {
+        self.health.checked.load(Ordering::Relaxed) && self.series.verdict().is_none()
     }
 }
 
@@ -119,6 +124,8 @@ pub struct BackendStatus {
     pub connections: i64,
     /// `None` when no health check is configured for the pool.
     pub healthy: Option<bool>,
+    /// Checked, waiting for its first probe.
+    pub initializing: bool,
     /// Passively ejected right now; the reason says what traffic failed.
     pub ejected: bool,
     pub eject_reason: Option<String>,
@@ -316,6 +323,11 @@ impl PoolRegistry {
     /// Record an active-check result. Flips the backend when the pool's
     /// threshold is reached; logs and updates `keel_backend_healthy` on flips.
     /// Mark every backend of a pool as covered by an active check: its
+    /// Whether a checked backend still waits for its first probe.
+    pub fn initializing(&self) -> bool {
+        self.drain.values().flat_map(HashMap::values).any(BackendEntry::initializing)
+    }
+
     /// health is the control worker's verdict, and status says so.
     pub fn mark_checked(&self, pool_name: &str) {
         for entry in self.drain.get(pool_name).into_iter().flat_map(HashMap::values) {
@@ -469,6 +481,7 @@ fn status_of(pool: &str, entry: &BackendEntry, now_ms: u64) -> BackendStatus {
         drain_state: entry.drain_state.load(Ordering::Relaxed),
         connections: entry.connections.load(Ordering::Relaxed).max(0),
         healthy: checked.then(|| entry.healthy()),
+        initializing: entry.initializing(),
         ejected,
         eject_reason: if ejected { entry.health.eject_reason.lock().unwrap().clone() } else { None },
     }
@@ -667,6 +680,12 @@ mod tests {
         verdict.set_healthy(false);
         assert_eq!(selections(&reg, 6).len(), 2, "an unchecked pool ignores verdicts");
         reg.mark_checked("p");
+        // No verdict for the second yet: initializing, no traffic.
+        assert!(reg.select("p", b"").is_none() && reg.initializing());
+        let b = reg.backends_for_pool("p").into_iter().find(|b| b.address == "127.0.0.9:2").unwrap();
+        assert!(b.initializing && b.healthy == Some(false), "initializing");
+        crate::metrics::BackendSeries::new("p", "127.0.0.9:2").set_healthy(true);
+        assert!(!reg.initializing());
         assert_eq!(selections(&reg, 6), ["127.0.0.9:2".parse().unwrap()].into_iter().collect());
         assert_eq!(reg.backends_for_pool("p").iter().find(|b| b.address == a.to_string()).unwrap().healthy, Some(false));
         verdict.set_healthy(true);

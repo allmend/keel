@@ -31,7 +31,7 @@ pool "web" {
 
 The control worker runs the checks, once per node: a backend gets one probe per interval, whatever the number of workers. Every worker acts on the same verdict, read from shared memory, and a worker started later reads the current one. While the control worker is down, the workers keep the last verdicts; a restarted control worker continues from them.
 
-Backends start healthy. The first round runs within a second of startup.
+A checked backend starts `initializing` and takes no traffic until its first probe: a pass makes it healthy, a failure unhealthy. Thresholds apply from then on. The first round runs within a second of startup, and workers serve once every checked backend has a verdict, at most the longest `timeout` plus two seconds; connections meanwhile wait in the listen queue. Without a health check a backend is healthy at once.
 
 ## Probe types
 
@@ -173,7 +173,7 @@ Ejections show in `keel status` as `ejected` with the streak, in the log at `war
     10.0.0.12:8080             active      unhealthy   0 conn  (connect: ConnectRefused)
 ```
 
-`unchecked`: the pool has no `health_check`. `ejected`: passive detection took the backend out, e.g. `3 consecutive connect failures`. Other reasons: `connection refused`, `timeout after 2000ms`, `port unreachable`, `status 503`, `body lacks "ok"`, `connect: ConnectTimedout`.
+`unchecked`: the pool has no `health_check`. `initializing`: no probe has answered yet. `ejected`: passive detection took the backend out, e.g. `3 consecutive connect failures`. Other reasons: `connection refused`, `timeout after 2000ms`, `port unreachable`, `status 503`, `body lacks "ok"`, `connect: ConnectTimedout`.
 
 Transitions are logged at `warn` (unhealthy, with the reason) and `info` (healthy), and set `keel_backend_healthy`.
 
