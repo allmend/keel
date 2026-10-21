@@ -8,55 +8,46 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-
-- `allow` and `deny` client lists on vhosts, routes and `tcp`/`udp`
-  listeners. HTTP answers 403, TCP closes, UDP drops; error `denied`.
-  Behind `trusted_proxies` the client is the last untrusted
-  `X-Forwarded-For` hop. Applied live on push.
-- Timeouts and limits. Pools: `connect_timeout` (3s), `read_timeout`,
-  `write_timeout`, `idle_timeout` (60s), `retry` once on another backend
-  after a failed connect. `keel`: `keepalive_timeout` (75s),
-  `body_timeout` (60s), `max_header_size` (64K, 431). Vhost and route:
-  `max_body_size` (off, 413). `tcp` listeners: `idle_timeout` (1h).
-- The container image carries users `keel` (10001) and `keel-control`
-  (10002), so started as root it drops privileges. `keel.user`,
-  `keel.group` and `keel.control_user` take numeric ids.
-- `-o json` on every `keel` and `keelctl` client command, `config validate`
-  and `credentials create`: one JSON object per line.
+## [0.27.0] — 2026-10-21
 
 ### Changed
 
-- A checked backend takes no traffic until its first probe, which decides
-  either way; workers serve once every checked backend has a verdict.
-  Before, backends started healthy and the first requests could reach a
-  dead one.
 - **Breaking: named listeners.** `listener "<name>" { protocol, addresses,
-  port }` replaces `listener "<protocol>" "<ip:port>"`. `addresses` is the
-  same on every node; each node binds those it has and skips the rest.
-  `keel status` and `keel_listener_bound` show which. Logs and metrics
-  label listeners by name. IPv6 sockets are IPv6 only.
-- **Breaking: addresses are `ip:port`.** Backends, listeners, `metrics`,
-  `control.remote` and `cluster` refuse host names at load. Keel resolves
-  no names.
-- TCP `reencrypt` sends no SNI and, with `tls_verify`, checks the backend
-  certificate against the backend's IP.
-- HTTP access-log errors after a backend is chosen name the failing side:
-  `upstream_connect`, `upstream_timeout`, `upstream`, `downstream`,
-  `internal`. Only backend-side failures count in
-  `keel_backend_connection_errors_total`.
+  port }` replaces `listener "<protocol>" "<ip:port>"`. Every node binds
+  the listed addresses it has; `keel status` and `keel_listener_bound`
+  show which. Logs and metrics name listeners. IPv6 sockets are v6 only.
+- **Breaking: no host names.** Backends, `metrics`, `control.remote` and
+  `cluster` take `ip:port`, listeners IPs. Keel resolves no names.
+- A checked backend gets no traffic before its first probe. Workers serve
+  once every checked backend has a verdict.
+- TCP `reencrypt` sends no SNI; `tls_verify` checks the backend
+  certificate against its IP.
+- HTTP access-log errors name the failing side: `upstream_connect`,
+  `upstream_timeout`, `upstream`, `downstream`, `internal`. Only backend
+  failures count in `keel_backend_connection_errors_total`.
+
+### Added
+
+- `allow`/`deny` on vhosts, routes and `tcp`/`udp` listeners: 403, close or
+  drop, error `denied`. Clients behind `trusted_proxies` are read from
+  `X-Forwarded-For`. Live on push.
+- Timeouts and limits. Pools: `connect_timeout` (3s), `read_timeout`,
+  `write_timeout`, `idle_timeout` (60s), `retry` on another backend after a
+  failed connect. A backend timeout is 504. `keel`: `keepalive_timeout`
+  (75s), `body_timeout` (60s), `max_header_size` (64K, 431). Vhost and
+  route: `max_body_size` (413). `tcp` listeners: `idle_timeout` (1h).
+- `-o json` on every `keel` and `keelctl` command.
+- Container image: users `keel` (10001) and `keel-control` (10002), so a
+  root start drops privileges. User and group settings take numeric ids.
 
 ### Fixed
 
-- rustls-webpki 0.103.16 and webpki-root-certs 1.0.10: distrusted emSign
-  intermediates are rejected (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
-- Access logs renamed or removed by logrotate are reopened at their path
-  within a second. Before, Keel kept writing to the renamed file.
-- Requests Keel answers itself (ACME challenges, redirects,
-  `default_action`) are logged under their vhost without an error, not as
-  `no_route` with empty method and URI.
-- A WebSocket the client dropped was logged as `upstream_connect` and
-  counted against the backend.
+- RUSTSEC-2026-0382, RUSTSEC-2026-0383: rustls-webpki 0.103.16,
+  webpki-root-certs 1.0.10.
+- Access logs renamed or removed by logrotate are reopened within a second.
+- Requests Keel answers itself (ACME, redirects, `default_action`) are
+  logged under their vhost, not as `no_route`.
+- A WebSocket closed by the client was logged as `upstream_connect`.
 
 ## [0.26.0] — 2026-10-19
 
@@ -1232,7 +1223,8 @@ missing features listed under Known Limitations below.
 
 ---
 
-[Unreleased]: https://github.com/allmend/keel/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/allmend/keel/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/allmend/keel/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/allmend/keel/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/allmend/keel/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/allmend/keel/compare/v0.23.0...v0.24.0
