@@ -33,7 +33,7 @@ stdout carries the access log, one JSON object per line; stderr carries Keel's o
 | TCP | `access_tcp_<pool>.log` |
 | UDP | `access_udp_<pool>.log` |
 
-A file is created with its first entry. Each worker opens it once and keeps it open; Keel never reopens or rotates it. With logrotate, use `copytruncate` (files are opened for append).
+A file is created with its first entry. Keel does not rotate files. A file renamed or removed (logrotate's default `create`, or `copytruncate`) is reopened at its path within a second; no signal is needed.
 
 ## HTTP
 
@@ -78,7 +78,7 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 
 | `error` | Meaning |
 |---|---|
-| `no_route` | No vhost or route matched, or Keel answered itself |
+| `no_route` | No vhost or route matched |
 | `no_backend` | No available backend in the pool; Keel answered 503 |
 | `denied` | An access list turned the client away; Keel answered 403 |
 | `header_too_large` | Request line and headers over `keel.max_header_size`; Keel answered 431 |
@@ -89,7 +89,7 @@ A file is created with its first entry. Each worker opens it once and keeps it o
 | `downstream` | The client's connection failed or closed early |
 | `internal` | Any other failure |
 
-Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` and `default_action` — have empty `vhost`, `method` and `uri`, `error` `no_route`, and the status Keel sent.
+Requests Keel answers itself — ACME HTTP-01 challenges, `redirect_http` and `default_action` — are logged under their vhost with the status Keel sent, `backend_addr` `null` and `error` `null`.
 
 ## TCP
 

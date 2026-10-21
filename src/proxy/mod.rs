@@ -78,6 +78,9 @@ pub struct ProxyCtx {
     retried_from: Option<SocketAddr>,
     /// The route's `max_body_size`.
     max_body: Option<usize>,
+    /// Keel answered the request itself: an ACME challenge, a redirect, a
+    /// default action.
+    answered: bool,
 }
 
 // Proxy implementation
@@ -369,6 +372,7 @@ impl ProxyHttp for KProxy {
             refused: None,
             retried_from: None,
             max_body: None,
+            answered: false,
         }
     }
 
@@ -378,6 +382,8 @@ impl ProxyHttp for KProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         let is_tls = session.digest().is_some_and(|d| d.ssl_digest.is_some());
+        // First, so a request Keel answers itself is logged under its vhost.
+        self.bind_route(session, ctx);
 
         // ACME HTTP-01 responder (plain HTTP only — the challenge arrives on
         // port 80). Must come before redirects and default actions, and works
@@ -399,6 +405,7 @@ impl ProxyHttp for KProxy {
                             session
                                 .write_response_body(Some(bytes::Bytes::from(body)), true)
                                 .await?;
+                            ctx.answered = true;
                             return Ok(true);
                         }
                     }
@@ -470,6 +477,7 @@ impl ProxyHttp for KProxy {
                 resp.insert_header("location", location.as_str())?;
                 resp.insert_header("content-length", "0")?;
                 session.write_response_header(Box::new(resp), true).await?;
+                ctx.answered = true;
                 return Ok(true);
             }
             if let Some(status) = action.status {
@@ -481,6 +489,7 @@ impl ProxyHttp for KProxy {
                 session
                     .write_response_body(Some(bytes::Bytes::from(body)), true)
                     .await?;
+                ctx.answered = true;
                 return Ok(true);
             }
         }
@@ -503,6 +512,7 @@ impl ProxyHttp for KProxy {
         resp.insert_header("location", location.as_str())?;
         resp.insert_header("content-length", "0")?;
         session.write_response_header(Box::new(resp), true).await?;
+        ctx.answered = true;
         Ok(true)
     }
 
@@ -808,6 +818,8 @@ impl ProxyHttp for KProxy {
 
         let error_str: Option<String> = if let Some(refused) = ctx.refused {
             Some(refused.into())
+        } else if ctx.answered {
+            None
         } else if ctx.pool.is_empty() {
             Some("no_route".into())
         } else if backend.is_none() {

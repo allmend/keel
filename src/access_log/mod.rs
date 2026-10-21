@@ -2,8 +2,14 @@ use crate::config::AccessLogConfig;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How often an open log file is checked against its path, to notice
+/// rotation.
+const ROTATION_CHECK: Duration = Duration::from_secs(1);
 
 #[derive(Serialize)]
 pub struct AccessLogEntry {
@@ -72,7 +78,14 @@ pub struct UdpLogEntry {
 pub struct AccessLogger {
     enabled: bool,
     dir: String,
-    files: Mutex<HashMap<String, BufWriter<File>>>,
+    files: Mutex<HashMap<String, Open>>,
+}
+
+/// A log file Keel writes, and the inode it was opened as.
+struct Open {
+    file: File,
+    ino: u64,
+    checked: Instant,
 }
 
 impl AccessLogger {
@@ -158,14 +171,26 @@ impl AccessLogger {
         self.write_to(&format!("access_udp_{}.log", sanitize_vhost(&entry.pool)), &line);
     }
 
+    /// Append one line. A file renamed or removed under Keel (logrotate)
+    /// is noticed within a second and reopened at its path; nothing to signal.
     fn write_to(&self, filename: &str, line: &str) {
         // filename is always built from a sanitized vhost — see sanitize_vhost.
+        let path = format!("{}/{}", self.dir, filename);
+        let now = Instant::now();
         let mut files = self.files.lock().unwrap();
+        if let Some(open) = files.get_mut(filename) {
+            if now.duration_since(open.checked) >= ROTATION_CHECK {
+                open.checked = now;
+                if std::fs::metadata(&path).map(|m| m.ino()).ok() != Some(open.ino) {
+                    files.remove(filename);
+                }
+            }
+        }
         if !files.contains_key(filename) {
-            let path = format!("{}/{}", self.dir, filename);
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(f) => {
-                    files.insert(filename.to_owned(), BufWriter::new(f));
+            let opened = OpenOptions::new().create(true).append(true).open(&path);
+            match opened.and_then(|file| Ok(Open { ino: file.metadata()?.ino(), file, checked: now })) {
+                Ok(open) => {
+                    files.insert(filename.to_owned(), open);
                 }
                 Err(e) => {
                     tracing::error!(path = path, error = %e, "failed to open access log file");
@@ -173,9 +198,8 @@ impl AccessLogger {
                 }
             }
         }
-        if let Some(writer) = files.get_mut(filename) {
-            let _ = writeln!(writer, "{line}");
-            let _ = writer.flush();
+        if let Some(open) = files.get_mut(filename) {
+            let _ = writeln!(open.file, "{line}");
         }
     }
 }
@@ -201,7 +225,22 @@ fn sanitize_vhost(vhost: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_vhost;
+    use super::*;
+
+    #[test]
+    fn a_rotated_file_is_reopened_at_its_path() {
+        let dir = std::env::temp_dir().join(format!("keel-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = AccessLogger::new(&AccessLogConfig { enabled: true, dir: dir.display().to_string() });
+        logger.write_to("access_a.log", "one");
+        std::fs::rename(dir.join("access_a.log"), dir.join("access_a.log.1")).unwrap();
+        logger.write_to("access_a.log", "two");
+        std::thread::sleep(ROTATION_CHECK);
+        logger.write_to("access_a.log", "three");
+        assert_eq!(std::fs::read_to_string(dir.join("access_a.log.1")).unwrap(), "one\ntwo\n", "until the check");
+        assert_eq!(std::fs::read_to_string(dir.join("access_a.log")).unwrap(), "three\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rejects_path_traversal() {

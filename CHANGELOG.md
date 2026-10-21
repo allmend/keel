@@ -46,6 +46,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 - rustls-webpki 0.103.16 and webpki-root-certs 1.0.10: distrusted emSign
   intermediates are rejected (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
+- Access logs renamed or removed by logrotate are reopened at their path
+  within a second. Before, Keel kept writing to the renamed file.
+- Requests Keel answers itself (ACME challenges, redirects,
+  `default_action`) are logged under their vhost without an error, not as
+  `no_route` with empty method and URI.
 - A WebSocket the client dropped was logged as `upstream_connect` and
   counted against the backend.
 
