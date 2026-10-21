@@ -155,6 +155,29 @@ fn estimate(cfg: &Config) -> usize {
     64 + routes * 48 + backends * 64 + cfg.pools.len() * 16 + cfg.listeners.len() * 2
 }
 
+/// A re-executed master: map the region the previous binary left, when its
+/// layout fits this one; else a fresh one (counters start over).
+pub fn adopt_region(fd: std::os::fd::RawFd, cfg: &Config) -> anyhow::Result<()> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the previous binary's memfd, open across the exec.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    match Region::adopt(owned) {
+        Ok(region) if region.layout().stripes == layout_for(GENERATION_SLOTS * slot_width(cfg.keel.workers) + 1, estimate(cfg)).stripes => {
+            region.global(G_WORKERS_CONFIGURED).store(cfg.keel.workers as u64, Ordering::Relaxed);
+            REGION.set(region).map_err(|_| anyhow::anyhow!("metrics region created twice"))
+        }
+        _ => {
+            tracing::warn!("master: the previous metrics region does not fit; counters start over");
+            create_region(cfg)
+        }
+    }
+}
+
+/// The memfd behind the region, for keel upgrade.
+pub fn region_fd() -> Option<std::os::fd::RawFd> {
+    region().fd()
+}
+
 /// Master, before forking: map the region every child inherits.
 pub fn create_region(cfg: &Config) -> anyhow::Result<()> {
     // Per generation slot one stripe per worker, and the last one for the
@@ -730,6 +753,7 @@ fn render_globals(out: &mut String, region: &Region) {
          # HELP keel_workers_unresponsive Workers that did not answer the last liveness check\n# TYPE keel_workers_unresponsive gauge\nkeel_workers_unresponsive {}\n\
          # HELP keel_start_time_seconds When the master started, unix time; counters count from here\n# TYPE keel_start_time_seconds gauge\nkeel_start_time_seconds {}\n\
          # HELP keel_metrics_series_dropped_total Series not recorded because the shared memory region was full\n# TYPE keel_metrics_series_dropped_total counter\nkeel_metrics_series_dropped_total {}\n\
+         # HELP keel_build_info The running binary's version\n# TYPE keel_build_info gauge\nkeel_build_info{{version=\"{}\"}} 1\n\
          # HELP keel_workers_draining Workers a newer generation replaced, still finishing their connections\n# TYPE keel_workers_draining gauge\nkeel_workers_draining {}\n\
          # HELP keel_worker_replacements_failed_total New workers for a version that did not start or were not ready in time\n# TYPE keel_worker_replacements_failed_total counter\nkeel_worker_replacements_failed_total {}",
         g(G_RESTARTS_EXIT),
@@ -739,6 +763,7 @@ fn render_globals(out: &mut String, region: &Region) {
         g(G_UNRESPONSIVE),
         g(G_START),
         g(G_DROPPED),
+        env!("CARGO_PKG_VERSION"),
         g(G_DRAINING),
         g(G_REPLACEMENTS_FAILED),
     );

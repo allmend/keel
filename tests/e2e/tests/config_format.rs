@@ -158,7 +158,7 @@ fn a_node_configured_in_hcl_serves_traffic_and_validate_checks_files() -> Result
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("+  backend \"172.29.88.22:80\" {}"), "{out}");
     assert!(out.contains("reload  pool \"web\": backend \"172.29.88.22:80\" added"), "{out}");
-    assert!(out.contains("restart the node file"), "{out}");
+    assert!(out.contains("workers the node file"), "{out}");
     assert!(!out.contains("\x1b["), "no colors when not on a terminal: {out}");
 
     // A host name, though Docker's DNS knows it: refused, and not pushed.

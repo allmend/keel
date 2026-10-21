@@ -25,7 +25,7 @@
 | `cluster status` | `node_id`, `role`, `term`, `leader_id`, `last_committed`, `membership`: `[{id, addr, role}]` |
 | `config push` | `message`, `version` |
 | `config reload`, `cluster demote`, `cluster stepdown`, `cluster remove`, `credentials revoke-all` | `message` |
-| `config validate` | `valid`, `error` when not, `unformatted` (files), `files` with `--full` (`[{path, text}]`), `diff` and `changes` with `--diff` (`[{restart, change}]`) |
+| `config validate` | `valid`, `error` when not, `unformatted` (files), `files` with `--full` (`[{path, text}]`), `diff` and `changes` with `--diff` (`[{new_workers, change}]`) |
 | `credentials create` | `endpoint`, `ca_cert`, `client_cert`, `client_key` |
 
 A backend is `{address, state, health, health_reason, connections}`. `state` is `active`, `draining` or `removed`; `health` is `healthy`, `unhealthy`, `initializing`, `ejected` or `unchecked`; `health_reason` is `null` or why.
@@ -99,6 +99,20 @@ keel backend activate <address>
 
 Returns a drained backend to service in every pool that has it, on every node. `address` as for `drain`. Committed through Raft like a drain. Health checks and passive ejection still apply.
 
+## keel upgrade
+
+Runs the binary on disk in place of the running one, without dropping a connection. `SIGUSR2` to the master does the same.
+
+```
+upgrade started: the master tries the binary on disk, then runs it in place; see the node's log
+```
+
+1. The master runs the new binary's `--version` and `config validate`. If either fails, nothing changes: `master: upgrade refused` in the log.
+2. It stops the control worker (a leader's peers elect another within seconds) and executes the new binary in its own process: same PID, so systemd and container init see no change. Listening sockets, the metrics region and the workers carry over; counters continue.
+3. The new binary starts a control worker and new workers. Once they have the node's state, the old workers drain as on a reload: open requests, WebSockets, TCP connections and UDP flows finish or move over, at most `keel.drain_timeout`.
+
+`keel_build_info{version}` shows the running version. Install the new binary the way packages do, by writing a new file and renaming it over the old one; a running binary cannot be written in place. A node file that changes `keel.user`, `keel.group`, `keel.control_user` or a path applies with the upgrade.
+
 ## keel config reload
 
 Pushes this node's config directory as the next version, as `SIGHUP` does.
@@ -107,7 +121,7 @@ Pushes this node's config directory as the next version, as `SIGHUP` does.
 config version 43 committed; every node applies it
 ```
 
-A directory that does not load is refused with the reason. See [Hot reload](configuration.md#hot-reload) for what applies without a restart.
+A directory that does not load is refused with the reason. See [Hot reload](configuration.md#hot-reload) for how each change applies.
 
 ## keel config push
 
@@ -142,7 +156,7 @@ Silent by default: exit 0 when the files can go live, 1 when they cannot, with t
 | Flag | |
 |---|---|
 | `--full` | Print every file that is loaded, in load order, each under `# file <path>` |
-| `--diff` | Diff against the version the running node serves, then each change marked `reload` (applies on reload) or `restart` (waits for a restart) |
+| `--diff` | Diff against the version the running node serves, then each change marked `reload` (applies in place) or `workers` (applies by new workers); both on reload, without dropping connections |
 | `--list` | List files not in canonical format |
 | `--write` | Rewrite them in canonical format, with units on bare durations |
 | `--check` | Exit 3 when a file is not in canonical format |

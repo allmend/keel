@@ -138,6 +138,7 @@ Flow expiry is not an error.
 |---|---|---|---|
 | `keel_workers` | gauge | | Worker processes running |
 | `keel_workers_configured` | gauge | | `keel.workers` |
+| `keel_build_info` | gauge | `version` | `1`, labelled with the running binary's version |
 | `keel_workers_draining` | gauge | | Workers a newer generation replaced, still finishing their connections |
 | `keel_worker_replacements_failed_total` | counter | | New workers for a version that did not start or were not ready in time; the old ones kept serving |
 | `keel_workers_unresponsive` | gauge | | Workers that did not answer the control worker's last liveness check (every 5s, 5s timeout) |

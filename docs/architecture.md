@@ -74,7 +74,9 @@ The processes talk over Unix sockets:
 
 ```
  master ---- socketpair ----> control worker      "SIGHUP arrived",
-                              (one way)           "worker N was restarted"
+                                                  "worker N (pid P) started"
+ master <--- socketpair ----- control worker      "replace", "node", "upgrade":
+                                                  fixed words, no data
 
  control worker ---- workers/worker-<N>.sock ---> worker N
                      applied config, ACME certificates, drains,
@@ -148,7 +150,8 @@ version.
 ```
 
 A worker started later, after a crash say, gets the applied version from
-the control worker. Some settings take a restart; see
+the control worker. What workers cannot change in place applies by new
+workers, and a new binary by `keel upgrade`; see
 [Configuration](configuration.md#hot-reload).
 
 ---

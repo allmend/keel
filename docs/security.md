@@ -80,11 +80,11 @@ Every control connection's request line is capped (64 MiB, enough for a config p
 
 ## Processes and what each can read
 
-No code in the root master accepts a connection or reads from one. It binds the sockets, forks, supervises, and writes two messages to the control worker over a socketpair: `SIGHUP` arrived, and worker N was restarted.
+No code in the root master accepts a connection. It binds the sockets, forks, supervises, and writes two messages to the control worker over a socketpair: `SIGHUP` arrived, and worker N was started. From its children it takes no data. The control worker can send three fixed words on the socketpair (`replace`, `node`, `upgrade`); anything else is dropped unread. On `replace` the master reads the version the control worker left in the state directory and validates it like any config; on `node` it reads `node.hcl`; on `upgrade` it runs the binary on disk. A new worker is ready when a marker file named after its PID exists; the master never reads the file.
 
 | Process | User | Parses network input | Reads |
 |---|---|---|---|
-| master | root | no | `node.hcl`, the config directory |
+| master | root | no | `node.hcl`, the config directory, a version the control worker hands over for new workers |
 | control worker | `keel.control_user` (default `keel-control`) | control socket, `control.remote`, Raft peers | the state directory: node key, Raft store with the cluster and control CA keys, ACME account and certificates |
 | workers | `keel.user` | proxy listeners | nothing under the state directory |
 

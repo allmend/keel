@@ -66,6 +66,9 @@ enum Output {
 enum Command {
     /// Show node status
     Status,
+    /// Run the binary on disk in place of the running one, without dropping
+    /// a connection
+    Upgrade,
 
     /// Cluster management commands
     Cluster {
@@ -237,6 +240,7 @@ fn run_cli(cmd: &Command, cli: &Cli) -> Result<()> {
     let mut stream = connect_socket(&cli.socket)?;
     match cmd {
         Command::Status => client::status(&mut stream, json),
+        Command::Upgrade => client::message(&mut stream, &ControlRequest::Upgrade, json),
         Command::Backend { command } => match command {
             BackendCommand::List { pool } => client::backend_list(&mut stream, pool, json),
             BackendCommand::Drain { address, wait } => {

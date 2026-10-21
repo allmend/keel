@@ -145,7 +145,7 @@ On `SIGTERM`, `SIGINT`, or `SIGQUIT`, Keel stops accepting new connections, lets
 
 `udp_flow_timeout` is the idle time after which a UDP flow (one client `ip:port` on a `udp` listener) expires and releases its backend. `udp_max_flows` caps how many flows each UDP listener holds at once — each costs an upstream socket and a task, and the worker's HTTP and TCP listeners share its descriptors, so a worker's ceiling is this value times the number of `udp` listeners; it must be at least 1. See [UDP proxying](udp-proxying.md).
 
-Every setting in the `keel` block requires a process restart. See [Hot reload](#hot-reload) for what reloads live.
+The `keel` block applies on reload by new workers, the node file's part too; users and paths take [`keel upgrade`](cli.md#keel-upgrade). See [Hot reload](#hot-reload).
 
 ---
 
@@ -217,7 +217,7 @@ For UDP, the master binds one socket per worker in an `SO_REUSEPORT` group and h
 
 Each worker hands its inherited TCP sockets to Pingora over `workers/upgrade-<index>.sock` beside the control socket. Pingora checks for them once a second and logs `No incoming socket transfer, sleep 1s and try again` once per worker meanwhile; `handed inherited listeners to pingora` follows. Workers serve about one second after the fork.
 
-Changing listeners, their addresses or ports included, requires a restart.
+Changing listeners, their addresses or ports included, applies on reload by new workers; see [Hot reload](#hot-reload).
 
 ---
 
@@ -546,7 +546,7 @@ keel config validate --diff                # what changed since the running node
 | Flag | |
 |---|---|
 | `--full` | Every file that is loaded, in load order, each under `# file <path>`; like `nginx -T` |
-| `--diff` | A diff against the version the running node serves, then each change marked `reload` or `restart`, by the rules in [Hot reload](#hot-reload) |
+| `--diff` | A diff against the version the running node serves, then each change marked `reload` (in place) or `workers` (by new workers), by the rules in [Hot reload](#hot-reload) |
 | `--list` | Files not in canonical format |
 | `--write` | Rewrite them in canonical format, with the unit added to a bare number given to a duration (`ttl = 30` becomes `ttl = "30s"`) |
 | `--check` | Exit 3 when a file is not in canonical format |
@@ -560,7 +560,7 @@ $ keel config validate --diff
    backend "10.0.0.1:8080" {}
 +  backend "10.0.0.2:8080" {}
  }
-restart pool "web": backend "10.0.0.2:8080" added
+reload  pool "web": backend "10.0.0.2:8080" added
 ```
 
 The canonical format is the reference formatter's (`terraform fmt`, `tofu fmt`): two-space indentation, one space around `=`, the `=` of consecutive attributes aligned, trailing comments aligned. Only whitespace changes. Formatting never affects the exit status, except with `--check`. Keel does not format on its own.
@@ -573,7 +573,7 @@ Output is colored on a terminal; `--no-color` or `NO_COLOR` turns it off.
 
 `SIGHUP` to the master or `keel config reload` pushes the node's config directory as the next version, one node or many; see [In a cluster](#in-a-cluster). A directory that does not load is refused and nothing changes. Every node's control worker applies the version and hands it to its workers without dropping connections. A worker started later gets the applied version from the control worker. The master also reads the node file again; see below.
 
-What reloads without restart, open connections untouched:
+What applies in place, open connections untouched:
 - Virtual host rules: hosts, routes, `forwarded_headers`, cache rules, `redirect_http`, `default_action`, access lists, body limits
 - Pools: added and removed, backends added and removed, weights, algorithms, `health_check`, `passive`, timeouts and `retry`. A removed backend or pool drains: no new connections, open ones finish. A backend that stays keeps its connections, drain, health and ejection. A new backend in a checked pool gets traffic after its first probe; a changed check keeps the verdicts and counts its thresholds afresh
 - TLS certificates: certificate files of vhosts and `certificate` blocks are re-read with every applied version
@@ -584,7 +584,7 @@ What starts new workers, also without dropping a connection: listeners, `cache` 
 The node file applies on the same reload, on this node:
 - `keel.workers`: new workers, as above.
 - `metrics`, `control` and `cluster`: a new control worker, with new listeners where an address changed. Traffic is not touched.
-- `keel.user`, `keel.group`, `keel.control_user`, `keel.control_socket`, `keel.state_dir` and `keel.config_dir` need a new master: a node file changing any of them is refused as a whole and logged; they take a restart.
+- `keel.user`, `keel.group`, `keel.control_user`, `keel.control_socket`, `keel.state_dir` and `keel.config_dir` need a new master: a node file changing any of them is refused as a whole on reload and logged; [`keel upgrade`](cli.md#keel-upgrade) applies them without dropping connections.
 
 Backends are matched on IP and port: `[2001:db8::1]:80` and `[2001:db8:0::1]:80` are the same backend.
 

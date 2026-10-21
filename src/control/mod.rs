@@ -242,6 +242,14 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             }
         }
 
+        ControlRequest::Upgrade => {
+            crate::control::control_worker::nudge_master(crate::control::control_worker::UPGRADE_NUDGE);
+            let resp = ControlResponse::ok(serde_json::json!({
+                "message": "upgrade started: the master tries the binary on disk, then runs it in place; see the node's log"
+            }));
+            write_line(&mut writer, &resp).await?;
+        }
+
         ControlRequest::ConfigReload => {
             // The node file is the master's to read; tell it to, as SIGHUP does.
             crate::control::control_worker::nudge_master(crate::control::control_worker::NODE_NUDGE);

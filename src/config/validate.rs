@@ -126,11 +126,11 @@ pub fn run(opts: &Options) -> Result<i32> {
                     Ok(old) => {
                         let changes = changes(&old, &cfg, applied_node != node_file);
                         if opts.json {
-                            let changes = changes.iter().map(|(restart, what)| serde_json::json!({ "restart": restart, "change": what }));
+                            let changes = changes.iter().map(|(workers, what)| serde_json::json!({ "new_workers": workers, "change": what }));
                             report.insert("changes".into(), changes.collect());
                         }
-                        for (restart, what) in changes.iter().filter(|_| !opts.json) {
-                            let tag = if *restart { out.yellow("restart") } else { out.green("reload ") };
+                        for (workers, what) in changes.iter().filter(|_| !opts.json) {
+                            let tag = if *workers { out.yellow("workers") } else { out.green("reload ") };
                             println!("{tag} {what}");
                         }
                     }
@@ -169,15 +169,15 @@ fn print_file(out: &Paint, path: &str, text: &str) {
 }
 
 /// How the files differ from the applied version, each change marked as
-/// applied on reload (`false`) or waiting for a restart (`true`).
+/// applied in place on reload (`false`) or by new workers (`true`).
 /// A change from `old` to `new` the workers cannot apply in place.
 pub fn needs_new_workers(old: &Config, new: &Config) -> bool {
-    changes(old, new, false).iter().any(|(restart, _)| *restart)
+    changes(old, new, false).iter().any(|(workers, _)| *workers)
 }
 
 pub fn changes(old: &Config, new: &Config, node_file_changed: bool) -> Vec<(bool, String)> {
     let mut out = Vec::new();
-    let mut note = |restart: bool, what: String| out.push((restart, what));
+    let mut note = |workers: bool, what: String| out.push((workers, what));
     if node_file_changed {
         note(true, "the node file".into());
     }
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn changes_are_marked_reload_or_restart() {
+    fn changes_are_marked_live_or_new_workers() {
         let old = cfg("listener \"http\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n}\npool \"web\" {\n  backend \"10.0.0.1:80\" {}\n  backend \"10.0.0.2:80\" {}\n}\nvhost \"*\" {\n  pool = \"web\"\n}\n");
         let new = cfg("listener \"http\" {\n  protocol  = \"http\"\n  addresses = [\"0.0.0.0\"]\n  port      = 80\n}\nlistener \"https\" {\n  protocol  = \"https\"\n  addresses = [\"0.0.0.0\"]\n  port      = 443\n}\npool \"web\" {\n  algorithm = \"random\"\n  backend \"10.0.0.1:80\" { weight = 2 }\n  backend \"10.0.0.3:80\" {}\n}\npool \"api\" {\n  backend \"10.0.0.9:80\" {}\n}\nvhost \"*\" {\n  pool = \"api\"\n}\n");
         let got = changes(&old, &new, false);

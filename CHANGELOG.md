@@ -8,6 +8,13 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `keel upgrade` / `keelctl upgrade` / `SIGUSR2`: the binary on disk runs in
+  place, same PID, without dropping a connection. Tried first; a binary
+  that does not run with the config is refused. Counters continue.
+  `keel_build_info{version}`.
+
 ### Changed
 
 - Listeners, `cache`, `access_log` and the `keel` block of the config

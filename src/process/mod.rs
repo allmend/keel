@@ -11,6 +11,8 @@
 //! └ worker N
 //! ```
 
+mod upgrade;
+
 use crate::config::Config;
 use crate::control::control_worker::{self, MasterMessage};
 use crate::proxy;
@@ -82,6 +84,20 @@ pub struct BoundListeners {
 }
 
 impl BoundListeners {
+    /// The sockets a previous binary of this master bound, still open.
+    fn adopt(h: &upgrade::Handover) -> BoundListeners {
+        use std::os::fd::FromRawFd;
+        // SAFETY: descriptors this process held before its exec, open across it.
+        unsafe {
+            BoundListeners {
+                tcp: h.tcp.iter().map(|(a, fd)| (a.clone(), std::net::TcpListener::from_raw_fd(*fd))).collect(),
+                udp: h.udp.iter().map(|(a, fds)| (a.clone(), fds.iter().map(|fd| std::net::UdpSocket::from_raw_fd(*fd)).collect())).collect(),
+                icmp4: h.icmp4.map(|fd| std::net::UdpSocket::from_raw_fd(fd)),
+                icmp6: h.icmp6.map(|fd| std::net::UdpSocket::from_raw_fd(fd)),
+            }
+        }
+    }
+
     /// The subset a given worker uses. The struct itself stays alive in the
     /// child (it never returns), so the raw TCP fds remain valid.
     fn for_worker(&self, index: usize, cfg: &Config) -> Result<proxy::WorkerSockets> {
@@ -371,6 +387,19 @@ fn file_id(path: &str) -> Option<(u64, u64)> {
 }
 
 impl ControlListeners {
+    fn adopt(h: &upgrade::Handover) -> ControlListeners {
+        use std::os::fd::FromRawFd;
+        // SAFETY: descriptors this process held before its exec, open across it.
+        unsafe {
+            ControlListeners {
+                socket: std::os::unix::net::UnixListener::from_raw_fd(h.control_socket),
+                socket_file: h.control_socket_file,
+                remote: h.control_remote.map(|fd| std::net::TcpListener::from_raw_fd(fd)),
+                metrics: std::net::TcpListener::from_raw_fd(h.metrics),
+            }
+        }
+    }
+
     /// The listeners `next` asks for: an unchanged address keeps its socket,
     /// a changed one is bound anew. The control socket path cannot change.
     fn rebind(&self, cfg: &Config, next: &Config) -> Result<ControlListeners> {
@@ -440,6 +469,12 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 /// `keel config reload` reached the control worker: read node.hcl again.
 static NODE: AtomicBool = AtomicBool::new(false);
+/// SIGUSR2 or `keel upgrade`: execute the binary on disk in place.
+static UPGRADE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_upgrade(_: libc::c_int) {
+    UPGRADE.store(true, Ordering::SeqCst);
+}
 
 extern "C" fn handle_shutdown(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -476,13 +511,38 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     // SO_REUSEPORT (proxy::listen). Not root does not matter: without the
     // shared socket all workers but one would wait for a port that never
     // frees.
-    let bound = if cfg!(target_os = "linux") {
-        Some(bind_listeners(&cfg, cfg.keel.workers, accounts.is_some(), None)?)
-    } else {
-        None
+    // Where the binary is now: an upgrade executes what is there then.
+    let exe = std::env::current_exe().context("master: cannot find its own binary")?;
+    // After keel upgrade the sockets, the metrics region and the workers are
+    // the previous image's, still open and running.
+    let handover = upgrade::take();
+    let bound = match &handover {
+        Some(h) if cfg!(target_os = "linux") => Some(BoundListeners::adopt(h)),
+        _ if cfg!(target_os = "linux") => Some(bind_listeners(&cfg, cfg.keel.workers, accounts.is_some(), None)?),
+        _ => None,
     };
-    let mut control_listeners = bind_control(&cfg, accounts.as_ref())?;
-    crate::metrics::create_region(&cfg)?;
+    let mut control_listeners = match &handover {
+        Some(h) => ControlListeners::adopt(h),
+        None => bind_control(&cfg, accounts.as_ref())?,
+    };
+    match handover.as_ref().and_then(|h| h.region) {
+        Some(fd) => crate::metrics::adopt_region(fd, &cfg)?,
+        None => crate::metrics::create_region(&cfg)?,
+    }
+    // The previous image's workers: they drain once ours are ready.
+    let mut inherited: Vec<Generation> = handover
+        .iter()
+        .flat_map(|h| &h.generations)
+        .map(|h| {
+            let mut g = Generation::new(h.slot, cfg.for_workers());
+            g.workers = h.workers.iter().map(|(pid, index)| (Pid::from_raw(*pid), *index, Instant::now())).collect();
+            g.closing = h.draining;
+            g
+        })
+        .collect();
+    if handover.is_some() {
+        info!(generations = inherited.len(), "master: upgraded; taking over from the previous binary");
+    }
 
     let mut control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
     let mut control_backoff = Backoff::default();
@@ -490,7 +550,10 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
 
     let root = accounts.is_some();
     let mut bound = bound;
-    let mut current = Generation::new(0, cfg.for_workers());
+    let slot = (0..crate::metrics::GENERATION_SLOTS).find(|s| !inherited.iter().any(|g| g.slot == *s)).unwrap_or(0);
+    let mut current = Generation::new(slot, cfg.for_workers());
+    // Workers of the previous binary's current generation hand their UDP flows on.
+    let predecessors: Vec<usize> = inherited.iter().find(|g| !g.closing).map(|g| g.workers.iter().map(|(_, i, _)| *i).collect()).unwrap_or_default();
     info!(workers = current.cfg.keel.workers, "master: spawning workers");
     // Worker indexes waiting for their restart, and when it is due. Only the
     // current generation's workers come back; each index backs off on its own.
@@ -498,9 +561,14 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     let mut due: Vec<(usize, Instant)> = Vec::new();
     for i in 0..current.cfg.keel.workers {
         let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
-        let pid = spawn_worker(&current.cfg, i, current.stripe(i), false, bound.as_ref(), accounts.as_ref(), &private)?;
+        let pid = spawn_worker(&current.cfg, i, current.stripe(i), predecessors.contains(&i), bound.as_ref(), accounts.as_ref(), &private)?;
         info!(pid = pid.as_raw(), index = i, "master: worker started");
         current.workers.push((pid, i, Instant::now()));
+        // After an upgrade the previous workers still answer on these
+        // sockets: the control worker hands the state to this pid.
+        if let (Some(c), false) = (&control, inherited.is_empty()) {
+            control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index: i, pid: Some(pid.as_raw() as u32) });
+        }
     }
     crate::metrics::set_workers(current.workers.len());
     // A generation being started for a new version, with its sockets, and
@@ -516,6 +584,56 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
 
     loop {
         std::thread::sleep(TICK);
+
+        // After an upgrade: the previous binary's workers drain once ours
+        // have the node's state.
+        if !inherited.is_empty() && current.ready(&cfg.keel.control_socket) {
+            for mut g in inherited.drain(..) {
+                if !g.closing {
+                    g.stop(Signal::SIGUSR1);
+                }
+                g.closing = false;
+                draining.push(g);
+            }
+            info!("master: upgrade complete; the previous binary's workers drain");
+            crate::metrics::set_draining(draining.iter().map(|g| g.workers.len()).sum());
+        }
+
+        if UPGRADE.swap(false, Ordering::SeqCst) {
+            if pending.is_some() || !inherited.is_empty() {
+                warn!("master: upgrade asked while new workers are starting; ask again when they are ready");
+            } else if let Err(e) = upgrade::preflight(&exe, &cfg.path) {
+                error!(error = %format!("{e:#}"), "master: upgrade refused; the new binary does not run with this config");
+            } else {
+                info!(binary = %exe.display(), "master: upgrading; stopping the control worker first");
+                if let Some(c) = control.take() {
+                    stop_and_reap(c.pid, Duration::from_secs(15));
+                }
+                let handover = upgrade::Handover {
+                    tcp: bound.iter().flat_map(|b| b.tcp.iter().map(|(a, l)| (a.clone(), l.as_raw_fd()))).collect(),
+                    udp: bound.iter().flat_map(|b| b.udp.iter().map(|(a, s)| (a.clone(), s.iter().map(AsRawFd::as_raw_fd).collect()))).collect(),
+                    icmp4: bound.as_ref().and_then(|b| b.icmp4.as_ref().map(AsRawFd::as_raw_fd)),
+                    icmp6: bound.as_ref().and_then(|b| b.icmp6.as_ref().map(AsRawFd::as_raw_fd)),
+                    control_socket: control_listeners.socket.as_raw_fd(),
+                    control_socket_file: control_listeners.socket_file,
+                    control_remote: control_listeners.remote.as_ref().map(AsRawFd::as_raw_fd),
+                    metrics: control_listeners.metrics.as_raw_fd(),
+                    region: crate::metrics::region_fd(),
+                    generations: std::iter::once(&current)
+                        .map(|g| (g, false))
+                        .chain(draining.iter().map(|g| (g, true)))
+                        .map(|(g, draining)| upgrade::Handed {
+                            slot: g.slot,
+                            draining,
+                            workers: g.workers.iter().map(|(p, i, _)| (p.as_raw(), *i)).collect(),
+                        })
+                        .collect(),
+                };
+                let e = upgrade::exec(&exe, &handover);
+                error!(error = %format!("{e:#}"), "master: upgrade failed; carrying on with this binary");
+                control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
+            }
+        }
 
         if SHUTDOWN.load(Ordering::SeqCst) {
             info!("master: shutdown signal received, stopping");
@@ -625,6 +743,11 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
                 control_due = Some(Instant::now() + delay);
                 continue;
             }
+            if let Some(g) = inherited.iter_mut().find(|g| g.has(dead)) {
+                g.remove(dead);
+                inherited.retain(|g| !g.workers.is_empty());
+                continue;
+            }
             if let Some(g) = draining.iter_mut().find(|g| g.has(dead)) {
                 let index = g.remove(dead);
                 crate::metrics::clear_stripe(g.stripe(index));
@@ -701,6 +824,20 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             control = Some(spawn_control(&cfg, &control_listeners, bound.as_ref(), accounts.as_ref(), force_new_cluster)?);
         }
     }
+}
+
+/// Stop a child and wait for it, killing it after `wait`.
+fn stop_and_reap(pid: Pid, wait: Duration) {
+    let _ = signal::kill(pid, Signal::SIGTERM);
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if !matches!(waitpid(pid, Some(WaitPidFlag::WNOHANG)), Ok(WaitStatus::StillAlive)) {
+            return;
+        }
+        std::thread::sleep(TICK);
+    }
+    let _ = signal::kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
 }
 
 /// Generations draining at once; a further one closes the oldest's
@@ -838,6 +975,9 @@ fn read_nudge(link: &std::os::unix::net::UnixStream, buf: &mut Vec<u8>) -> bool 
             nudged |= buf[..=end] == *control_worker::REPLACE_NUDGE;
             if buf[..=end] == *control_worker::NODE_NUDGE {
                 NODE.store(true, Ordering::SeqCst);
+            }
+            if buf[..=end] == *control_worker::UPGRADE_NUDGE {
+                UPGRADE.store(true, Ordering::SeqCst);
             }
             buf.drain(..=end);
         }
@@ -994,6 +1134,7 @@ fn install_signal_handlers() -> Result<()> {
         signal::sigaction(Signal::SIGINT, &shutdown)?;
         signal::sigaction(Signal::SIGQUIT, &shutdown)?;
         signal::sigaction(Signal::SIGHUP, &sighup)?;
+        signal::sigaction(Signal::SIGUSR2, &SigAction::new(SigHandler::Handler(handle_upgrade), SaFlags::SA_RESTART, SigSet::empty()))?;
         // A write to a control worker that just died must not kill the master.
         signal::sigaction(Signal::SIGPIPE, &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()))?;
     }

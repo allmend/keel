@@ -124,7 +124,7 @@ vhost "example.com" {
 
 ```bash
 keel config validate          # exit 0: the files can go live
-keel config validate --diff   # what changes, and whether it needs a restart
+keel config validate --diff   # what changes, and whether it takes new workers
 ```
 
 See [Configuration](docs/configuration.md).

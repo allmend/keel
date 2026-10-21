@@ -332,6 +332,8 @@ struct ApplyDriver {
 /// start new workers with it. Node: read node.hcl again, as on SIGHUP.
 pub const REPLACE_NUDGE: &[u8] = b"replace\n";
 pub const NODE_NUDGE: &[u8] = b"node\n";
+/// Upgrade: execute the binary on disk in place (keel upgrade).
+pub const UPGRADE_NUDGE: &[u8] = b"upgrade\n";
 
 /// Our end of the master link, for the nudges.
 static MASTER: std::sync::OnceLock<std::os::unix::net::UnixStream> = std::sync::OnceLock::new();

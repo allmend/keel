@@ -1,10 +1,13 @@
 //! One shared-memory region per master, written by the workers and read by
 //! the control worker, the way nginx keeps its shared zones.
 //!
-//! The master maps it (`MAP_SHARED | MAP_ANONYMOUS`) before forking anything,
-//! so every child inherits the same pages and the region lives exactly as
-//! long as the master: no file, nothing to clean up, and a master restart
-//! starts from zero. The master never reads it.
+//! The master maps it before forking anything, so every child inherits the
+//! same pages, and the region lives exactly as long as the master process:
+//! no file in the file system, nothing to clean up, and a master restart
+//! starts from zero. On Linux it is a memfd, so a master that re-executes
+//! itself (keel upgrade) maps the same region again and counters carry on;
+//! the header records the layout it was made with. The master never reads
+//! the series.
 //!
 //! ```text
 //! header   globals: one u64 counter each, written by whoever owns them
@@ -31,6 +34,9 @@ const HEADER: usize = 4096;
 pub const GLOBALS: usize = 256;
 const NEXT_CELL: usize = 0;
 const NEXT_ARENA: usize = 1;
+/// The layout, in header words, for a re-executed master to map it again.
+const MAGIC_AT: usize = 2;
+const MAGIC: u64 = u64::from_be_bytes(*b"keelshm1");
 /// Offset of the globals in the header, in u64 words.
 const GLOBALS_AT: usize = 8;
 
@@ -85,6 +91,8 @@ pub struct Series<'a> {
 pub struct Region {
     base: NonNull<u8>,
     layout: Layout,
+    /// The memfd behind the mapping, where there is one.
+    fd: Option<std::os::fd::OwnedFd>,
 }
 
 // SAFETY: the region is only ever accessed through atomics, except record
@@ -98,21 +106,33 @@ impl Region {
     pub fn create(layout: Layout) -> io::Result<Region> {
         assert!(layout.slots.is_power_of_two() && layout.stripes > 0);
         assert!(layout.cells <= u32::MAX as usize && layout.arena < u32::MAX as usize);
-        #[allow(unused_mut)]
-        let mut flags = libc::MAP_SHARED | libc::MAP_ANON;
-        #[cfg(target_os = "linux")]
-        {
-            flags |= libc::MAP_NORESERVE;
+        let fd = memfd(layout.len())?;
+        let region = map(layout, fd)?;
+        let words = [MAGIC, layout.stripes as u64, layout.cells as u64, layout.slots as u64, layout.arena as u64];
+        for (i, w) in words.into_iter().enumerate() {
+            region.word(MAGIC_AT + i).store(w, Ordering::Relaxed);
         }
-        // SAFETY: a fresh anonymous mapping, not aliasing anything.
-        let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), layout.len(), libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+        Ok(region)
+    }
+
+    /// Map the region behind `fd` again, as a re-executed master does. The
+    /// layout is the one the header records.
+    pub fn adopt(fd: std::os::fd::OwnedFd) -> io::Result<Region> {
+        use std::os::fd::AsRawFd;
+        let mut head = [0u64; 5];
+        // SAFETY: reading the header words into a local buffer.
+        let read = unsafe { libc::pread(fd.as_raw_fd(), head.as_mut_ptr().cast(), 40, (MAGIC_AT * 8) as libc::off_t) };
+        if read != 40 || head[0] != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a keel metrics region"));
         }
-        let base = NonNull::new(ptr.cast()).ok_or_else(io::Error::last_os_error)?;
-        Ok(Region { base, layout })
+        let layout = Layout { stripes: head[1] as usize, cells: head[2] as usize, slots: head[3] as usize, arena: head[4] as usize };
+        map(layout, Some(fd))
+    }
+
+    /// The memfd behind the region, to pass on to a re-executed master.
+    pub fn fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        self.fd.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     pub fn layout(&self) -> Layout {
@@ -226,6 +246,52 @@ fn wait_published(slot: &AtomicU32) -> u32 {
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// A memfd of `len` bytes on Linux; elsewhere none (an anonymous mapping).
+fn memfd(len: usize) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a static name; the fd is owned from here on.
+        let fd = unsafe { libc::memfd_create(c"keel-metrics".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        // SAFETY: sizing the file we own.
+        if unsafe { libc::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&fd), len as libc::off_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(fd))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = len;
+        Ok(None)
+    }
+}
+
+/// Map `layout` shared: over `fd` when given, else anonymous.
+fn map(layout: Layout, fd: Option<std::os::fd::OwnedFd>) -> io::Result<Region> {
+    use std::os::fd::AsRawFd;
+    #[allow(unused_mut)]
+    let mut flags = libc::MAP_SHARED;
+    if fd.is_none() {
+        flags |= libc::MAP_ANON;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        flags |= libc::MAP_NORESERVE;
+    }
+    let raw = fd.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+    // SAFETY: a fresh shared mapping of our own fd, or anonymous.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), layout.len(), libc::PROT_READ | libc::PROT_WRITE, flags, raw, 0) };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let base = NonNull::new(ptr.cast()).ok_or_else(io::Error::last_os_error)?;
+    Ok(Region { base, layout, fd })
 }
 
 impl Drop for Region {

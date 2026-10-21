@@ -44,6 +44,9 @@ enum Output {
 enum Command {
     /// Show node status
     Status,
+    /// Run the binary on disk in place of the running one, without dropping
+    /// a connection
+    Upgrade,
     /// Backend pool management
     Backend {
         #[command(subcommand)]
@@ -127,6 +130,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Command::Status => client::status(&mut stream, json),
+        Command::Upgrade => client::message(&mut stream, &ControlRequest::Upgrade, json),
         Command::Backend { command } => match command {
             BackendCommand::List { pool } => client::backend_list(&mut stream, pool, json),
             BackendCommand::Drain { address, wait } => {

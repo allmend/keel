@@ -47,6 +47,7 @@ keelctl config reload
 keelctl config push ./config
 keelctl cluster status
 keelctl cluster stepdown
+keelctl upgrade
 keelctl -o json status
 ```
 
