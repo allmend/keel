@@ -103,6 +103,7 @@ Every datagram of a flow reaches the flow's backend. Across flows, `consistent_h
 - No available backend: the datagram is dropped. Drops are logged once a second per listener and reason (`no_backend`, `flow_limit`), however many datagrams a flood sends.
 - Shutdown ends every flow as `shutdown`.
 - Each flow holds its own upstream socket and local port. The ephemeral port range and the descriptor limit bound the flows to one backend; running out shows as `upstream_bind`.
+- When new workers replace the current ones (see [Hot reload](configuration.md#hot-reload)), every flow moves to the new worker of the same index with its upstream socket: same backend, same source address toward it.
 - On Linux the master binds one `SO_REUSEPORT` socket per worker; the kernel sends each client `ip:port` to one socket, so a flow stays on one worker. A replacement worker takes over its predecessor's socket. Elsewhere each worker binds its own.
 - Datagrams up to 65,535 bytes are forwarded whole.
 - Packet and byte counters update per datagram. One log entry per flow in `access_udp_<pool>.log`; see [Access logging](access-logging.md#udp). Metrics: `keel_udp_*`, see [Metrics](metrics.md#udp-l4-metrics).

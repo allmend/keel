@@ -390,6 +390,14 @@ impl PoolRegistry {
         readmitted
     }
 
+    /// One more connection to a backend chosen elsewhere: a UDP flow a
+    /// replaced worker handed over.
+    pub fn acquire(&self, pool_name: &str, addr: SocketAddr) {
+        if let Some(entry) = self.backend(pool_name, addr) {
+            entry.acquire();
+        }
+    }
+
     /// Decrement the connection counter for `addr` in `pool_name`.
     /// If the backend is draining and this was the last connection, marks it removed.
     pub fn release(&self, pool_name: &str, addr: SocketAddr) {

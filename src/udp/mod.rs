@@ -20,10 +20,13 @@
 //! metrics (`keel_udp_*`) and access logs (`access_udp_<pool>.log`, one entry
 //! per flow).
 
+pub mod handover;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -32,7 +35,7 @@ use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::net::UdpSocket;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::access_log::{AccessLogger, UdpLogEntry};
 use crate::backend::PoolRegistry;
@@ -66,7 +69,16 @@ pub struct UdpProxyService {
     pub proxy_protocol: bool,
     /// The applied routing table, for this listener's access list.
     pub routing: Arc<arc_swap::ArcSwap<crate::vhost::RoutingTable>>,
+    /// Where this worker's flows go when a newer generation replaces it,
+    /// and where it takes them from when it replaced one.
+    pub handover: PathBuf,
+    /// Bound when this worker replaces one: wait for its flows first.
+    pub predecessor: std::sync::Mutex<Option<std::os::unix::net::UnixListener>>,
 }
+
+/// How long a new worker waits for its predecessor's flows; it only waits
+/// when there is one.
+const HANDOVER_WAIT: Duration = Duration::from_secs(90);
 
 /// Per-flow accounting, shared between the receive loop (client → backend)
 /// and the flow's reply task (backend → client). Lock-free so neither path
@@ -167,6 +179,7 @@ impl Drops {
 /// aborted) when the flow ends.
 struct Flow {
     _open: crate::drain::Open,
+    reply_to: SocketAddr,
     backend: SocketAddr,
     upstream: Arc<UdpSocket>,
     stats: Arc<FlowStats>,
@@ -216,6 +229,12 @@ impl UdpProxyService {
         // A selected backend is always in the registry.
         let counters = *self.pools.backend(&self.pool, backend).ok_or(None)?.series().udp();
         counters.flow();
+        debug!(pool = self.pool, client = %client, backend = %backend, "udp: flow opened");
+        Ok(self.flow(downstream, reply_to, backend, upstream, counters, now))
+    }
+
+    /// A flow over `upstream`, its reply task started.
+    fn flow(&self, downstream: &Arc<UdpSocket>, reply_to: SocketAddr, backend: SocketAddr, upstream: Arc<UdpSocket>, counters: UdpSeries, now: Instant) -> Flow {
         let stats = Arc::new(FlowStats::new(now));
         let reply_task = tokio::spawn(reply_loop(
             Arc::clone(&upstream),
@@ -227,8 +246,62 @@ impl UdpProxyService {
             backend,
             Arc::clone(&self.pools),
         ));
-        debug!(pool = self.pool, client = %client, backend = %backend, "udp: flow opened");
-        Ok(Flow { _open: crate::drain::Open::new(), backend, upstream, stats, counters, reply_task })
+        Flow { _open: crate::drain::Open::new(), reply_to, backend, upstream, stats, counters, reply_task }
+    }
+
+    /// The flows of the worker this one replaced, on their own sockets.
+    async fn adopt(&self, downstream: &Arc<UdpSocket>, flows: &mut HashMap<SocketAddr, Flow>) {
+        let Some(listener) = self.predecessor.lock().unwrap().take() else { return };
+        let received = tokio::task::spawn_blocking(move || handover::receive(&listener, HANDOVER_WAIT)).await;
+        let moved = match received {
+            Ok(Ok(Some(moved))) => moved,
+            Ok(Ok(None)) => {
+                warn!(listener = self.listener, address = self.address, "udp: the replaced worker sent no flows");
+                return;
+            }
+            Ok(Err(e)) => {
+                error!(listener = self.listener, address = self.address, error = %e, "udp: flows of the replaced worker lost");
+                return;
+            }
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        let n = moved.len();
+        for (m, socket) in moved {
+            let upstream = match socket.set_nonblocking(true).and_then(|()| UdpSocket::from_std(socket)) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!(client = %m.client, error = %e, "udp: a handed-over flow could not be taken");
+                    continue;
+                }
+            };
+            let Some(entry) = self.pools.backend(&self.pool, m.backend) else { continue };
+            self.pools.acquire(&self.pool, m.backend);
+            let counters = *entry.series().udp();
+            flows.insert(m.client, self.flow(downstream, m.reply_to, m.backend, upstream, counters, now));
+        }
+        info!(listener = self.listener, address = self.address, flows = n, "udp: took over the replaced worker's flows");
+    }
+
+    /// Replaced by a newer generation: its worker of the same index takes
+    /// every flow, with its upstream socket. Nothing is logged as ended.
+    async fn hand_over(&self, flows: &mut HashMap<SocketAddr, Flow>) {
+        use std::os::fd::AsFd;
+        let mut moving = Vec::with_capacity(flows.len());
+        for (client, flow) in flows.drain() {
+            flow.reply_task.abort();
+            self.pools.release(&self.pool, flow.backend);
+            match flow.upstream.as_fd().try_clone_to_owned() {
+                Ok(fd) => moving.push((handover::Moved { client, reply_to: flow.reply_to, backend: flow.backend }, fd)),
+                Err(e) => warn!(client = %client, error = %e, "udp: a flow could not be handed over"),
+            }
+        }
+        let path = self.handover.clone();
+        match tokio::task::spawn_blocking(move || handover::send(&path, moving)).await {
+            Ok(Ok(n)) => info!(listener = self.listener, address = self.address, flows = n, "udp: flows handed to the new worker"),
+            Ok(Err(e)) => warn!(listener = self.listener, address = self.address, error = %e, "udp: no new worker took the flows"),
+            Err(_) => {}
+        }
     }
 
     /// Forward one datagram, opening a flow for an unknown client first.
@@ -383,6 +456,8 @@ impl BackgroundService for UdpProxyService {
         );
 
         let mut flows: HashMap<SocketAddr, Flow> = HashMap::new();
+        // Datagrams wait in the shared socket meanwhile.
+        self.adopt(&downstream, &mut flows).await;
         let mut drops = Drops::default();
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut reaper = tokio::time::interval(REAPER_INTERVAL);
@@ -392,8 +467,11 @@ impl BackgroundService for UdpProxyService {
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        // No request boundary at L4: flows are cut, and each
-                        // still releases its backend and gets a log entry.
+                        if crate::drain::draining() {
+                            self.hand_over(&mut flows).await;
+                        }
+                        // Keel stopping: no request boundary at L4, flows are
+                        // cut, each still releasing its backend and logged.
                         for (client, flow) in flows.drain() {
                             self.close_flow(client, flow, Some("shutdown"));
                         }

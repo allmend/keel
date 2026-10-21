@@ -473,7 +473,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
     let mut due: Vec<(usize, Instant)> = Vec::new();
     for i in 0..current.cfg.keel.workers {
         let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
-        let pid = spawn_worker(&current.cfg, i, current.stripe(i), bound.as_ref(), accounts.as_ref(), &private)?;
+        let pid = spawn_worker(&current.cfg, i, current.stripe(i), false, bound.as_ref(), accounts.as_ref(), &private)?;
         info!(pid = pid.as_raw(), index = i, "master: worker started");
         current.workers.push((pid, i, Instant::now()));
     }
@@ -522,8 +522,8 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
             wanted |= read_nudge(&c.link, &mut nudged);
             if wanted && pending.is_none() {
                 wanted = false;
-                let busy: Vec<usize> = std::iter::once(&current).chain(&draining).map(|g| g.slot).collect();
-                match start_generation(&cfg, &busy, bound.as_ref(), root, &control_listeners, Some(c), accounts.as_ref()) {
+                let spawn = Spawn { control_listeners: &control_listeners, control: Some(c), accounts: accounts.as_ref() };
+                match start_generation(&cfg, &current, &draining, bound.as_ref(), root, &spawn) {
                     Ok((generation, sockets)) => pending = Some((generation, sockets, Instant::now())),
                     Err(e) => {
                         error!(error = %format!("{e:#}"), "master: new workers not started; the current ones keep serving");
@@ -615,7 +615,7 @@ pub fn run(cfg: Config, force_new_cluster: bool) -> Result<()> {
         due.retain(|(_, at)| *at > now);
         for index in ready {
             let private = private_fds(&control_listeners, control.as_ref(), bound.as_ref());
-            let pid = spawn_worker(&current.cfg, index, current.stripe(index), bound.as_ref(), accounts.as_ref(), &private)?;
+            let pid = spawn_worker(&current.cfg, index, current.stripe(index), false, bound.as_ref(), accounts.as_ref(), &private)?;
             current.workers.push((pid, index, Instant::now()));
             crate::metrics::set_workers(current.workers.len());
             info!(index, pid = pid.as_raw(), "master: replacement worker started");
@@ -682,18 +682,29 @@ impl Generation {
     }
 }
 
+/// What forking a worker needs besides its config.
+#[derive(Clone, Copy)]
+struct Spawn<'a> {
+    control_listeners: &'a ControlListeners,
+    control: Option<&'a Control>,
+    accounts: Option<&'a Accounts>,
+}
+
 /// Start a generation for the version the control worker handed over: the
 /// master reads it from the state directory itself and validates it like
 /// any config; sockets it already holds are shared, new ones bound.
 fn start_generation(
     cfg: &Config,
-    busy: &[usize],
+    current: &Generation,
+    draining: &[Generation],
     bound: Option<&BoundListeners>,
     root: bool,
-    control_listeners: &ControlListeners,
-    control: Option<&Control>,
-    accounts: Option<&Accounts>,
+    spawn: &Spawn,
 ) -> Result<(Generation, Option<BoundListeners>)> {
+    let Spawn { control_listeners, control, accounts } = *spawn;
+    let busy: Vec<usize> = std::iter::once(current).chain(draining).map(|g| g.slot).collect();
+    // A new worker whose index the current generation has gets its UDP flows.
+    let predecessors: Vec<usize> = current.workers.iter().map(|(_, index, _)| *index).collect();
     let files = crate::cluster::applied::read_for_master(std::path::Path::new(&cfg.keel.state_dir))?;
     let mut next = crate::config::assemble(&cfg.node_file, &files)?;
     next.path = cfg.path.clone();
@@ -711,7 +722,7 @@ fn start_generation(
     info!(workers, "master: starting new workers for a new version");
     for index in 0..workers {
         let private = private_fds(control_listeners, control, sockets.as_ref());
-        let pid = spawn_worker(&g.cfg, index, g.stripe(index), sockets.as_ref(), accounts, &private)?;
+        let pid = spawn_worker(&g.cfg, index, g.stripe(index), predecessors.contains(&index), sockets.as_ref(), accounts, &private)?;
         g.workers.push((pid, index, Instant::now()));
         if let Some(c) = control {
             control_worker::send_to_control(&c.link, &MasterMessage::WorkerRestarted { index, pid: Some(pid.as_raw() as u32) });
@@ -801,6 +812,7 @@ fn spawn_worker(
     cfg: &Config,
     index: usize,
     stripe: usize,
+    successor: bool,
     bound: Option<&BoundListeners>,
     accounts: Option<&Accounts>,
     private: &[RawFd],
@@ -821,7 +833,7 @@ fn spawn_worker(
                 None => None,
             };
             info!(index, inherited = sockets.is_some(), "worker: started");
-            proxy::run(cfg, index, stripe, sockets)
+            proxy::run(cfg, index, stripe, successor, sockets)
         }
     }
 }

@@ -1098,7 +1098,9 @@ impl crate::control::worker_socket::Apply for WorkerApplier {
 // `index` is the worker's position among `keel.workers`; it names the worker's
 // own control socket, where the control worker asks for its view and hands it
 // every applied config.
-pub fn run(cfg: &Config, index: usize, stripe: usize, inherited: Option<WorkerSockets>) -> ! {
+/// `successor`: a worker of this index in an older generation is still
+/// running; its UDP flows come to this one.
+pub fn run(cfg: &Config, index: usize, stripe: usize, successor: bool, inherited: Option<WorkerSockets>) -> ! {
     crate::metrics::init_worker(stripe);
     let routing = Arc::new(ArcSwap::from_pointee(RoutingTable::build(cfg)));
     let mut inherited = inherited;
@@ -1142,7 +1144,7 @@ pub fn run(cfg: &Config, index: usize, stripe: usize, inherited: Option<WorkerSo
     };
 
     add_l4_services(&mut server, cfg, &pools, &access_logger, &cert_store, &routing);
-    add_udp_services(&mut server, cfg, &pools, &access_logger, &routing, inherited.as_mut().map(|w| &mut w.udp));
+    add_udp_services(&mut server, cfg, &pools, &access_logger, &routing, inherited.as_mut().map(|w| &mut w.udp), (index, successor));
 
     let upstream = Arc::new(ArcSwap::from_pointee(upstream_settings(cfg)));
     let applier = WorkerApplier {
@@ -1410,10 +1412,26 @@ fn add_udp_services(
     access_logger: &Arc<AccessLogger>,
     routing: &Arc<ArcSwap<RoutingTable>>,
     mut inherited: Option<&mut HashMap<String, std::net::UdpSocket>>,
+    (index, successor): (usize, bool),
 ) {
+    let dir = crate::control::fanout::worker_socket_dir(&cfg.keel.control_socket);
     for (l, address) in here(cfg.listeners.iter()) {
         let Some(pool) = l.udp_pool().map(str::to_owned) else { continue };
         let socket = inherited.as_mut().and_then(|m| m.remove(&address));
+        let handover = crate::udp::handover::path(&dir, &address, index);
+        // Bound now, before this worker can be ready: the one it replaces
+        // sends its flows here once it is.
+        let predecessor = if successor {
+            match crate::udp::handover::listen(&handover) {
+                Ok(l) => Some(l),
+                Err(e) => {
+                    error!(address, error = %e, "udp: cannot wait for the replaced worker's flows");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         info!(listener = l.name, address, pool, inherited = socket.is_some(), "adding UDP listener");
         let svc = crate::udp::UdpProxyService {
             listener: l.name.clone(),
@@ -1426,6 +1444,8 @@ fn add_udp_services(
             socket,
             proxy_protocol: l.proxy_protocol,
             routing: Arc::clone(routing),
+            handover,
+            predecessor: std::sync::Mutex::new(predecessor),
         };
         server.add_service(background_service(&format!("udp-{address}"), svc));
     }

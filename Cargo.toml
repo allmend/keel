@@ -37,7 +37,7 @@ arc-swap = "1"
 ipnet = "2"
 
 # Unix process management — fork, setuid, signals
-nix = { version = "0.31", features = ["process", "user", "signal", "fs"] }
+nix = { version = "0.31", features = ["process", "user", "signal", "fs", "socket", "uio"] }
 libc = "0.2"
 
 # Raft state on disk — pure Rust, single file, no C dependency
