@@ -108,7 +108,7 @@ upgrade started: the master tries the binary on disk, then runs it in place; see
 ```
 
 1. The master runs the new binary's `--version` and `config validate`. If either fails, nothing changes: `master: upgrade refused` in the log.
-2. It stops the control worker (a leader's peers elect another within seconds) and executes the new binary in its own process: same PID, so systemd and container init see no change. Listening sockets, the metrics region and the workers carry over; counters continue.
+2. It stops the control worker (a leader [hands leadership over](cluster.md#leadership-hand-over) first) and executes the new binary in its own process: same PID, so systemd and container init see no change. Listening sockets, the metrics region and the workers carry over; counters continue.
 3. The new binary starts a control worker and new workers. Once they have the node's state, the old workers drain as on a reload: open requests, WebSockets, TCP connections and UDP flows finish or move over, at most `keel.drain_timeout`.
 
 `keel_build_info{version}` shows the running version. Install the new binary the way packages do, by writing a new file and renaming it over the old one; a running binary cannot be written in place. A node file that changes `keel.user`, `keel.group`, `keel.control_user` or a path applies with the upgrade.
@@ -180,7 +180,13 @@ Cluster:
 
 ## keel cluster demote
 
-On the leader: starts a new election. The node stays a voter. On a follower it fails with `this node is not the leader`.
+On the leader: [hands leadership](cluster.md#leadership-hand-over) to the most up-to-date other voter and stays a voter.
+
+```
+leadership handed to node 98765432
+```
+
+On a follower it fails with `this node is not the leader`; on the only voter, or when no other voter takes over within 8 seconds, it fails and the node leads on.
 
 ## keel cluster stepdown
 

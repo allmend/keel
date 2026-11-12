@@ -22,6 +22,11 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A leader that stops hands leadership over first: on `keel upgrade`, a
+  stop or restart, and `keel cluster demote`, it asks the most up-to-date
+  voter to start an election and waits until it leads. No election timeout
+  passes. `cluster demote` names the new leader and no longer can re-elect
+  the node it ran on.
 - `keel upgrade` / `keelctl upgrade` / `SIGUSR2`: the binary on disk runs in
   place, same PID, without dropping a connection. Tried first; a binary
   that does not run with the config is refused. Counters continue.

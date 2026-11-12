@@ -211,6 +211,13 @@ impl Cluster {
             })?;
             cluster.ids.insert(node.to_owned(), id);
         }
+        // The control worker answers before its workers do: `status` right
+        // after a join is "no worker answered" until their sockets exist.
+        for node in NODES {
+            wait_until(&format!("{node}'s workers answer"), Duration::from_secs(30), || {
+                Ok(cluster.request(node, &ControlRequest::Status).ok())
+            })?;
+        }
         Ok(cluster)
     }
 
@@ -520,6 +527,63 @@ fn removing_the_leader_hands_over_leadership() -> Result<()> {
         let new = status["leader_id"].as_u64().filter(|id| *id != cluster.id(&leader));
         Ok(new.filter(|_| cluster.voters(follower).is_ok_and(|v| v.len() == 2)))
     })?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn demote_hands_leadership_to_another_voter() -> Result<()> {
+    let cluster = Cluster::up("cluster-demote")?;
+    let leader = cluster.leader()?;
+    let old = cluster.id(&leader);
+    let follower = NODES.iter().copied().find(|n| *n != leader).expect("a follower");
+    let err = cluster.request(follower, &ControlRequest::ClusterDemote).expect_err("a follower").to_string();
+    assert!(err.contains("this node is not the leader"), "{err}");
+
+    let answer = cluster.request(&leader, &ControlRequest::ClusterDemote)?;
+    let new = answer["leader_id"].as_u64().expect("the new leader");
+    assert_ne!(new, old, "{answer}");
+    for node in NODES {
+        wait_until(&format!("{node} follows the new leader"), Duration::from_secs(30), || {
+            Ok((cluster.status(node)?["leader_id"].as_u64() == Some(new)).then_some(()))
+        })?;
+    }
+    assert_eq!(cluster.voters(&leader)?.len(), 3, "the old leader stays a voter");
+    cluster.push_marker()?;
+    for node in NODES {
+        cluster.serves_marker(node)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn an_upgraded_leader_hands_leadership_over_first() -> Result<()> {
+    let cluster = Cluster::up("cluster-upgrade-leader")?;
+    let leader = cluster.leader()?;
+    let old = cluster.id(&leader);
+    let follower = NODES.iter().copied().find(|n| *n != leader).expect("a follower");
+
+    let out = cluster.stack.exec(&leader, &["keel", "upgrade"])?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    wait_until("a new leader among the other two", Duration::from_secs(30), || {
+        Ok(cluster.status(follower)?["leader_id"].as_u64().filter(|id| *id != old))
+    })?;
+    // Handed over, not found missing after an election timeout.
+    assert!(cluster.logged(&leader, "cluster: leadership handed over")?, "the old leader handed over");
+
+    wait_until("the upgrade", Duration::from_secs(60), || Ok(cluster.logged(&leader, "master: upgrade complete")?.then_some(())))?;
+    // The same member again, with its store: three voters, and it follows.
+    wait_until("the upgraded node follows the new leader", Duration::from_secs(30), || {
+        let status = cluster.status(&leader).ok();
+        let follows = status.and_then(|s| s["leader_id"].as_u64()).is_some_and(|id| id != old);
+        Ok((follows && cluster.voters(&leader).is_ok_and(|v| v.len() == 3)).then_some(()))
+    })?;
+    assert_eq!(cluster.node_id(&leader)?, old);
+    cluster.push_marker()?;
+    for node in NODES {
+        cluster.serves_marker(node)?;
+    }
     Ok(())
 }
 

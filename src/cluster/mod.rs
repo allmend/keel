@@ -485,7 +485,8 @@ fn claimed_sender(req: &RpcRequest) -> Option<NodeId> {
         | RpcRequest::RevokeOperatorCredentials
         | RpcRequest::Drain { .. }
         | RpcRequest::Activate { .. }
-        | RpcRequest::Remove { .. } => None,
+        | RpcRequest::Remove { .. }
+        | RpcRequest::Elect => None,
     }
 }
 
@@ -562,6 +563,14 @@ async fn handle_peer(stream: tokio_rustls::server::TlsStream<TcpStream>, raft: A
             })
             .unwrap()
         }
+        Ok(RpcRequest::Elect) => match start_election(&raft, peer_id).await {
+            Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
+                ok: Some(crate::cluster::network::StepDownReply { message: "election started".into() }),
+                err: None,
+            })
+            .unwrap(),
+            Err(e) => serde_json::to_vec(&RpcResponse::<()> { ok: None, err: Some(format!("{e:#}")) }).unwrap(),
+        },
         Ok(RpcRequest::RevokeOperatorCredentials) => match replace_control_ca(&raft).await {
             Ok(()) => serde_json::to_vec(&RpcResponse::<_> {
                 ok: Some(crate::cluster::network::StepDownReply { message: "revoked".into() }),
@@ -1139,11 +1148,18 @@ impl ClusterService {
 
         let cluster_ca_rx = self.cluster_ca_tx.subscribe();
 
+        // A stopping leader hands leadership over first, with the peer
+        // listener still open: the election it asks for needs this node's
+        // answers.
+        let mut handing_over: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
+                _ = shutdown.changed(), if handing_over.is_none() => {
+                    if *shutdown.borrow() {
+                        handing_over = Some(tokio::spawn(hand_over(Arc::clone(&raft), Arc::clone(&client_tls))));
+                    }
                 }
+                _ = async { handing_over.as_mut().expect("guarded").await }, if handing_over.is_some() => break,
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
@@ -1257,6 +1273,117 @@ pub fn new_cluster(opts: ClusterOpts) -> (ClusterHandle, ClusterService) {
 }
 
 // Cluster operations
+
+/// How long a stopping leader waits for another voter to take over. Below the
+/// 15 seconds the master gives a control worker to stop.
+const HAND_OVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long one voter gets to win the election it was asked for before the
+/// next is asked: the leader lease (`election_timeout_max`) the other voters
+/// hold, and a margin.
+const HAND_OVER_ROUND: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// The voters a leader hands over to, most up-to-date first: by the log index
+/// each has replicated, then by node ID.
+fn hand_over_order(
+    me: NodeId,
+    voters: &std::collections::BTreeSet<NodeId>,
+    matched: &BTreeMap<NodeId, Option<u64>>,
+) -> Vec<NodeId> {
+    let mut order: Vec<NodeId> = voters.iter().copied().filter(|id| *id != me).collect();
+    order.sort_by_key(|id| (std::cmp::Reverse(matched.get(id).copied().flatten()), *id));
+    order
+}
+
+/// A leader that stops (upgrade, restart, shutdown) hands leadership to the
+/// most up-to-date voter first, so the cluster does not wait out an election
+/// timeout to notice it is gone, and it cannot be elected again on its way
+/// down. A follower only stops standing for election. Never fails: a
+/// hand-over that does not happen is logged and the others elect a leader as
+/// after a crash.
+async fn hand_over(raft: Arc<ClusterRaft>, tls: Arc<rustls::ClientConfig>) {
+    // Stopping: this node is not a candidate from here on.
+    raft.runtime_config().elect(false);
+    if let Err(e) = give_leadership(&raft, tls).await {
+        warn!(reason = %format!("{e:#}"), "cluster: leadership not handed over; the others elect a leader on their own");
+    }
+}
+
+/// `keel cluster demote`: hand leadership to the most up-to-date voter and
+/// stay a voter. Returns the new leader.
+pub async fn demote(raft: &ClusterRaft, tls: Arc<rustls::ClientConfig>) -> Result<NodeId> {
+    let m = raft.metrics().borrow().clone();
+    if m.current_leader != Some(m.id) {
+        anyhow::bail!("this node is not the leader");
+    }
+    // Not a candidate in the election it asks for.
+    raft.runtime_config().elect(false);
+    let given = give_leadership(raft, tls).await;
+    raft.runtime_config().elect(true);
+    given?.context("this node is the only voter; there is nobody to hand leadership to")
+}
+
+/// On a leader: ask the other voters, most up-to-date first, to start an
+/// election until one of them leads. `None` on a follower and on the only
+/// voter. Without a reachable majority there is nobody to hand over to.
+async fn give_leadership(raft: &ClusterRaft, tls: Arc<rustls::ClientConfig>) -> Result<Option<NodeId>> {
+    let m = raft.metrics().borrow().clone();
+    if m.current_leader != Some(m.id) {
+        return Ok(None);
+    }
+    let membership = m.membership_config.membership();
+    let voters: std::collections::BTreeSet<NodeId> = membership.voter_ids().collect();
+    let addrs: BTreeMap<NodeId, String> = membership.nodes().map(|(id, n)| (*id, n.addr.clone())).collect();
+    let matched: BTreeMap<NodeId, Option<u64>> =
+        m.replication.iter().flatten().map(|(id, log)| (*id, log.as_ref().map(|l| l.index))).collect();
+    let targets: Vec<(NodeId, String)> =
+        hand_over_order(m.id, &voters, &matched).into_iter().filter_map(|id| Some((id, addrs.get(&id)?.clone()))).collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let reachable = probe_reachable(&targets).await + usize::from(voters.contains(&m.id));
+    if reachable < voters.len() / 2 + 1 {
+        anyhow::bail!("no majority reachable: {reachable} of {} voters", voters.len());
+    }
+
+    // The other voters refuse an election while they hear from this leader.
+    raft.runtime_config().heartbeat(false);
+    let started = std::time::Instant::now();
+    let mut metrics = raft.metrics();
+    for (id, addr) in targets.iter().cycle() {
+        let left = HAND_OVER_TIMEOUT.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        if let Err(e) = crate::cluster::network::send_elect(addr, Arc::clone(&tls)).await {
+            debug!(node_id = id, error = %format!("{e:#}"), "cluster: hand-over: voter did not start an election");
+        }
+        let other = |m: &openraft::RaftMetrics<NodeId, BasicNode>| m.current_leader.filter(|l| *l != m.id);
+        let won = tokio::time::timeout(left.min(HAND_OVER_ROUND), metrics.wait_for(|m| other(m).is_some())).await;
+        if let Ok(Ok(m)) = won {
+            let leader = other(&m);
+            info!(leader, ms = started.elapsed().as_millis() as u64, "cluster: leadership handed over");
+            return Ok(leader);
+        }
+    }
+    // Still the leader: lead on.
+    raft.runtime_config().heartbeat(true);
+    anyhow::bail!("no other voter took over in {}s", HAND_OVER_TIMEOUT.as_secs())
+}
+
+/// A leader asked this node to take over: start an election. Only the leader
+/// this node follows may ask, and only a voter can stand.
+async fn start_election(raft: &ClusterRaft, from: Option<NodeId>) -> Result<()> {
+    let m = raft.metrics().borrow().clone();
+    if from.is_none() || from != m.current_leader {
+        anyhow::bail!("election refused: node {from:?} is not the leader node {} follows", m.id);
+    }
+    if !m.membership_config.membership().voter_ids().any(|id| id == m.id) {
+        anyhow::bail!("election refused: node {} is not a voter", m.id);
+    }
+    info!(leader = from, "cluster: the leader hands over; starting an election");
+    raft.trigger().elect().await.map_err(|e| anyhow::anyhow!("election not started: {e}"))
+}
 
 /// How long a config push may take to commit on the leader.
 const PUSH_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1686,6 +1813,24 @@ async fn probe_reachable(peers: &[(NodeId, String)]) -> usize {
         }
     }
     up
+}
+
+#[cfg(test)]
+mod hand_over_tests {
+    use super::hand_over_order;
+
+    #[test]
+    fn the_most_up_to_date_voter_is_asked_first() {
+        let voters = [1, 2, 3, 4].into();
+        // Node 5 is a learner: it replicates, and is never asked.
+        let matched = [(2, Some(7)), (3, Some(9)), (4, None), (5, Some(9))].into();
+        assert_eq!(hand_over_order(1, &voters, &matched), vec![3, 2, 4]);
+        // Equal logs: by node ID. No replication view at all: every other voter.
+        let matched = [(2, Some(9)), (3, Some(9))].into();
+        assert_eq!(hand_over_order(1, &voters, &matched), vec![2, 3, 4]);
+        assert_eq!(hand_over_order(3, &voters, &Default::default()), vec![1, 2, 4]);
+        assert!(hand_over_order(1, &[1].into(), &Default::default()).is_empty());
+    }
 }
 
 #[cfg(test)]

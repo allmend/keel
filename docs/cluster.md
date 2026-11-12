@@ -14,7 +14,13 @@ A node is always a cluster, of one or more. A single node runs the same processe
 
 Every write — a push, a drain, a membership change, an ACME issuance — needs a majority of the voters. Traffic needs none: every node serves the last version it applied.
 
-A leader is elected by majority vote; a node never promotes itself. Without the leader's heartbeat for 1–2 seconds the others elect a new one; writes wait, traffic does not. A partition with no majority side keeps serving everywhere and refuses writes everywhere. When it heals, nodes catch up from the Raft log.
+A leader is elected by majority vote; a node never promotes itself. Without the leader's heartbeat for 1–2 seconds the others elect a new one; writes wait, traffic does not.
+
+### Leadership hand-over
+
+A leader that stops on purpose does not make the others wait for that: on `keel upgrade`, a service stop or restart, and `keel cluster demote`, it asks the voter with the most complete log to start an election, and stops (or follows) once that node leads. This takes well under a second; `cluster: leadership handed over` in the log names the new leader. A stopping node does not stand for election itself.
+
+Only the leader a node follows can ask it for an election. With no majority reachable, or when nobody takes over within 8 seconds, the node stops anyway and the others elect a leader as after a crash. A node running an older version does not know the request; the next voter is asked. A partition with no majority side keeps serving everywhere and refuses writes everywhere. When it heals, nodes catch up from the Raft log.
 
 ## Configuration
 

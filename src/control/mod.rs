@@ -416,18 +416,15 @@ async fn cmd_cluster_status(ch: &crate::cluster::ClusterHandle) -> String {
 }
 
 async fn cmd_cluster_demote(ch: &crate::cluster::ClusterHandle) -> String {
-    let Some(raft) = ch.raft().await else {
+    let (Some(raft), Some(tls)) = (ch.raft().await, ch.client_tls().await) else {
         return ControlResponse::err("cluster not yet initialized");
     };
-    let m = raft.metrics().borrow().clone();
-    if m.current_leader != Some(m.id) {
-        return ControlResponse::err("this node is not the leader");
-    }
-    match raft.trigger().elect().await {
-        Ok(()) => ControlResponse::ok(serde_json::json!({
-            "message": "leadership transfer requested; a new election will begin"
+    match crate::cluster::demote(&raft, tls).await {
+        Ok(leader) => ControlResponse::ok(serde_json::json!({
+            "message": format!("leadership handed to node {leader}"),
+            "leader_id": leader,
         })),
-        Err(e) => ControlResponse::err(e.to_string()),
+        Err(e) => ControlResponse::err(format!("{e:#}")),
     }
 }
 

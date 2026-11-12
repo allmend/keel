@@ -140,10 +140,10 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
         join: cfg.cluster.as_ref().map(|c| c.join.clone()).unwrap_or_default(),
     };
     let (cluster, svc) = crate::cluster::new_cluster(opts);
-    {
+    let cluster_task = {
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { pingora::services::background::BackgroundService::start(&svc, shutdown).await });
-    }
+        tokio::spawn(async move { pingora::services::background::BackgroundService::start(&svc, shutdown).await })
+    };
 
     let (applied_tx, applied_rx) = watch::channel(Arc::new(cfg.clone()));
     let certs_changed = Arc::new(Notify::new());
@@ -210,10 +210,18 @@ async fn serve(inherited_cfg: Config, mut inherited: Inherited, force_new_cluste
         }
     }
     info!("control: shutting down");
-    // Let Raft and the listeners observe it.
+    // Raft first: a leader hands leadership over and closes its store. Then
+    // the listeners get a moment to observe the shutdown.
+    if tokio::time::timeout(CLUSTER_STOP_TIMEOUT, cluster_task).await.is_err() {
+        warn!("control: the cluster service did not stop in {}s", CLUSTER_STOP_TIMEOUT.as_secs());
+    }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     Ok(())
 }
+
+/// How long the cluster service gets to hand leadership over and close its
+/// store on shutdown. The master kills a control worker after 15 seconds.
+const CLUSTER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// Ping the workers on an interval and publish how many did not answer. A
 /// worker that stops answering, or answers again, is logged with its index

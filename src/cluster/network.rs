@@ -44,6 +44,9 @@ pub enum RpcRequest {
     Activate { address: String },
     /// Ask the receiving node (must be the leader) to remove a member for good.
     Remove { node_id: NodeId },
+    /// Ask the receiving node to start an election now. Sent by the leader
+    /// it follows, which is stopping and hands leadership over.
+    Elect,
 }
 
 /// The leader's answer to a forwarded config push: the committed version.
@@ -193,6 +196,14 @@ pub(crate) async fn send_revoke(leader_addr: &str, tls: Arc<rustls::ClientConfig
         .call(&RpcRequest::RevokeOperatorCredentials)
         .await
         .map_err(|e| anyhow::anyhow!("revocation request to the leader at {leader_addr} failed: {e}"))?;
+    Ok(())
+}
+
+/// Ask the voter at `addr` to start an election: this leader hands over.
+pub(crate) async fn send_elect(addr: &str, tls: Arc<rustls::ClientConfig>) -> anyhow::Result<()> {
+    let mut net = ClusterNetwork { target_addr: addr.to_owned(), tls };
+    let _: StepDownReply =
+        net.call(&RpcRequest::Elect).await.map_err(|e| anyhow::anyhow!("election request to {addr} failed: {e}"))?;
     Ok(())
 }
 
