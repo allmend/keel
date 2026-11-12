@@ -40,6 +40,11 @@ use crate::access_log::{AccessLogger, TcpLogEntry};
 use crate::backend::PoolRegistry;
 use crate::config::TlsMode;
 
+/// How long a TLS handshake may take, with the client or with the backend. The
+/// idle timeout only starts once bytes are spliced: without this a client that
+/// connects and never finishes its handshake holds the connection for good.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
+
 pub struct TcpProxyApp {
     pub listener: String,
     pub pool: String,
@@ -94,7 +99,9 @@ impl TcpProxyApp {
         let mut plain = Some(client);
         if let Some(cfg) = &self.server_tls {
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(cfg));
-            match acceptor.accept(plain.take().unwrap()).await {
+            let accepted = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(plain.take().unwrap())).await;
+            let accepted = accepted.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out")));
+            match accepted {
                 Ok(tls) => {
                     let (_, conn) = tls.get_ref();
                     out.tls = Some(TlsInfo {
@@ -133,7 +140,9 @@ impl TcpProxyApp {
                 // Backends are IPs: no SNI, and a verified certificate names the IP.
                 let name = ServerName::IpAddress(backend.ip().into());
                 let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
-                match connector.connect(name, upstream).await {
+                let connected = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(name, upstream)).await;
+                let connected = connected.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timed out")));
+                match connected {
                     Ok(mut tls_upstream) => copy(&mut client, &mut tls_upstream, shutdown, self.idle_timeout).await,
                     Err(e) => {
                         warn!(pool = self.pool, backend = %backend, error = %e, "tcp: upstream TLS handshake failed");
@@ -503,6 +512,19 @@ mod tests {
         use rustls::pki_types::pem::PemObject;
         let expected = rustls::pki_types::CertificateDer::pem_slice_iter(cert.as_bytes()).next().unwrap().unwrap();
         assert_eq!(served, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_finishes_its_handshake_is_dropped() {
+        let (cert, key) = self_signed("cache.example.test");
+        let store = CertStore::with_test_cert("cache.example.test", &cert, &key);
+        let server_tls = store.rustls_server_config_with_default(&[], "cache.example.test").unwrap();
+        let backend = echo_backend().await;
+        let (addr, h, _keep) = serve_one(app(TlsMode::Terminate, Some(server_tls), None), backend).await;
+        // Connects and sends nothing.
+        let _silent = TcpStream::connect(addr).await.unwrap();
+        let out = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT * 3, h).await.expect("splice returns").unwrap();
+        assert_eq!(out.error, Some("tls_handshake"));
     }
 
     #[tokio::test]

@@ -70,6 +70,9 @@ pub fn save(state_dir: &Path, version: u64, files: &FileSet) -> Result<()> {
 /// are `0700`, since a version can carry keys.
 pub fn write_config_dir(dir: &Path, files: &FileSet) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    // Checked when the version was pushed; a name that leaves `dir` must not
+    // be written whatever route it took here.
+    files.keys().try_for_each(|rel| keel_control::check_file_name(rel))?;
     let current = keel_control::read_file_set(dir)?;
     for (rel, text) in files {
         if current.get(rel) == Some(text) {
@@ -112,6 +115,21 @@ fn write_atomic(dir: &Path, name: &str, text: &str, mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_outside_the_directory_is_not_written() {
+        let base = std::env::temp_dir().join(format!("keel-applied-escape-{}", std::process::id()));
+        let dir = base.join("config");
+        let abs = base.join("absolute.txt");
+        for name in ["../escaped.txt", "a/../../escaped.txt", abs.to_str().unwrap(), ".hidden", "a//b", ""] {
+            let files = FileSet::from([("keel.hcl".to_owned(), "v1".to_owned()), (name.to_owned(), "x".to_owned())]);
+            assert!(write_config_dir(&dir, &files).is_err(), "{name:?}");
+        }
+        assert!(!base.join("escaped.txt").exists());
+        assert!(!abs.exists());
+        assert!(!dir.join("keel.hcl").exists(), "nothing of a refused set is written");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn set(entries: &[(&str, &str)]) -> FileSet {
         entries.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect()

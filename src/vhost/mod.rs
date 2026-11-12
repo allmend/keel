@@ -55,7 +55,9 @@ impl RoutingTable {
         let list = |allow: &[String], deny: &[String]| AccessList::new(allow, deny).ok().flatten();
 
         for vhost in &cfg.vhosts {
-            let routes = vhosts.entry(vhost.host.clone()).or_default();
+            // Host names compare case-insensitively: keys are lower case, like `name`.
+            let host = vhost.host.to_ascii_lowercase();
+            let routes = vhosts.entry(host.clone()).or_default();
             let vhost_access = list(&vhost.allow, &vhost.deny);
             // Validated: sizes parse.
             let size = |s: &Option<String>| s.as_deref().and_then(|s| crate::cache::parse_size(s).ok());
@@ -67,7 +69,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: "/".into(),
                         pool: pool.clone(),
-                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(pool, &vhost.host)),
+                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(pool, &host)),
                         cache: None,
                         access: vhost_access.clone(),
                         max_body: vhost_max_body,
@@ -78,7 +80,7 @@ impl RoutingTable {
                     routes.push(Route {
                         path_prefix: r.path.clone(),
                         pool: r.pool.clone(),
-                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(&r.pool, &vhost.host)),
+                        series: std::sync::Arc::new(crate::metrics::RequestSeries::new(&r.pool, &host)),
                         cache: r.cache.clone(),
                         access: list(&r.allow, &r.deny).or_else(|| vhost_access.clone()),
                         max_body: size(&r.max_body_size).or(vhost_max_body),
@@ -90,26 +92,26 @@ impl RoutingTable {
             routes.sort_by_key(|r| std::cmp::Reverse(r.path_prefix.len()));
 
             if let Some(fwd) = &vhost.forwarded_headers {
-                forwarded.insert(vhost.host.clone(), fwd.clone());
+                forwarded.insert(host.clone(), fwd.clone());
                 let nets: Vec<_> = fwd.trusted_proxies.iter().filter_map(|n| crate::access::parse_net(n).ok()).collect();
                 if !nets.is_empty() {
-                    trusted.insert(vhost.host.clone(), nets);
+                    trusted.insert(host.clone(), nets);
                 }
             }
             if let Some(a) = vhost_access {
-                access.insert(vhost.host.clone(), a);
+                access.insert(host.clone(), a);
             }
 
             if let Some(cc) = &vhost.cache {
-                cache.insert(vhost.host.clone(), cc.clone());
+                cache.insert(host.clone(), cc.clone());
             }
 
             if vhost.redirect_http_effective() {
-                redirect_http.insert(vhost.host.clone());
+                redirect_http.insert(host.clone());
             }
 
             if let Some(action) = &vhost.default_action {
-                default_actions.insert(vhost.host.clone(), action.clone());
+                default_actions.insert(host.clone(), action.clone());
             }
         }
 
@@ -153,7 +155,8 @@ impl RoutingTable {
     /// the wildcard vhost. An exact vhost with a pool shadows the wildcard's
     /// default action (the request routes normally).
     pub fn default_action(&self, host: &str) -> Option<&DefaultAction> {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
         if let Some(a) = self.default_actions.get(host) {
             return Some(a);
         }
@@ -168,7 +171,8 @@ impl RoutingTable {
     /// Order: exact host, then its one-label wildcard (`*.example.com` for
     /// `api.example.com`), then the catch-all `"*"`.
     pub fn resolve<'a>(&'a self, host: &str, path: &str) -> Option<&'a Route> {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
         self.match_route(host, path)
             .or_else(|| wildcard_of(host).and_then(|w| self.match_route(&w, path)))
             .or_else(|| self.match_route("*", path))
@@ -177,7 +181,8 @@ impl RoutingTable {
     /// Returns the cache config for the given host and path, or `None` if caching is
     /// not enabled. Resolution order: route-level → vhost-level → wildcard vhost-level.
     pub fn cache_config(&self, host: &str, path: &str) -> Option<&VhostCacheConfig> {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
 
         let wildcard = wildcard_of(host);
         let route_cache = self.route_cache(host, path)
@@ -203,7 +208,8 @@ impl RoutingTable {
     /// an attacker-supplied Host header cannot create unbounded files or metric
     /// series. The returned value is always one of the operator-configured hosts.
     pub fn vhost_label(&self, host: &str) -> Option<&str> {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
         if let Some((key, _)) = self.vhosts.get_key_value(host) {
             Some(key.as_str())
         } else if let Some((key, _)) = wildcard_of(host).and_then(|w| self.vhosts.get_key_value(w.as_str())) {
@@ -217,13 +223,15 @@ impl RoutingTable {
 
     /// Returns the forwarded headers config for the given host, or `None` if not set.
     pub fn forwarded_config(&self, host: &str) -> Option<&ForwardedHeadersConfig> {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
         self.forwarded.get(host).or_else(|| self.forwarded.get("*"))
     }
 
     /// Returns true if plain HTTP requests to this host should be redirected to HTTPS.
     pub fn should_redirect_https(&self, host: &str) -> bool {
-        let host = host.split(':').next().unwrap_or(host);
+        let host = name(host);
+        let host = host.as_ref();
         self.redirect_http.contains(host) || self.redirect_http.contains("*")
     }
 
@@ -245,6 +253,20 @@ impl RoutingTable {
 /// The wildcard vhost name that would cover `host`: `*.example.com` for
 /// `api.example.com`. One label only, as in certificates — `a.b.example.com`
 /// is not covered by `*.example.com`, and a bare `example.com` has none.
+/// The name a `Host` value asks for, as the table keys it: no port, no trailing
+/// dot, lower case. Host names compare case-insensitively, so `Admin.Example.com`
+/// and `admin.example.com.` are the vhost `admin.example.com` and get its access
+/// list, never a wildcard vhost's.
+fn name(host: &str) -> std::borrow::Cow<'_, str> {
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(host)
+    }
+}
+
 pub fn wildcard_of(host: &str) -> Option<String> {
     let (first, rest) = host.split_once('.')?;
     if first.is_empty() || rest.is_empty() || !rest.contains('.') {
@@ -313,6 +335,20 @@ mod tests {
             deny: vec![],
             max_body_size: None,
         }
+    }
+
+    #[test]
+    fn host_names_match_without_case_or_trailing_dot() {
+        let mut admin = vhost("Admin.example.com", "admin");
+        admin.allow = vec!["10.0.0.0/8".into()];
+        let cfg = make_config(vec![admin, vhost("*", "public")], [pool("admin"), pool("public")].into());
+        let t = RoutingTable::build(&cfg);
+        for host in ["admin.example.com", "ADMIN.Example.Com", "admin.example.com.", "Admin.example.com.:8443"] {
+            assert_eq!(routed(&t, host, "/"), Some("admin"), "{host}");
+            assert_eq!(t.vhost_label(host), Some("admin.example.com"), "{host}");
+            assert!(t.access(host, "/").is_some(), "{host}: the vhost's access list applies");
+        }
+        assert_eq!(routed(&t, "other.example.com", "/"), Some("public"));
     }
 
     #[test]

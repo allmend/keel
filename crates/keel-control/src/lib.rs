@@ -22,6 +22,19 @@ use serde::{Deserialize, Serialize};
 /// relative to that directory (`/`-separated).
 pub type FileSet = BTreeMap<String, String>;
 
+/// Refuse a file set key that is not a plain relative path below the config
+/// directory. A set read from a directory never has one; a pushed or replicated
+/// set is input, and its keys become paths on every node: `../../x` or `/x`
+/// would be written outside the directory. A component starting with `.` is
+/// refused too, which covers `.` and `..` and the names `read_file_set` skips.
+pub fn check_file_name(rel: &str) -> anyhow::Result<()> {
+    let plain = !rel.is_empty()
+        && !rel.contains(['\\', '\0'])
+        && rel.split('/').all(|part| !part.is_empty() && !part.starts_with('.'));
+    anyhow::ensure!(plain, "{rel:?}: not a file below the config directory");
+    Ok(())
+}
+
 /// Every file below `dir`, by relative path. Names starting with `.` (editor
 /// and temporary files) are skipped; every other file must be UTF-8 text.
 pub fn read_file_set(dir: &Path) -> anyhow::Result<FileSet> {

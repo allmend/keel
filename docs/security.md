@@ -39,6 +39,26 @@ Every length-prefixed read on the cluster port is capped before allocation; a la
 
 ---
 
+## Pushed file names stay in the config directory
+
+A config version is a set of files by relative path, and every node writes it to its config directory. A name that is absolute, has a `..`, `.` or empty component, or a component starting with `.` is refused at push and again before anything is written: a keelconfig holder or a cluster member cannot use a push to write elsewhere as `keel.control_user`.
+
+---
+
+## Vhost names match case-insensitively
+
+The requested host is matched without its port, without a trailing dot, in lower case. `Host: ADMIN.example.com` and `admin.example.com.` are the vhost `admin.example.com`, with its `allow` and `deny`; they do not reach a wildcard vhost instead.
+
+Paths are matched as sent: `route "/admin"` does not match `/Admin`, `//admin` or `/%61dmin`. Put an access list on the vhost, not on one route, when the backend treats such paths alike.
+
+---
+
+## TLS handshake deadline on TCP listeners
+
+A `terminate` or `reencrypt` listener gives a client 10 seconds to finish its TLS handshake, and the backend the same in `reencrypt`. `idle_timeout` covers the connection from then on.
+
+---
+
 ## Host header bounded before use
 
 Logs and metrics use the configured vhost name (`"*"`, a wildcard, or `"unmatched"`), never the client's `Host` header, and the access logger also sanitizes it to filesystem-safe characters. A crafted header cannot choose log file names (`Host: ../../etc/cron.d/x`), create files without bound, or add metric labels. Backends still get the original in `X-Forwarded-Host`.

@@ -77,7 +77,9 @@ pub fn read_config_dir(dir: &std::path::Path) -> Result<FileSet> {
 
 /// The config files of a set in load order: the root file, then every other
 /// `*.hcl` in path order. A YAML file is refused: the format changed.
+/// So is a name that is not a plain path below the config directory.
 pub fn config_files(files: &FileSet) -> Result<Vec<(&str, &str)>> {
+    files.keys().try_for_each(|p| keel_control::check_file_name(p))?;
     if let Some(old) = files.keys().find(|p| p.ends_with(".yaml") || p.ends_with(".yml")) {
         anyhow::bail!("{old}: the configuration is HCL now (*.hcl); YAML files are not read");
     }
@@ -1783,6 +1785,15 @@ vhost "a.test" {
         assert!(cfg.pools.contains_key("web") && cfg.pools.contains_key("api"));
         let hosts: Vec<&str> = cfg.vhosts.iter().map(|v| v.host.as_str()).collect();
         assert_eq!(hosts, vec!["a.test", "b.test"], "root first, then the others in path order");
+    }
+
+    #[test]
+    fn a_set_naming_a_file_outside_the_config_directory_is_refused() {
+        for name in ["../../etc/cron.d/x", "/etc/cron.d/x", "pools/../../x.hcl", ".ssh/authorized_keys"] {
+            let set = files(&[("keel.hcl", ROOT), (name, "x")]);
+            let e = assemble_err("", &set);
+            assert!(e.contains("not a file below the config directory"), "{name}: {e}");
+        }
     }
 
     #[test]

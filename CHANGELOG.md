@@ -8,6 +8,18 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- A pushed or replicated config whose file names leave the config directory
+  (`../x`, `/x`, a dot-file) is refused; before, the control worker wrote
+  such a file where the name pointed, as `keel.control_user`, on every node.
+- Vhost names match without regard to case or a trailing dot. `Host:
+  ADMIN.example.com` or `admin.example.com.` no longer falls through to a
+  wildcard vhost, past the named vhost's `allow` and `deny`.
+- `tcp` listeners in `terminate` and `reencrypt`: a TLS handshake, with the
+  client or the backend, gets 10 seconds. A client that connected and sent
+  nothing held its connection for good.
+
 ### Added
 
 - `keel upgrade` / `keelctl upgrade` / `SIGUSR2`: the binary on disk runs in
