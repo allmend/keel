@@ -73,7 +73,7 @@ ring = "0.17"
 # TLS with rustls, so this is the only thing still pulling OpenSSL in.
 openssl = "0.10"
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
-hcl-edit = "0.9"
+hcl-edit = "0.10"
 serde_path_to_error = "0.1"
 hcl-rs = "0.20"
 
